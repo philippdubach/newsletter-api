@@ -1,0 +1,39 @@
+name = "newsletter-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# KV namespace binding
+[[kv_namespaces]]
+binding = "NEWSLETTER_SUBSCRIBERS"
+id = "f98d1bbfe9924cbaa277fa8da10ba2ea"
+preview_id = "df4697a2ecbc4a218d439fa4208b0fe4"
+
+# R2 bucket binding for newsletter files
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "static"
+
+# Development environment variables
+[vars]
+ENVIRONMENT = "development"
+ALLOWED_ORIGIN = "http://localhost:1313,http://localhost:3000"
+
+# Production environment
+[env.production]
+name = "newsletter-api"
+
+# Production KV namespace binding
+[[env.production.kv_namespaces]]
+binding = "NEWSLETTER_SUBSCRIBERS"
+id = "f98d1bbfe9924cbaa277fa8da10ba2ea"
+
+# Production R2 bucket binding
+[[env.production.r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "static"
+
+# Production environment variables
+[env.production.vars]
+ALLOWED_ORIGIN = "https://philippdubach.com,https://www.philippdubach.com"
+ENVIRONMENT = "production"
+
