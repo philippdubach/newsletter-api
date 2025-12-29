@@ -1,15 +1,37 @@
 {
   "name": "newsletter-api",
   "version": "1.0.0",
-  "description": "Newsletter subscription API for philippdubach.com",
+  "description": "Cloudflare Workers API for newsletter subscriptions with rate limiting, email validation, and R2 storage integration",
+  "author": "Philipp Dubach",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/philippdubach/newsletter-api.git"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "newsletter",
+    "email",
+    "subscription",
+    "api",
+    "serverless",
+    "kv",
+    "r2",
+    "resend"
+  ],
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "deploy:production": "wrangler deploy --env production",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241106.0",
     "typescript": "^5.3.3",
+    "vitest": "^2.1.9",
     "wrangler": "^4.54.0"
   }
 }
