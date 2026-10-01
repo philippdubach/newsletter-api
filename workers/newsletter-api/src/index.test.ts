@@ -16,7 +16,7 @@ interface MockEnv {
   NEWSLETTER_SUBSCRIBERS: MockKVNamespace;
   R2_BUCKET: MockR2Bucket;
   ALLOWED_ORIGIN: string;
-  RESEND_API_KEY: string;
+  PLUNK_SECRET_KEY: string;
   ADMIN_TOKEN: string;
   ENVIRONMENT: string;
 }
@@ -40,7 +40,7 @@ describe('Newsletter API', () => {
         list: vi.fn(),
       },
       ALLOWED_ORIGIN: 'https://example.com',
-      RESEND_API_KEY: 'test_api_key',
+      PLUNK_SECRET_KEY: 'test_api_key',
       ADMIN_TOKEN: 'test_token',
       ENVIRONMENT: 'development',
     };
@@ -264,7 +264,7 @@ describe('Newsletter API', () => {
       const body = await response.json() as { count: number; display: string };
 
       expect(response.status).toBe(200);
-      expect(body.count).toBe(2); // excludes rate_limit key
+      expect(body.count).toBe(100); // 2 real subscribers + 100, rounded down to nearest 10
     });
   });
 
@@ -305,7 +305,7 @@ describe('Newsletter API', () => {
     it('should allow with valid auth token', async () => {
       mockEnv.ENVIRONMENT = 'production';
       
-      // Mock fetch for Resend API
+      // Mock fetch for Plunk API
       global.fetch = vi.fn().mockResolvedValue({
         ok: true,
         text: () => Promise.resolve('{}'),

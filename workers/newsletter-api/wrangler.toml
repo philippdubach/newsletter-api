@@ -2,21 +2,25 @@ name = "newsletter-api"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
-# KV namespace binding
+# KV namespace binding (rate-limit + caches; subscriber storage now lives in Listmonk)
 [[kv_namespaces]]
 binding = "NEWSLETTER_SUBSCRIBERS"
 id = "f98d1bbfe9924cbaa277fa8da10ba2ea"
-preview_id = "df4697a2ecbc4a218d439fa4208b0fe4"
 
-# R2 bucket binding for newsletter files
+# R2 bucket binding for newsletter files (now in EU jurisdiction)
 [[r2_buckets]]
 binding = "R2_BUCKET"
-bucket_name = "static"
+bucket_name = "static-eu"
+jurisdiction = "eu"
 
 # Development environment variables
 [vars]
 ENVIRONMENT = "development"
 ALLOWED_ORIGIN = "http://localhost:1313,http://localhost:3000"
+LINKEDIN_NEWSLETTER_URLS = "https://www.linkedin.com/pulse/ai-lab-60b-cursor-25b-anthropic-chinese-open-weight-triple-dubach-ltbae"
+LISTMONK_API_URL = "https://mail.philippdubach.com"
+LISTMONK_LIST_ID = "3"
+LISTMONK_WELCOME_TEMPLATE_ID = "5"
 
 # Production environment
 [env.production]
@@ -27,13 +31,17 @@ name = "newsletter-api"
 binding = "NEWSLETTER_SUBSCRIBERS"
 id = "f98d1bbfe9924cbaa277fa8da10ba2ea"
 
-# Production R2 bucket binding
+# Production R2 bucket binding (EU jurisdiction)
 [[env.production.r2_buckets]]
 binding = "R2_BUCKET"
-bucket_name = "static"
+bucket_name = "static-eu"
+jurisdiction = "eu"
 
 # Production environment variables
 [env.production.vars]
-ALLOWED_ORIGIN = "https://philippdubach.com,https://www.philippdubach.com"
+ALLOWED_ORIGIN = "https://philippdubach.com,https://www.philippdubach.com,https://phil-dubach.com"
 ENVIRONMENT = "production"
-
+LINKEDIN_NEWSLETTER_URLS = "https://www.linkedin.com/pulse/ai-lab-60b-cursor-25b-anthropic-chinese-open-weight-triple-dubach-ltbae"
+LISTMONK_API_URL = "https://mail.philippdubach.com"
+LISTMONK_LIST_ID = "3"
+LISTMONK_WELCOME_TEMPLATE_ID = "5"
