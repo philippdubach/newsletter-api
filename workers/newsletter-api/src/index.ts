@@ -285,7 +285,7 @@ async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Prom
 
   // Plunk generates the plain-text alternative from `body`.
   const emailPayload = {
-    from: { name: 'Philipp D. Dubach, AI & Markets', email: 'newsletter@m.philippdubach.com' },
+    from: { name: 'Philipp D. Dubach - AI & Markets', email: 'newsletter@m.philippdubach.com' },
     to: subscriberEmail,
     reply: 'hi@philippdubach.com',
     subject: 'Welcome to the Newsletter',
