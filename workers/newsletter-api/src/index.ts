@@ -29,7 +29,10 @@ interface NewsletterItem {
 
 const MAX_REQUEST_SIZE = 1024;
 const UNSUBSCRIBE_TOKEN_VERSION = 'v1';
-const DEFAULT_UNSUBSCRIBE_BASE_URL = 'https://newsletter-api.philippdubach.workers.dev';
+// The account's workers.dev subdomain is `philippd`, not `philippdubach`; the
+// blog's endpoint configuration previously pointed at a hostname that does not
+// resolve.  Override via UNSUBSCRIBE_BASE_URL if a custom domain is added.
+const DEFAULT_UNSUBSCRIBE_BASE_URL = 'https://newsletter-api.philippd.workers.dev';
 const RATE_LIMIT_WINDOW_MS = 60000;
 const RATE_LIMIT_MAX_REQUESTS = 5;
 const MAX_EMAIL_LENGTH = 320;
