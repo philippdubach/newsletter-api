@@ -1,4 +1,6 @@
-name = "newsletter-api"
+# Default (dev) worker has a distinct name so a bare `wrangler deploy` cannot
+# overwrite the production Worker (which must be deployed via --env production).
+name = "newsletter-api-dev"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 

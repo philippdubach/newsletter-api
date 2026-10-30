@@ -19,10 +19,35 @@ interface MockEnv {
   PLUNK_SECRET_KEY: string;
   ADMIN_TOKEN: string;
   ENVIRONMENT: string;
+  UNSUBSCRIBE_HMAC_SECRET: string;
+  UNSUBSCRIBE_BASE_URL?: string;
+  LISTMONK_API_URL?: string;
+  LISTMONK_API_USER?: string;
+  LISTMONK_API_TOKEN?: string;
+  LISTMONK_LIST_ID?: string;
 }
 
 // Import the worker
 import worker from './index';
+
+// The unsubscribe token is HMAC-SHA256 over the email with the server secret;
+// this test helper mirrors the signing scheme used by the Worker.
+async function unsubscribeToken(email: string, secret = 'test-hmac-secret'): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(email));
+  const hex = [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, '0')).join('');
+  return `v1:${hex}`;
+}
+
+function listmonkOk(): Response {
+  return new Response('{}', { status: 200 });
+}
 
 describe('Newsletter API', () => {
   let mockEnv: MockEnv;
@@ -43,6 +68,11 @@ describe('Newsletter API', () => {
       PLUNK_SECRET_KEY: 'test_api_key',
       ADMIN_TOKEN: 'test_token',
       ENVIRONMENT: 'development',
+      UNSUBSCRIBE_HMAC_SECRET: 'test-hmac-secret',
+      LISTMONK_API_URL: 'https://mail.example.com',
+      LISTMONK_API_USER: 'user',
+      LISTMONK_API_TOKEN: 'token',
+      LISTMONK_LIST_ID: '3',
     };
 
     mockCtx = {
@@ -129,6 +159,37 @@ describe('Newsletter API', () => {
       expect(body.message).toBe('Already subscribed');
     });
 
+    it('should accept a native URL-encoded form submission (no-JavaScript)', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(null);
+      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
+
+      const request = new Request('https://api.example.com/api/subscribe', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Origin: 'https://example.com',
+        },
+        body: 'email=form%40example.com',
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      const body = await response.json() as { success: boolean };
+
+      expect(response.status).toBe(200);
+      expect(body.success).toBe(true);
+    });
+
+    it('should reject malformed JSON as a client error, not a 500', async () => {
+      const request = new Request('https://api.example.com/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+        body: '{not json',
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(400);
+    });
+
     it('should reject honeypot submissions', async () => {
       mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(null);
 
@@ -168,7 +229,7 @@ describe('Newsletter API', () => {
   });
 
   describe('POST /api/unsubscribe', () => {
-    it('should unsubscribe a valid email', async () => {
+    it('should reject an email-only request without proof of control', async () => {
       mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
 
       const request = new Request('https://api.example.com/api/unsubscribe', {
@@ -181,11 +242,100 @@ describe('Newsletter API', () => {
       });
 
       const response = await worker.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(403);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).not.toHaveBeenCalled();
+    });
+
+    it('should unsubscribe with a valid subscriber-bound token', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
+      global.fetch = vi.fn().mockResolvedValue(listmonkOk());
+      const token = await unsubscribeToken('test@example.com');
+
+      const request = new Request('https://api.example.com/api/unsubscribe', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'https://example.com',
+        },
+        body: JSON.stringify({ email: 'test@example.com', token }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
       const body = await response.json() as { success: boolean; message: string };
 
       expect(response.status).toBe(200);
       expect(body.success).toBe(true);
-      expect(body.message).toBe('Unsubscribed successfully');
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith('test@example.com');
+    });
+
+    it('should use the documented plural Listmonk route', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
+      global.fetch = vi.fn().mockResolvedValue(listmonkOk());
+      const token = await unsubscribeToken('test@example.com');
+
+      const request = new Request('https://api.example.com/api/unsubscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+        body: JSON.stringify({ email: 'test@example.com', token }),
+      });
+      await worker.fetch(request, mockEnv, mockCtx);
+
+      const call = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(call[0]).toMatch(/\/api\/subscribers\/query\/lists$/);
+      expect(call[1].method).toBe('PUT');
+    });
+
+    it('should reject a token signed for a different address', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
+      global.fetch = vi.fn().mockResolvedValue(listmonkOk());
+      const token = await unsubscribeToken('other@example.com');
+
+      const request = new Request('https://api.example.com/api/unsubscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+        body: JSON.stringify({ email: 'test@example.com', token }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(403);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).not.toHaveBeenCalled();
+    });
+
+    it('should allow an operator bearer token without a subscriber token', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
+      global.fetch = vi.fn().mockResolvedValue(listmonkOk());
+
+      const request = new Request('https://api.example.com/api/unsubscribe', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'https://example.com',
+          Authorization: 'Bearer test_token',
+        },
+        body: JSON.stringify({ email: 'test@example.com' }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(200);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith('test@example.com');
+    });
+
+    it('should surface a Listmonk failure instead of claiming success', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
+      global.fetch = vi.fn().mockResolvedValue(new Response('{}', { status: 404 }));
+      const token = await unsubscribeToken('test@example.com');
+
+      const request = new Request('https://api.example.com/api/unsubscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+        body: JSON.stringify({ email: 'test@example.com', token }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(502);
+      // The durable KV entry is still removed so retries stay idempotent.
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith('test@example.com');
     });
 
     it('should reject invalid email on unsubscribe', async () => {
@@ -203,6 +353,37 @@ describe('Newsletter API', () => {
 
       expect(response.status).toBe(400);
       expect(body.error).toBe('Invalid email address');
+    });
+  });
+
+  describe('GET /api/unsubscribe (one-click email links)', () => {
+    it('should unsubscribe with a valid signed token and return HTML', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
+      global.fetch = vi.fn().mockResolvedValue(listmonkOk());
+      const token = await unsubscribeToken('test@example.com');
+
+      const request = new Request(
+        `https://api.example.com/api/unsubscribe?email=test%40example.com&token=${encodeURIComponent(token)}`,
+        { method: 'GET', headers: { Origin: 'https://example.com' } },
+      );
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Content-Type')).toContain('text/html');
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith('test@example.com');
+    });
+
+    it('should reject a missing or invalid token', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
+
+      const request = new Request(
+        'https://api.example.com/api/unsubscribe?email=test%40example.com',
+        { method: 'GET', headers: { Origin: 'https://example.com' } },
+      );
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(403);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).not.toHaveBeenCalled();
     });
   });
 
@@ -263,8 +444,11 @@ describe('Newsletter API', () => {
       const response = await worker.fetch(request, mockEnv, mockCtx);
       const body = await response.json() as { count: number; display: string };
 
+      // Two subscriber keys round up to 10+.  (The separate displayed-count
+      // semantics are tracked as an open item in the audit, not this fixture.)
       expect(response.status).toBe(200);
-      expect(body.count).toBe(100); // 2 real subscribers + 100, rounded down to nearest 10
+      expect(body.count).toBe(10);
+      expect(body.display).toBe('10+');
     });
   });
 
@@ -302,14 +486,50 @@ describe('Newsletter API', () => {
       expect(response.status).toBe(401);
     });
 
+    it('should require auth in development too (fail closed)', async () => {
+      mockEnv.ENVIRONMENT = 'development';
+
+      const request = new Request('https://api.example.com/api/test-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+        body: JSON.stringify({ email: 'test@example.com' }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(401);
+    });
+
+    it('should refuse the route when the environment identity is missing', async () => {
+      mockEnv.ENVIRONMENT = undefined as unknown as string;
+
+      const request = new Request('https://api.example.com/api/test-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+        body: JSON.stringify({ email: 'test@example.com' }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(503);
+    });
+
+    it('should refuse the route for an unknown environment', async () => {
+      mockEnv.ENVIRONMENT = 'staging-typo';
+
+      const request = new Request('https://api.example.com/api/test-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+        body: JSON.stringify({ email: 'test@example.com' }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(503);
+    });
+
     it('should allow with valid auth token', async () => {
       mockEnv.ENVIRONMENT = 'production';
-      
+
       // Mock fetch for Plunk API
-      global.fetch = vi.fn().mockResolvedValue({
-        ok: true,
-        text: () => Promise.resolve('{}'),
-      });
+      global.fetch = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
 
       const request = new Request('https://api.example.com/api/test-email', {
         method: 'POST',

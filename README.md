@@ -47,7 +47,15 @@ npm install
 ```
 PLUNK_SECRET_KEY=your_plunk_secret_key
 ADMIN_TOKEN=your_admin_token
+UNSUBSCRIBE_HMAC_SECRET=your_dev_hmac_secret
+LISTMONK_API_URL=https://mail.example.com
+LISTMONK_API_USER=user
+LISTMONK_API_TOKEN=token
+LISTMONK_LIST_ID=0
 ```
+
+Point `LISTMONK_*` at dummy/non-production values; the dev worker shares
+production KV/R2 storage, so never exercise it with real subscriber addresses.
 
 4. Update `wrangler.toml` with your KV namespace IDs and R2 bucket name.
 
@@ -69,7 +77,12 @@ npm run deploy:production
 npx wrangler deploy --env production
 ```
 
-> ⚠️ **Always pass `--env production`.** The top-level and `[env.production]` blocks in `wrangler.toml` share the same Worker name, so `wrangler deploy` (or `npm run deploy`) without an env flag uploads the dev env vars to the production Worker and breaks CORS for the live origin. Wrangler emits a warning when no env is specified — do not ignore it.
+> ⚠️ **Always pass `--env production` for production.** The default (dev) Worker is
+> named `newsletter-api-dev` so a plain `wrangler deploy` (or `npm run deploy`)
+> uploads a development worker and can no longer overwrite the production
+> Worker. Even so, deploy production with `npm run deploy:production` and do not
+> ignore wrangler's no-env warning. Dev and production still share KV/R2
+> resources, so only use dev with dummy data.
 
 ## Configuration
 
@@ -91,14 +104,20 @@ Secrets (set via `wrangler secret put ... --env production`):
 | `LISTMONK_API_USER` | Listmonk API user (Basic auth username) |
 | `LISTMONK_API_TOKEN` | Listmonk API token (Basic auth password) |
 | `PLUNK_SECRET_KEY` | Plunk project secret key — used by the welcome-email fallback path |
-| `ADMIN_TOKEN` | Token for `/api/test-email` in production |
+| `ADMIN_TOKEN` | Operator bearer token required for `/api/test-email` and for admin-initiated unsubscribes |
+| `UNSUBSCRIBE_HMAC_SECRET` | Signs subscriber-bound unsubscribe tokens (required for one-click email unsubscribe links) |
+| `UNSUBSCRIBE_BASE_URL` | Optional; origin used in unsubscribe links (defaults to the workers.dev hostname) |
 
 ```bash
 wrangler secret put LISTMONK_API_USER --env production
 wrangler secret put LISTMONK_API_TOKEN --env production
 wrangler secret put PLUNK_SECRET_KEY --env production
 wrangler secret put ADMIN_TOKEN --env production
+wrangler secret put UNSUBSCRIBE_HMAC_SECRET --env production
 ```
+
+Set the same secrets (with distinct values) for the dev worker if you exercise
+the protected routes locally.
 
 To bypass Listmonk for welcome emails, delete the `LISTMONK_*` secrets — the Worker will fall through to the Plunk code path automatically.
 
@@ -127,16 +146,28 @@ This creates a `subscribers.csv` file with all current subscribers. The script:
 
 ## Security
 
-The API implements several security measures:
+Controls are endpoint-specific:
 
-- Rate limiting (5 requests per minute per IP)
-- Request size limits (1KB max)
-- Email validation with RFC 5322 compliant regex
-- XSS protection via HTML sanitization
-- CORS origin validation
-- Timing-safe token comparison
-- Security headers (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection)
-- Honeypot field for bot detection
+- **`POST /api/subscribe`** — rate limited (5 requests/minute/IP, fail-open on
+  KV errors), honeypot field, bounded request body. The rate limiter is not
+  atomic under concurrency.
+- **`POST /api/subscribe` and `POST /api/unsubscribe`** — request bodies are
+  bounded to 1 KB on the streamed body itself (not just the declared
+  Content-Length); JSON and URL-encoded forms are accepted; malformed input is
+  a client error (4xx).
+- **`POST /api/unsubscribe`** — requires proof of control: a subscriber-bound
+  HMAC token signed over the email address, or an operator bearer
+  (`ADMIN_TOKEN`). Email-only requests are rejected. The Listmonk removal uses
+  the documented plural API route and a failed removal is reported as a failure.
+- **`POST /api/test-email`** — fail closed: refused when `ENVIRONMENT` is
+  missing or unknown, and requires the operator bearer token in every
+  environment.
+- Email validation with an RFC 5322-compliant regex; CORS origin validation;
+  timing-safe comparisons; security headers (X-Content-Type-Options,
+  X-Frame-Options, X-XSS-Protection).
+
+There is no HTML sanitizer in this codebase; do not render arbitrary values
+from provider responses as HTML client-side.
 
 ## License
 

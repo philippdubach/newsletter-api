@@ -15,7 +15,9 @@ export interface Env {
   // Rollback path: direct Plunk API call (kept as automatic fallback).
   // To force-rollback: remove LISTMONK_* secrets and Worker uses these instead.
   PLUNK_SECRET_KEY?: string;
-  ADMIN_TOKEN?: string; // for /api/test-email auth in prod
+  ADMIN_TOKEN?: string; // operator bearer token for /api/test-email and admin unsubscribe
+  UNSUBSCRIBE_HMAC_SECRET?: string; // signs subscriber-bound unsubscribe tokens
+  UNSUBSCRIBE_BASE_URL?: string; // origin used in email unsubscribe links
 }
 
 interface NewsletterItem {
@@ -26,6 +28,8 @@ interface NewsletterItem {
 }
 
 const MAX_REQUEST_SIZE = 1024;
+const UNSUBSCRIBE_TOKEN_VERSION = 'v1';
+const DEFAULT_UNSUBSCRIBE_BASE_URL = 'https://newsletter-api.philippdubach.workers.dev';
 const RATE_LIMIT_WINDOW_MS = 60000;
 const RATE_LIMIT_MAX_REQUESTS = 5;
 const MAX_EMAIL_LENGTH = 320;
@@ -77,10 +81,121 @@ function jsonResponse(data: unknown, status: number, request: Request, env: Env)
   });
 }
 
+function htmlResponse(body: string, status: number, request: Request, env: Env): Response {
+  return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>Newsletter</title></head><body>${body}</body></html>`, {
+    status,
+    headers: {
+      ...getCorsHeaders(request, env),
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-cache',
+    },
+  });
+}
+
 function isValidEmail(email: string): boolean {
   if (!email || typeof email !== 'string') return false;
   if (email.length > MAX_EMAIL_LENGTH) return false;
   return EMAIL_REGEX.test(email);
+}
+
+interface ParsedBody {
+  email?: string;
+  token?: string;
+  honeypot?: string;
+}
+
+type BodyResult =
+  | { ok: true; body: ParsedBody }
+  | { ok: false; status: number; error: string };
+
+/**
+ * Read and validate a POST body with an actual byte limit.
+ *
+ * Accepts JSON and URL-encoded form bodies (the blog's no-JavaScript native
+ * form sends the latter), and rejects malformed input as a client error rather
+ * than a 500.  The declared Content-Length is only an early rejection; the
+ * streamed body itself is bounded.
+ */
+async function readBody(request: Request): Promise<BodyResult> {
+  const declared = request.headers.get('Content-Length');
+  if (declared && parseInt(declared, 10) > MAX_REQUEST_SIZE) {
+    return { ok: false, status: 413, error: 'Request too large' };
+  }
+  let text: string;
+  try {
+    text = await request.text();
+  } catch {
+    return { ok: false, status: 400, error: 'Invalid request body' };
+  }
+  if (text.length > MAX_REQUEST_SIZE) {
+    return { ok: false, status: 413, error: 'Request too large' };
+  }
+  const rawType = (request.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
+  const jsonLike = !rawType || rawType === 'application/json' || rawType === 'text/plain';
+  if (jsonLike) {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (typeof parsed !== 'object' || parsed === null) {
+        return { ok: false, status: 400, error: 'Invalid request body' };
+      }
+      return { ok: true, body: parsed as ParsedBody };
+    } catch {
+      // Not JSON; fall through to form parsing for native form submissions.
+    }
+  }
+  if (rawType && !jsonLike && rawType !== 'application/x-www-form-urlencoded') {
+    return { ok: false, status: 415, error: 'Unsupported content type' };
+  }
+  try {
+    const params = new URLSearchParams(text);
+    return {
+      ok: true,
+      body: {
+        email: params.get('email') ?? undefined,
+        token: params.get('token') ?? undefined,
+        honeypot: params.get('honeypot') ?? undefined,
+      },
+    };
+  } catch {
+    return { ok: false, status: 400, error: 'Invalid request body' };
+  }
+}
+
+function redactEmail(email: string): string {
+  const at = email.indexOf('@');
+  if (at <= 1) return '***';
+  return `${email[0]}***${email.slice(at)}`;
+}
+
+async function hmacHex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Subscriber-bound token: HMAC over the subscriber's email and a server secret. */
+async function signUnsubscribeToken(email: string, env: Env): Promise<string | null> {
+  if (!env.UNSUBSCRIBE_HMAC_SECRET) return null;
+  return `${UNSUBSCRIBE_TOKEN_VERSION}:${await hmacHex(env.UNSUBSCRIBE_HMAC_SECRET, email)}`;
+}
+
+async function verifyUnsubscribeToken(email: string, token: string | undefined, env: Env): Promise<boolean> {
+  if (!env.UNSUBSCRIBE_HMAC_SECRET || !token) return false;
+  const prefix = `${UNSUBSCRIBE_TOKEN_VERSION}:`;
+  if (!token.startsWith(prefix)) return false;
+  const expected = await hmacHex(env.UNSUBSCRIBE_HMAC_SECRET, email);
+  return timingSafeEqual(token.slice(prefix.length), expected);
+}
+
+function unsubscribeUrl(email: string, token: string, env: Env): string {
+  const base = env.UNSUBSCRIBE_BASE_URL || DEFAULT_UNSUBSCRIBE_BASE_URL;
+  return `${base}/api/unsubscribe?email=${encodeURIComponent(email)}&token=${encodeURIComponent(token)}`;
 }
 
 function getClientIP(request: Request): string {
@@ -193,12 +308,16 @@ async function createListmonkSubscriber(email: string, clientIP: string, env: En
   }
 }
 
-async function unsubscribeFromListmonk(email: string, env: Env): Promise<void> {
-  if (!isListmonkConfigured(env)) return;
+async function unsubscribeFromListmonk(email: string, env: Env): Promise<{ success: boolean; error?: string }> {
+  // Without Listmonk configuration there is nothing to reconcile; the KV entry
+  // is the only store and has already been removed by the caller.
+  if (!isListmonkConfigured(env)) return { success: true };
   try {
     const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
     const safeEmail = email.replace(/'/g, "''");
-    const resp = await callListmonk(env, '/api/subscribers/query/list', {
+    // Documented Listmonk route is plural (PUT /api/subscribers/query/lists);
+    // the singular path used earlier is not a registered alias.
+    const resp = await callListmonk(env, '/api/subscribers/query/lists', {
       method: 'PUT',
       body: JSON.stringify({
         query: `subscribers.email = '${safeEmail}'`,
@@ -206,12 +325,18 @@ async function unsubscribeFromListmonk(email: string, env: Env): Promise<void> {
         target_list_ids: [listId],
       }),
     });
-    if (!resp.ok && resp.status !== 404) {
-      const body = await resp.text();
-      console.error(`Listmonk unsubscribe failed ${resp.status}: ${body}`);
-    }
+    if (resp.ok) return { success: true };
+    // 401/403 (insufficient permission), 404 and 5xx are all real failures: the
+    // subscriber must not be told they are removed while Listmonk still has them.
+    const body = await resp.text();
+    console.error(`Listmonk unsubscribe failed for ${redactEmail(email)}: HTTP ${resp.status}`);
+    const detail = resp.status === 404
+      ? 'route or subscriber not found'
+      : `Listmonk unsubscribe HTTP ${resp.status}: ${body.slice(0, 120)}`;
+    return { success: false, error: detail };
   } catch (err) {
-    console.error(`Listmonk unsubscribe exception: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`Listmonk unsubscribe exception for ${redactEmail(email)}`);
+    return { success: false, error: `Listmonk unsubscribe exception: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -283,6 +408,15 @@ async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Prom
     return { success: false, error: 'PLUNK_SECRET_KEY not configured' };
   }
 
+  // Every email carries a subscriber-bound one-click unsubscribe link to match
+  // the privacy notice ("every newsletter email has an unsubscribe link, removal
+  // is immediate").  Without the signing secret the link cannot be produced, so
+  // the previous reply-to fallback remains.
+  const token = await signUnsubscribeToken(subscriberEmail, env);
+  const unsubscribeHtml = token
+    ? `If you no longer wish to receive this newsletter, <a href="${unsubscribeUrl(subscriberEmail, token, env)}">unsubscribe here</a>.`
+    : 'To unsubscribe, simply reply to this email.';
+
   // Plunk generates the plain-text alternative from `body`.
   const emailPayload = {
     from: { name: 'Philipp D. Dubach - AI & Markets', email: 'newsletter@m.philippdubach.com' },
@@ -292,7 +426,7 @@ async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Prom
     body: `
       <p>Thanks for subscribing!</p>
       <p>You'll receive the next newsletter in your inbox. In the meantime, you can <a href="https://philippdubach.com/newsletter-archive/">browse the archive</a>.</p>
-      <p style="color: #666; font-size: 0.9em; margin-top: 2em;">To unsubscribe, simply reply to this email.</p>
+      <p style="color: #666; font-size: 0.9em; margin-top: 2em;">${unsubscribeHtml}</p>
     `,
   };
 
@@ -323,17 +457,22 @@ async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Prom
 
 async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    const contentLength = request.headers.get('Content-Length');
-    if (contentLength && parseInt(contentLength) > MAX_REQUEST_SIZE) {
+    // Cheap declared-length rejection before spending rate-limit budget; the
+    // streamed body itself is bounded later in readBody.
+    const declaredLength = request.headers.get('Content-Length');
+    if (declaredLength && parseInt(declaredLength, 10) > MAX_REQUEST_SIZE) {
       return jsonResponse({ success: false, error: 'Request too large' }, 413, request, env);
     }
-
     const clientIP = getClientIP(request);
     if (!await checkRateLimit(clientIP, env)) {
       return jsonResponse({ success: false, error: 'Too many requests. Please try again later.' }, 429, request, env);
     }
 
-    const body = await request.json() as { email?: string; honeypot?: string };
+    const parsed = await readBody(request);
+    if (!parsed.ok) {
+      return jsonResponse({ success: false, error: parsed.error }, parsed.status, request, env);
+    }
+    const body = parsed.body;
 
     if (body.honeypot) {
       return jsonResponse({ success: false, error: 'Invalid request' }, 400, request, env);
@@ -370,14 +509,14 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       if (created.success) {
         const sent = await sendListmonkWelcome(email, env);
         if (sent.success) return;
-        console.error(`Listmonk welcome send failed for ${email}: ${sent.error} — using Plunk fallback`);
+        console.error(`Listmonk welcome send failed for ${redactEmail(email)}: ${sent.error} — using Plunk fallback`);
       } else {
-        console.error(`Listmonk subscribe failed for ${email}: ${created.error} — using Plunk fallback`);
+        console.error(`Listmonk subscribe failed for ${redactEmail(email)}: ${created.error} — using Plunk fallback`);
       }
       // FALLBACK: direct Plunk API with legacy hardcoded welcome email
       const fallback = await sendPlunkWelcomeFallback(email, env);
       if (!fallback.success) {
-        console.error(`Plunk fallback also failed for ${email}: ${fallback.error}`);
+        console.error(`Plunk fallback also failed for ${redactEmail(email)}: ${fallback.error}`);
       }
     })());
 
@@ -389,21 +528,38 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
 
 async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    const contentLength = request.headers.get('Content-Length');
-    if (contentLength && parseInt(contentLength) > MAX_REQUEST_SIZE) {
+    const declaredLength = request.headers.get('Content-Length');
+    if (declaredLength && parseInt(declaredLength, 10) > MAX_REQUEST_SIZE) {
       return jsonResponse({ success: false, error: 'Request too large' }, 413, request, env);
     }
+    const parsed = await readBody(request);
+    if (!parsed.ok) {
+      return jsonResponse({ success: false, error: parsed.error }, parsed.status, request, env);
+    }
 
-    const body = await request.json() as { email?: string };
-    const email = (body.email || '').trim().toLowerCase();
-
+    const email = (parsed.body.email || '').trim().toLowerCase();
     if (!isValidEmail(email)) {
       return jsonResponse({ success: false, error: 'Invalid email address' }, 400, request, env);
     }
 
-    // Dual-delete: KV is primary, Listmonk shadows
+    // Proof of control: an operator bearer token, or a subscriber-bound signed
+    // token covering the exact email address.  An unauthenticated email-only
+    // request must not remove another subscriber (audit item 33).
+    const operatorAuthed = requireAuth(request, env);
+    const tokenValid = await verifyUnsubscribeToken(email, parsed.body.token, env);
+    if (!operatorAuthed && !tokenValid) {
+      return jsonResponse({ success: false, error: 'Invalid or missing unsubscribe token' }, 403, request, env);
+    }
+
+    // Durable intent first: remove the KV dual-write entry synchronously.
     await env.NEWSLETTER_SUBSCRIBERS.delete(email);
-    ctx.waitUntil(unsubscribeFromListmonk(email, env));
+
+    // The Listmonk removal is awaited so the acknowledgement reflects reality;
+    // it is idempotent, so a failed attempt can be retried safely.
+    const result = await unsubscribeFromListmonk(email, env);
+    if (!result.success) {
+      return jsonResponse({ success: false, error: 'Unsubscribe failed; please try again later' }, 502, request, env);
+    }
 
     return jsonResponse({ success: true, message: 'Unsubscribed successfully' }, 200, request, env);
   } catch {
@@ -614,6 +770,26 @@ export default {
       return handleUnsubscribe(request, env, ctx);
     }
 
+    // One-click unsubscribe from emails: the request carries the signed token,
+    // so it is a benign, non-navigational side effect for the token holder.
+    if (path === '/api/unsubscribe' && request.method === 'GET') {
+      const email = (url.searchParams.get('email') || '').trim().toLowerCase();
+      const token = url.searchParams.get('token') || undefined;
+      if (!isValidEmail(email) || !(await verifyUnsubscribeToken(email, token, env))) {
+        return htmlResponse('<h1>Unsubscribe link invalid or expired</h1><p>Please contact us and we will remove you manually.</p>', 403, request, env);
+      }
+      await env.NEWSLETTER_SUBSCRIBERS.delete(email);
+      const result = await unsubscribeFromListmonk(email, env);
+      return htmlResponse(
+        result.success
+          ? '<h1>You have been unsubscribed</h1><p>You will no longer receive the newsletter.</p>'
+          : '<h1>Could not complete unsubscribe</h1><p>Please try again later.</p>',
+        result.success ? 200 : 502,
+        request,
+        env,
+      );
+    }
+
     if (path === '/api/newsletters' && request.method === 'GET') {
       return handleGetNewsletters(request, env);
     }
@@ -670,25 +846,35 @@ export default {
       return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() }, 200, request, env);
     }
 
-    // Test the Plunk fallback path directly (admin-auth gated in prod)
+    // Test the Plunk fallback path.  Fail closed: refuses when the environment
+    // identity is missing or unknown, and requires operator auth in every
+    // environment (a development deploy must not send mail unauthenticated).
     if (path === '/api/test-email' && request.method === 'POST') {
-      if (env.ENVIRONMENT === 'production' && !requireAuth(request, env)) {
+      if (env.ENVIRONMENT !== 'production' && env.ENVIRONMENT !== 'development') {
+        return jsonResponse({ error: 'Test email route not configured for this environment' }, 503, request, env);
+      }
+      if (!requireAuth(request, env)) {
         return jsonResponse({ error: 'Unauthorized' }, 401, request, env);
       }
       try {
-        const body = await request.json() as { email?: string };
-        const testEmail = body.email || 'test@example.com';
+        const parsed = await readBody(request);
+        if (!parsed.ok) {
+          return jsonResponse({ success: false, error: parsed.error }, parsed.status, request, env);
+        }
+        const testEmail = (parsed.body.email || '').trim().toLowerCase() || 'test@example.com';
         if (!isValidEmail(testEmail)) {
           return jsonResponse({ success: false, error: 'Invalid email' }, 400, request, env);
         }
         const result = await sendPlunkWelcomeFallback(testEmail, env);
         if (result.success) {
           return jsonResponse({ success: true, message: 'Test email sent' }, 200, request, env);
-        } else {
-          return jsonResponse({ success: false, error: result.error }, 500, request, env);
         }
-      } catch (error) {
-        return jsonResponse({ success: false, error: `Exception: ${error instanceof Error ? error.message : String(error)}` }, 500, request, env);
+        // Surface a generic error to the caller; the provider detail is for logs.
+        console.error(`Test email failed for ${redactEmail(testEmail)}: ${result.error}`);
+        return jsonResponse({ success: false, error: 'Test email sending failed' }, 500, request, env);
+      } catch {
+        console.error('Test email exception');
+        return jsonResponse({ success: false, error: 'Test email sending failed' }, 500, request, env);
       }
     }
 
