@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock types
 interface MockKVNamespace {
@@ -29,7 +29,7 @@ interface MockEnv {
 }
 
 // Import the worker
-import worker, { reconcileSignup } from './index';
+import worker, { reconcileSignup, type Env } from './index';
 
 type EnvLike = Parameters<typeof reconcileSignup>[3];
 
@@ -53,10 +53,15 @@ function listmonkOk(): Response {
 }
 
 describe('Newsletter API', () => {
-  let mockEnv: MockEnv;
+  let mockEnv: MockEnv & Env;
   let mockCtx: ExecutionContext;
+  let pending: Promise<unknown>[];
+  let deniedFetch: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    deniedFetch = vi.fn().mockRejectedValue(new Error('Unexpected outbound request in test'));
+    vi.stubGlobal('fetch', deniedFetch);
+    pending = [];
     mockEnv = {
       NEWSLETTER_SUBSCRIBERS: {
         get: vi.fn(),
@@ -77,14 +82,20 @@ describe('Newsletter API', () => {
       LISTMONK_API_TOKEN: 'token',
       LISTMONK_LIST_ID: '3',
       LISTMONK_WELCOME_TEMPLATE_ID: '5',
-    };
+    } as unknown as MockEnv & Env;
 
     mockCtx = {
-      waitUntil: vi.fn(),
+      waitUntil: vi.fn((promise: Promise<unknown>) => { pending.push(promise); }),
       passThroughOnException: vi.fn(),
     } as unknown as ExecutionContext;
 
     vi.clearAllMocks();
+  });
+
+  afterEach(async () => {
+    await Promise.allSettled(pending);
+    vi.unstubAllGlobals();
+    expect(deniedFetch).not.toHaveBeenCalled();
   });
 
   describe('OPTIONS requests', () => {
@@ -251,7 +262,7 @@ describe('Newsletter API', () => {
       expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).not.toHaveBeenCalled();
     });
 
-    it('should unsubscribe with a valid subscriber-bound token', async () => {
+    it('reports provider acknowledgement as unverified with a valid token', async () => {
       mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
       global.fetch = vi.fn().mockResolvedValue(listmonkOk());
       const token = await unsubscribeToken('test@example.com');
@@ -266,11 +277,24 @@ describe('Newsletter API', () => {
       });
 
       const response = await worker.fetch(request, mockEnv, mockCtx);
-      const body = await response.json() as { success: boolean; message: string };
+      const body = await response.json() as { success: boolean; status: string; message: string };
 
-      expect(response.status).toBe(200);
-      expect(body.success).toBe(true);
+      expect(response.status).toBe(202);
+      expect(body.success).toBe(false);
+      expect(body.status).toBe('unverified');
+      expect(body.message).toContain('could not be verified');
       expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith('test@example.com');
+    });
+
+    it('does not claim completion for an asynchronous provider response', async () => {
+      global.fetch = vi.fn().mockResolvedValue(new Response('{}', { status: 202 }));
+      const token = await unsubscribeToken('test@example.com');
+      const response = await worker.fetch(new Request('https://api.example.com/api/unsubscribe', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'test@example.com', token }),
+      }), mockEnv, mockCtx);
+      expect(response.status).toBe(202);
+      expect(await response.json()).toMatchObject({ success: false, status: 'unverified' });
     });
 
     it('should use the documented plural Listmonk route', async () => {
@@ -321,7 +345,7 @@ describe('Newsletter API', () => {
       });
 
       const response = await worker.fetch(request, mockEnv, mockCtx);
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(202);
       expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith('test@example.com');
     });
 
@@ -338,8 +362,30 @@ describe('Newsletter API', () => {
 
       const response = await worker.fetch(request, mockEnv, mockCtx);
       expect(response.status).toBe(502);
-      // The durable KV entry is still removed so retries stay idempotent.
+      // KV is removed, but there is no durable retry or ordering guarantee.
       expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith('test@example.com');
+    });
+
+    it('rejects an unsubscribe body over the 2 KB limit', async () => {
+      const response = await worker.fetch(new Request('https://api.example.com/api/unsubscribe', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'a'.repeat(2049) }),
+      }), mockEnv, mockCtx);
+      expect(response.status).toBe(413);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).not.toHaveBeenCalled();
+    });
+
+    it('does not acknowledge or delete KV when Listmonk configuration is incomplete', async () => {
+      mockEnv.LISTMONK_API_TOKEN = '';
+      const token = await unsubscribeToken('test@example.com');
+      const request = new Request('https://api.example.com/api/unsubscribe', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'test@example.com', token }),
+      });
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(502);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).not.toHaveBeenCalled();
+      expect(global.fetch).not.toHaveBeenCalled();
     });
 
     it('should reject invalid email on unsubscribe', async () => {
@@ -360,21 +406,66 @@ describe('Newsletter API', () => {
     });
   });
 
-  describe('GET /api/unsubscribe (one-click email links)', () => {
-    it('should unsubscribe with a valid signed token and return HTML', async () => {
+  describe('unsubscribe email links', () => {
+    it('does not unsubscribe when a valid link is prefetched; a form POST does', async () => {
       mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
       global.fetch = vi.fn().mockResolvedValue(listmonkOk());
-      const token = await unsubscribeToken('test@example.com');
+      const email = "te'st&x@example.com";
+      const token = await unsubscribeToken(email);
 
       const request = new Request(
-        `https://api.example.com/api/unsubscribe?email=test%40example.com&token=${encodeURIComponent(token)}`,
-        { method: 'GET', headers: { Origin: 'https://example.com' } },
+        `https://api.example.com/api/unsubscribe?email=${encodeURIComponent(email)}&token=${encodeURIComponent(token)}`,
+        { method: 'GET' },
       );
-
       const response = await worker.fetch(request, mockEnv, mockCtx);
+      const html = await response.text();
       expect(response.status).toBe(200);
       expect(response.headers.get('Content-Type')).toContain('text/html');
-      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith('test@example.com');
+      expect(response.headers.get('Referrer-Policy')).toBe('no-referrer');
+      expect(html).toContain('te&#39;st&amp;x@example.com');
+      expect(html).toContain('action="/api/unsubscribe/confirm"');
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).not.toHaveBeenCalled();
+      expect(global.fetch).not.toHaveBeenCalled();
+
+      const post = new Request('https://api.example.com/api/unsubscribe/confirm', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ email, token }).toString(),
+      });
+      const confirmation = await worker.fetch(post, mockEnv, mockCtx);
+      expect(confirmation.status).toBe(202);
+      expect(await confirmation.text()).toContain('could not verify removal');
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith(email);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('accepts the form encoding of an accepted 320-character email', async () => {
+      const email = '&'.repeat(315) + '@x.co';
+      const token = await unsubscribeToken(email);
+      const body = new URLSearchParams({ email, token }).toString();
+      expect(new TextEncoder().encode(body).length).toBeGreaterThan(1024);
+      global.fetch = vi.fn().mockResolvedValue(listmonkOk());
+      const get = await worker.fetch(new Request(
+        `https://api.example.com/api/unsubscribe?email=${encodeURIComponent(email)}&token=${encodeURIComponent(token)}`,
+      ), mockEnv, mockCtx);
+      expect(get.status).toBe(200);
+      const post = await worker.fetch(new Request('https://api.example.com/api/unsubscribe/confirm', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
+      }), mockEnv, mockCtx);
+      expect(post.status).toBe(202);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.delete).toHaveBeenCalledWith(email);
+    });
+
+    it('does not claim success when the upstream unsubscribe fails', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.delete.mockResolvedValue(undefined);
+      global.fetch = vi.fn().mockResolvedValue(new Response('', { status: 500 }));
+      const token = await unsubscribeToken('test@example.com');
+      const post = new Request('https://api.example.com/api/unsubscribe/confirm', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ email: 'test@example.com', token }).toString(),
+      });
+      const response = await worker.fetch(post, mockEnv, mockCtx);
+      expect(response.status).toBe(502);
+      expect(await response.text()).toContain('Could not complete unsubscribe');
     });
 
     it('should reject a missing or invalid token', async () => {
@@ -415,6 +506,7 @@ describe('Newsletter API', () => {
 
     it('should return fallback when R2 is empty', async () => {
       mockEnv.R2_BUCKET.list.mockResolvedValue({ objects: [] });
+      global.fetch = vi.fn().mockRejectedValue(new Error('Synthetic archive failure'));
 
       const request = new Request('https://api.example.com/api/newsletters', {
         method: 'GET',
@@ -431,6 +523,7 @@ describe('Newsletter API', () => {
 
   describe('GET /api/subscriber-count', () => {
     it('should return subscriber count', async () => {
+      mockEnv.LISTMONK_API_TOKEN = ''; // This fixture exercises the KV-only fallback.
       mockEnv.NEWSLETTER_SUBSCRIBERS.list.mockResolvedValue({
         keys: [
           { name: 'user1@example.com' },
@@ -622,16 +715,14 @@ describe('Newsletter API', () => {
       expect(urls.some(u => u.includes('useplunk.com'))).toBe(false);
     });
 
-    it('never clobbers a newer intent when recording the outcome', async () => {
-      mockEnv.NEWSLETTER_SUBSCRIBERS.get
-        .mockResolvedValueOnce(recordJson(5))
-        .mockResolvedValueOnce(recordJson(5))
-        .mockResolvedValueOnce(recordJson(99)); // a resubscribe replaced the record mid-flight
-      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
+    it('does not rewrite a checked record to KV after reconciliation', async () => {
+      // A check-then-put here could restore a record deleted between those two
+      // operations, even when both reads still see the same intent.
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(recordJson(5));
       const f = stubFetch(200);
       await reconcileSignup('race@example.com', 5, '1.2.3.4', mockEnv as unknown as EnvLike, { welcome: false });
+      expect(f).toHaveBeenCalled();
       expect(mockEnv.NEWSLETTER_SUBSCRIBERS.put).not.toHaveBeenCalled();
-      expect(f).toHaveBeenCalled(); // the create ran, but the outcome was not recorded
     });
   });
 });

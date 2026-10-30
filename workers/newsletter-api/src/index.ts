@@ -28,6 +28,8 @@ interface NewsletterItem {
 }
 
 const MAX_REQUEST_SIZE = 1024;
+// URL-encoding a 320-character address plus its signed token can exceed 1 KB.
+const MAX_UNSUBSCRIBE_REQUEST_SIZE = 2048;
 const UNSUBSCRIBE_TOKEN_VERSION = 'v1';
 // The account's workers.dev subdomain is `philippd`, not `philippdubach`; the
 // blog's endpoint configuration previously pointed at a hostname that does not
@@ -90,7 +92,9 @@ function htmlResponse(body: string, status: number, request: Request, env: Env):
     headers: {
       ...getCorsHeaders(request, env),
       'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+      'Content-Security-Policy': "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     },
   });
 }
@@ -277,11 +281,9 @@ interface SubscriptionRecord {
   timestamp: string;
   ip: string;
   userAgent: string;
-  // Monotonic intent version per address.  A slow background task must only
-  // apply while the stored record still carries the version it captured, so a
-  // later unsubscribe (KV delete) or resubscribe supersedes it (audit item 35).
+  // Best-effort intent marker. KV is eventually consistent and this value
+  // cannot serialize in-flight Listmonk writes with unsubscribe requests.
   seq: number;
-  listmonk?: string; // last reconciliation outcome ('ok' | 'error') — observability
 }
 
 async function readRecord(email: string, env: Env): Promise<SubscriptionRecord | null> {
@@ -294,7 +296,6 @@ async function readRecord(email: string, env: Env): Promise<SubscriptionRecord |
       ip: typeof parsed.ip === 'string' ? parsed.ip : 'unknown',
       userAgent: typeof parsed.userAgent === 'string' ? parsed.userAgent : 'unknown',
       seq: typeof parsed.seq === 'number' ? parsed.seq : 0,
-      ...(typeof parsed.listmonk === 'string' ? { listmonk: parsed.listmonk } : {}),
     };
   } catch {
     return null;
@@ -307,23 +308,10 @@ async function intentStillCurrent(email: string, seq: number, env: Env): Promise
   return record !== null && record.seq === seq;
 }
 
-async function recordListmonkState(email: string, seq: number, status: 'ok' | 'error', env: Env): Promise<void> {
-  try {
-    const record = await readRecord(email, env);
-    if (record === null || record.seq !== seq) return; // never clobber a newer intent
-    record.listmonk = status;
-    await env.NEWSLETTER_SUBSCRIBERS.put(email, JSON.stringify(record));
-  } catch {
-    // Best-effort observability field; never fail the signup flow over it.
-  }
-}
-
 /**
- * Reconcile Listmonk with the subscriber's latest intent (KV).  Runs in the
- * background after the subscribe response, but only applies while the address
- * still holds the intent version captured at request time.  This keeps the two
- * stores from diverging: a slow earlier signup can no longer re-add an address
- * after an unsubscribe, and a 5xx claiming "duplicate" is treated as a failure.
+ * Best-effort signup reconciliation. Intent checks can suppress some stale
+ * work, but cannot cancel a Listmonk request already in flight or guarantee
+ * ordering across KV and Listmonk. That race requires a durable coordinator.
  */
 export async function reconcileSignup(
   email: string,
@@ -355,7 +343,9 @@ export async function reconcileSignup(
     if (options.welcome) await sendFallbackWelcome(email, env);
   }
 
-  await recordListmonkState(email, seq, created.success ? 'ok' : 'error', env);
+  // Do not write a status back to KV here: a check-then-put can resurrect a
+  // record deleted by an overlapping unsubscribe. This does not fix the
+  // separate in-flight Listmonk ordering race described above.
 }
 
 async function sendFallbackWelcome(email: string, env: Env): Promise<void> {
@@ -467,9 +457,11 @@ async function createListmonkSubscriber(email: string, clientIP: string, env: En
 }
 
 async function unsubscribeFromListmonk(email: string, env: Env): Promise<{ success: boolean; error?: string }> {
-  // Without Listmonk configuration there is nothing to reconcile; the KV entry
-  // is the only store and has already been removed by the caller.
-  if (!isListmonkConfigured(env)) return { success: true };
+  // Missing configuration does not prove that Listmonk has no existing
+  // subscription. Fail closed rather than falsely acknowledging removal.
+  if (!isListmonkConfigured(env)) {
+    return { success: false, error: 'Listmonk not configured' };
+  }
   try {
     const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
     const safeEmail = email.replace(/'/g, "''");
@@ -653,9 +645,8 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       return jsonResponse({ success: true, message: 'Already subscribed' }, 200, request, env);
     }
 
-    // Dual-write: KV is the durable, synchronous record; Listmonk registration
-    // and the welcome run in the background, gated on this intent version so a
-    // later unsubscribe or resubscribe supersedes the work (audit item 35).
+    // KV is written first; background Listmonk registration remains subject to
+    // an ordering race with unsubscribe (audit item 35).
     const record: SubscriptionRecord = {
       timestamp: new Date().toISOString(),
       ip: clientIP,
@@ -674,11 +665,7 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
 
 async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    const declaredLength = request.headers.get('Content-Length');
-    if (declaredLength && parseInt(declaredLength, 10) > MAX_REQUEST_SIZE) {
-      return jsonResponse({ success: false, error: 'Request too large' }, 413, request, env);
-    }
-    const parsed = await readBody(request);
+    const parsed = await readBody(request, MAX_UNSUBSCRIBE_REQUEST_SIZE);
     if (!parsed.ok) {
       return jsonResponse({ success: false, error: parsed.error }, parsed.status, request, env);
     }
@@ -696,18 +683,27 @@ async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionConte
     if (!operatorAuthed && !tokenValid) {
       return jsonResponse({ success: false, error: 'Invalid or missing unsubscribe token' }, 403, request, env);
     }
+    if (!isListmonkConfigured(env)) {
+      return jsonResponse({ success: false, error: 'Unsubscribe unavailable; please try again later' }, 502, request, env);
+    }
 
-    // Durable intent first: remove the KV dual-write entry synchronously.
+    // Remove the KV entry first. This is not a durable intent tombstone and
+    // cannot resolve the in-flight signup ordering race.
     await env.NEWSLETTER_SUBSCRIBERS.delete(email);
 
-    // The Listmonk removal is awaited so the acknowledgement reflects reality;
-    // it is idempotent, so a failed attempt can be retried safely.
+    // Await the provider response, but do not treat a 2xx as proof of final
+    // removal: the provider contract and concurrent signup ordering are not
+    // verified. A failed/ambiguous request is not durably retried here.
     const result = await unsubscribeFromListmonk(email, env);
     if (!result.success) {
       return jsonResponse({ success: false, error: 'Unsubscribe failed; please try again later' }, 502, request, env);
     }
 
-    return jsonResponse({ success: true, message: 'Unsubscribed successfully' }, 200, request, env);
+    return jsonResponse({
+      success: false,
+      status: 'unverified',
+      message: 'A response was received, but removal could not be verified. If you receive another newsletter, please contact us.',
+    }, 202, request, env);
   } catch {
     return jsonResponse({ success: false, error: 'Internal server error' }, 500, request, env);
   }
@@ -916,23 +912,34 @@ export default {
       return handleUnsubscribe(request, env, ctx);
     }
 
-    // One-click unsubscribe from emails: the request carries the signed token,
-    // so it is a benign, non-navigational side effect for the token holder.
+    // Link scanners commonly prefetch GETs. Viewing a signed link must not
+    // mutate a subscription; a human can submit the form with one click.
     if (path === '/api/unsubscribe' && request.method === 'GET') {
       const email = (url.searchParams.get('email') || '').trim().toLowerCase();
       const token = url.searchParams.get('token') || undefined;
       if (!isValidEmail(email) || !(await verifyUnsubscribeToken(email, token, env))) {
         return htmlResponse('<h1>Unsubscribe link invalid or expired</h1><p>Please contact us and we will remove you manually.</p>', 403, request, env);
       }
-      await env.NEWSLETTER_SUBSCRIBERS.delete(email);
-      const result = await unsubscribeFromListmonk(email, env);
+      const escape = (s: string) => s.replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[c]!));
       return htmlResponse(
-        result.success
-          ? '<h1>You have been unsubscribed</h1><p>You will no longer receive the newsletter.</p>'
-          : '<h1>Could not complete unsubscribe</h1><p>Please try again later.</p>',
-        result.success ? 200 : 502,
-        request,
-        env,
+        `<h1>Unsubscribe from the newsletter</h1><form method="post" action="/api/unsubscribe/confirm">` +
+        `<input type="hidden" name="email" value="${escape(email)}">` +
+        `<input type="hidden" name="token" value="${escape(token!)}">` +
+        '<button type="submit">Unsubscribe</button></form>', 200, request, env,
+      );
+    }
+
+    // Keep the existing authenticated JSON/form POST API, while presenting a
+    // human-readable result for the browser form. No signed values are echoed.
+    if (path === '/api/unsubscribe/confirm' && request.method === 'POST') {
+      const result = await handleUnsubscribe(request, env, ctx);
+      return htmlResponse(
+        result.ok
+          ? '<h1>Unsubscribe request sent</h1><p>We received a response, but could not verify removal. If you receive another newsletter, please contact us.</p>'
+          : '<h1>Could not complete unsubscribe</h1><p>Please try again or contact us.</p>',
+        result.status, request, env,
       );
     }
 

@@ -18,11 +18,13 @@ A Cloudflare Workers API for managing newsletter subscriptions. Handles email su
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/subscribe` | Subscribe an email address |
-| POST | `/api/unsubscribe` | Remove a subscription |
+| GET | `/api/unsubscribe` | Display the signed unsubscribe form without changing the subscription |
+| POST | `/api/unsubscribe` | Request removal with a signed token or operator authorization; completion is unverified |
+| POST | `/api/unsubscribe/confirm` | Submit the signed browser form and display the result |
 | GET | `/api/newsletters` | List available newsletters |
 | GET | `/api/subscriber-count` | Get combined subscriber count (Listmonk + LinkedIn followers), 10-min cached |
 | GET | `/api/health` | Health check |
-| POST | `/api/test-email` | Test email sending (dev only or auth required) |
+| POST | `/api/test-email` | Send a test email (operator authorization required in every environment) |
 
 ## Requirements
 
@@ -105,7 +107,7 @@ Secrets (set via `wrangler secret put ... --env production`):
 | `LISTMONK_API_TOKEN` | Listmonk API token (Basic auth password) |
 | `PLUNK_SECRET_KEY` | Plunk project secret key — used by the welcome-email fallback path |
 | `ADMIN_TOKEN` | Operator bearer token required for `/api/test-email` and for admin-initiated unsubscribes |
-| `UNSUBSCRIBE_HMAC_SECRET` | Signs subscriber-bound unsubscribe tokens (required for one-click email unsubscribe links) |
+| `UNSUBSCRIBE_HMAC_SECRET` | Signs subscriber-bound unsubscribe tokens (required for email unsubscribe links) |
 | `UNSUBSCRIBE_BASE_URL` | Optional; origin used in unsubscribe links (defaults to the workers.dev hostname) |
 
 ```bash
@@ -119,7 +121,11 @@ wrangler secret put UNSUBSCRIBE_HMAC_SECRET --env production
 Set the same secrets (with distinct values) for the dev worker if you exercise
 the protected routes locally.
 
-To bypass Listmonk for welcome emails, delete the `LISTMONK_*` secrets — the Worker will fall through to the Plunk code path automatically.
+If `LISTMONK_*` secrets are removed, welcome email can fall through to Plunk.
+Unsubscribe requests fail closed with 502 when Listmonk is not configured,
+because missing configuration does not prove that existing Listmonk
+subscriptions are absent. Restore the configuration or remove affected
+subscriptions manually; this fallback is not a complete replacement.
 
 ## Testing
 
@@ -127,6 +133,8 @@ Run the test suite:
 ```bash
 npm test
 ```
+These tests run in Node with mocked bindings and provider responses; they are
+not a Worker-runtime or live-provider integration test.
 
 ## Scripts
 
@@ -151,14 +159,25 @@ Controls are endpoint-specific:
 - **`POST /api/subscribe`** — rate limited (5 requests/minute/IP, fail-open on
   KV errors), honeypot field, bounded request body. The rate limiter is not
   atomic under concurrency.
-- **`POST /api/subscribe` and `POST /api/unsubscribe`** — request bodies are
-  bounded to 1 KB on the streamed body itself (not just the declared
-  Content-Length); JSON and URL-encoded forms are accepted; malformed input is
-  a client error (4xx).
+- **`POST /api/subscribe` and `POST /api/unsubscribe`** — streamed request
+  bodies are bounded to 1 KB and 2 KB respectively, not just by the declared
+  Content-Length; JSON and URL-encoded forms are accepted. Invalid JSON, raw
+  UTF-8, body shape or declared length produces a client error (4xx); the form
+  decoder follows URLSearchParams' tolerant percent-decoding behavior.
 - **`POST /api/unsubscribe`** — requires proof of control: a subscriber-bound
   HMAC token signed over the email address, or an operator bearer
   (`ADMIN_TOKEN`). Email-only requests are rejected. The Listmonk removal uses
-  the documented plural API route and a failed removal is reported as a failure.
+  the documented plural API route and a failed or unconfigured removal is
+  reported as a failure. A provider 2xx returns HTTP 202 with `success: false`
+  and `status: "unverified"`: it reports receiving an upstream 2xx, not
+  confirmed removal or a durable queue. There is no automatic retry; if another
+  newsletter arrives, contact the operator. This changes the earlier 200/success
+  response and clients must handle it explicitly. Signed GET links show a form
+  and do not remove subscribers on prefetch; the form submits a POST.
+- **Subscription ordering limitation** — KV intent checks cannot prevent an
+  already in-flight Listmonk signup from completing after an unsubscribe. A
+  successful response alone does not establish cross-system ordering; this
+  requires a durable coordination and recovery design.
 - **`POST /api/test-email`** — fail closed: refused when `ENVIRONMENT` is
   missing or unknown, and requires the operator bearer token in every
   environment.
