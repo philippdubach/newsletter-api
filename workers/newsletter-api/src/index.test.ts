@@ -25,10 +25,13 @@ interface MockEnv {
   LISTMONK_API_USER?: string;
   LISTMONK_API_TOKEN?: string;
   LISTMONK_LIST_ID?: string;
+  LISTMONK_WELCOME_TEMPLATE_ID?: string;
 }
 
 // Import the worker
-import worker from './index';
+import worker, { reconcileSignup } from './index';
+
+type EnvLike = Parameters<typeof reconcileSignup>[3];
 
 // The unsubscribe token is HMAC-SHA256 over the email with the server secret;
 // this test helper mirrors the signing scheme used by the Worker.
@@ -73,6 +76,7 @@ describe('Newsletter API', () => {
       LISTMONK_API_USER: 'user',
       LISTMONK_API_TOKEN: 'token',
       LISTMONK_LIST_ID: '3',
+      LISTMONK_WELCOME_TEMPLATE_ID: '5',
     };
 
     mockCtx = {
@@ -559,6 +563,75 @@ describe('Newsletter API', () => {
 
       expect(response.status).toBe(404);
       expect(body.error).toBe('Not found');
+    });
+  });
+
+  describe('Listmonk reconciliation (audit item 35)', () => {
+    const recordJson = (seq: number): string =>
+      JSON.stringify({ timestamp: '2026-01-01T00:00:00Z', ip: '1.2.3.4', userAgent: 'test', seq });
+
+    function stubFetch(subscribersStatus = 200, subscribersBody = '{}'): ReturnType<typeof vi.fn> {
+      const f = vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/subscribers')) {
+          return Promise.resolve(new Response(subscribersBody, { status: subscribersStatus }));
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }));
+      });
+      global.fetch = f as unknown as typeof fetch;
+      return f;
+    }
+
+    const urlsOf = (f: ReturnType<typeof vi.fn>): string[] =>
+      (f.mock.calls as Array<Array<RequestInfo | URL>>).map(call => String(call[0]));
+
+    it('skips Listmonk when the record was removed (slow signup after unsubscribe)', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(null);
+      const f = stubFetch();
+      await reconcileSignup('late@example.com', 123, '1.2.3.4', mockEnv as unknown as EnvLike, { welcome: true });
+      expect(f).not.toHaveBeenCalled();
+    });
+
+    it('treats 409 as an existing subscriber without reactivating or resending the welcome', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(recordJson(7));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
+      const f = stubFetch(409);
+      await reconcileSignup('dup@example.com', 7, '1.2.3.4', mockEnv as unknown as EnvLike, { welcome: true });
+      const urls = urlsOf(f);
+      expect(urls.filter(u => u.includes('mail.example.com')).length).toBe(1); // create only
+      expect(urls.some(u => u.includes('useplunk.com'))).toBe(false);         // no welcome on duplicate
+    });
+
+    it('treats a 500 whose body mentions "duplicate" as a real failure (Plunk fallback)', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(recordJson(8));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
+      const f = stubFetch(500, '{"error":"duplicate conflict"}');
+      await reconcileSignup('faildup@example.com', 8, '1.2.3.4', mockEnv as unknown as EnvLike, { welcome: true });
+      const urls = urlsOf(f);
+      expect(urls.filter(u => u.includes('mail.example.com')).length).toBe(1); // failed create only
+      expect(urls.some(u => u.includes('useplunk.com'))).toBe(true);          // fallback welcome
+    });
+
+    it('sends the welcome through Listmonk tx after a successful create', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(recordJson(9));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
+      const f = stubFetch(200);
+      await reconcileSignup('ok@example.com', 9, '1.2.3.4', mockEnv as unknown as EnvLike, { welcome: true });
+      const urls = urlsOf(f);
+      expect(urls.filter(u => u.includes('/api/tx')).length).toBe(1);
+      expect(urls.some(u => u.includes('useplunk.com'))).toBe(false);
+    });
+
+    it('never clobbers a newer intent when recording the outcome', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get
+        .mockResolvedValueOnce(recordJson(5))
+        .mockResolvedValueOnce(recordJson(5))
+        .mockResolvedValueOnce(recordJson(99)); // a resubscribe replaced the record mid-flight
+      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
+      const f = stubFetch(200);
+      await reconcileSignup('race@example.com', 5, '1.2.3.4', mockEnv as unknown as EnvLike, { welcome: false });
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.put).not.toHaveBeenCalled();
+      expect(f).toHaveBeenCalled(); // the create ran, but the outcome was not recorded
     });
   });
 });

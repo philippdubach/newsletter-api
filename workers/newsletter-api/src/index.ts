@@ -209,6 +209,98 @@ function getClientIP(request: Request): string {
   return 'unknown';
 }
 
+interface SubscriptionRecord {
+  timestamp: string;
+  ip: string;
+  userAgent: string;
+  // Monotonic intent version per address.  A slow background task must only
+  // apply while the stored record still carries the version it captured, so a
+  // later unsubscribe (KV delete) or resubscribe supersedes it (audit item 35).
+  seq: number;
+  listmonk?: string; // last reconciliation outcome ('ok' | 'error') — observability
+}
+
+async function readRecord(email: string, env: Env): Promise<SubscriptionRecord | null> {
+  try {
+    const raw = await env.NEWSLETTER_SUBSCRIBERS.get(email);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SubscriptionRecord>;
+    return {
+      timestamp: typeof parsed.timestamp === 'string' ? parsed.timestamp : '',
+      ip: typeof parsed.ip === 'string' ? parsed.ip : 'unknown',
+      userAgent: typeof parsed.userAgent === 'string' ? parsed.userAgent : 'unknown',
+      seq: typeof parsed.seq === 'number' ? parsed.seq : 0,
+      ...(typeof parsed.listmonk === 'string' ? { listmonk: parsed.listmonk } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** True only while the address's record is still exactly this intent version. */
+async function intentStillCurrent(email: string, seq: number, env: Env): Promise<boolean> {
+  const record = await readRecord(email, env);
+  return record !== null && record.seq === seq;
+}
+
+async function recordListmonkState(email: string, seq: number, status: 'ok' | 'error', env: Env): Promise<void> {
+  try {
+    const record = await readRecord(email, env);
+    if (record === null || record.seq !== seq) return; // never clobber a newer intent
+    record.listmonk = status;
+    await env.NEWSLETTER_SUBSCRIBERS.put(email, JSON.stringify(record));
+  } catch {
+    // Best-effort observability field; never fail the signup flow over it.
+  }
+}
+
+/**
+ * Reconcile Listmonk with the subscriber's latest intent (KV).  Runs in the
+ * background after the subscribe response, but only applies while the address
+ * still holds the intent version captured at request time.  This keeps the two
+ * stores from diverging: a slow earlier signup can no longer re-add an address
+ * after an unsubscribe, and a 5xx claiming "duplicate" is treated as a failure.
+ */
+export async function reconcileSignup(
+  email: string,
+  seq: number,
+  clientIP: string,
+  env: Env,
+  options: { welcome: boolean } = { welcome: true },
+): Promise<void> {
+  if (!(await intentStillCurrent(email, seq, env))) return; // superseded (e.g. unsubscribed)
+
+  // PRIMARY: Listmonk (subscriber + welcome via /api/tx with thanks template).
+  const created = await createListmonkSubscriber(email, clientIP, env);
+
+  if (!(await intentStillCurrent(email, seq, env))) return; // intent changed mid-flight
+
+  if (created.success && created.duplicate) {
+    // Already registered in Listmonk.  Do NOT reactivate it: a blocklisted or
+    // unsubscribed Listmonk subscriber must not be silently re-enabled.
+  } else if (created.success) {
+    if (options.welcome) {
+      const sent = await sendListmonkWelcome(email, env);
+      if (!sent.success) {
+        console.error(`Listmonk welcome send failed for ${redactEmail(email)}: ${sent.error} — using Plunk fallback`);
+        await sendFallbackWelcome(email, env);
+      }
+    }
+  } else {
+    console.error(`Listmonk subscribe failed for ${redactEmail(email)}: ${created.error} — using Plunk fallback`);
+    if (options.welcome) await sendFallbackWelcome(email, env);
+  }
+
+  await recordListmonkState(email, seq, created.success ? 'ok' : 'error', env);
+}
+
+async function sendFallbackWelcome(email: string, env: Env): Promise<void> {
+  const fallback = await sendPlunkWelcomeFallback(email, env);
+  if (!fallback.success) {
+    console.error(`Plunk fallback also failed for ${redactEmail(email)}: ${fallback.error}`);
+  }
+}
+
 async function checkRateLimit(ip: string, env: Env): Promise<boolean> {
   const key = `rate_limit:${ip}`;
   try {
@@ -277,7 +369,7 @@ async function callListmonk(env: Env, path: string, init: RequestInit = {}): Pro
   }
 }
 
-async function createListmonkSubscriber(email: string, clientIP: string, env: Env): Promise<{ success: boolean; error?: string }> {
+async function createListmonkSubscriber(email: string, clientIP: string, env: Env): Promise<{ success: boolean; duplicate?: boolean; error?: string }> {
   if (!isListmonkConfigured(env)) {
     return { success: false, error: 'Listmonk not configured' };
   }
@@ -299,12 +391,11 @@ async function createListmonkSubscriber(email: string, clientIP: string, env: En
     });
 
     if (resp.ok) return { success: true };
-
+    // Only a documented 409 Conflict counts as "already a subscriber".  A 5xx
+    // (or any other status) whose body merely contains the word "duplicate"
+    // must NOT be treated as success (audit item 35).
+    if (resp.status === 409) return { success: true, duplicate: true };
     const body = await resp.text();
-    // 409 / duplicate is fine — subscriber already exists, treat as success
-    if (resp.status === 409 || body.toLowerCase().includes('already exists') || body.toLowerCase().includes('duplicate')) {
-      return { success: true };
-    }
     return { success: false, error: `Listmonk subscribe HTTP ${resp.status}: ${body.slice(0, 200)}` };
   } catch (err) {
     return { success: false, error: `Listmonk subscribe exception: ${err instanceof Error ? err.message : String(err)}` };
@@ -490,38 +581,26 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
     // Idempotency: check KV first for fast path on duplicates
     const existing = await env.NEWSLETTER_SUBSCRIBERS.get(email);
     if (existing) {
-      // Make sure Listmonk has them too in case prior write failed
-      ctx.waitUntil((async () => {
-        await createListmonkSubscriber(email, clientIP, env);
-      })());
+      // Reconcile on interaction: make sure Listmonk still has this subscription
+      // in case a prior background write failed (durable retry channel).
+      const record = await readRecord(email, env);
+      const seq = record?.seq ?? 0;
+      ctx.waitUntil(reconcileSignup(email, seq, clientIP, env, { welcome: false }));
       return jsonResponse({ success: true, message: 'Already subscribed' }, 200, request, env);
     }
 
-    // Dual-write: both stores see the new subscriber.
-    // KV write is fast and synchronous; Listmonk write + welcome happen in waitUntil.
-    const subscriptionData = {
+    // Dual-write: KV is the durable, synchronous record; Listmonk registration
+    // and the welcome run in the background, gated on this intent version so a
+    // later unsubscribe or resubscribe supersedes the work (audit item 35).
+    const record: SubscriptionRecord = {
       timestamp: new Date().toISOString(),
       ip: clientIP,
       userAgent: request.headers.get('User-Agent') || 'unknown',
+      seq: Date.now(),
     };
-    await env.NEWSLETTER_SUBSCRIBERS.put(email, JSON.stringify(subscriptionData));
+    await env.NEWSLETTER_SUBSCRIBERS.put(email, JSON.stringify(record));
 
-    ctx.waitUntil((async () => {
-      // PRIMARY: Listmonk (subscriber + welcome via /api/tx with thanks.html template)
-      const created = await createListmonkSubscriber(email, clientIP, env);
-      if (created.success) {
-        const sent = await sendListmonkWelcome(email, env);
-        if (sent.success) return;
-        console.error(`Listmonk welcome send failed for ${redactEmail(email)}: ${sent.error} — using Plunk fallback`);
-      } else {
-        console.error(`Listmonk subscribe failed for ${redactEmail(email)}: ${created.error} — using Plunk fallback`);
-      }
-      // FALLBACK: direct Plunk API with legacy hardcoded welcome email
-      const fallback = await sendPlunkWelcomeFallback(email, env);
-      if (!fallback.success) {
-        console.error(`Plunk fallback also failed for ${redactEmail(email)}: ${fallback.error}`);
-      }
-    })());
+    ctx.waitUntil(reconcileSignup(email, record.seq, clientIP, env, { welcome: true }));
 
     return jsonResponse({ success: true, message: 'Subscribed successfully' }, 200, request, env);
   } catch {
