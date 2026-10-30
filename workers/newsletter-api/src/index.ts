@@ -112,38 +112,102 @@ type BodyResult =
   | { ok: false; status: number; error: string };
 
 /**
- * Read and validate a POST body with an actual byte limit.
+ * Read and validate a POST body with a genuine bounded-byte stream parser.
  *
  * Accepts JSON and URL-encoded form bodies (the blog's no-JavaScript native
  * form sends the latter), and rejects malformed input as a client error rather
- * than a 500.  The declared Content-Length is only an early rejection; the
- * streamed body itself is bounded.
+ * than a 500.  The body is read incrementally from the request stream with a
+ * byte limit enforced during streaming (1 KB by default). Invalid raw UTF-8,
+ * malformed or misleading Content-Length, and non-string fields are rejected.
  */
-async function readBody(request: Request): Promise<BodyResult> {
+export async function readBody(request: Request, maxBytes = MAX_REQUEST_SIZE): Promise<BodyResult> {
   const declared = request.headers.get('Content-Length');
-  if (declared && parseInt(declared, 10) > MAX_REQUEST_SIZE) {
-    return { ok: false, status: 413, error: 'Request too large' };
+  if (declared !== null) {
+    if (!/^[0-9]+$/.test(declared)) {
+      return { ok: false, status: 400, error: 'Invalid Content-Length' };
+    }
+    const declaredLength = Number(declared);
+    if (!Number.isSafeInteger(declaredLength)) {
+      return { ok: false, status: 400, error: 'Invalid Content-Length' };
+    }
+    if (declaredLength > maxBytes) {
+      return { ok: false, status: 413, error: 'Request too large' };
+    }
   }
+
+  const body = request.body;
+  if (!body) {
+    return { ok: false, status: 400, error: 'Invalid request body' };
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.length;
+      if (totalBytes > maxBytes) {
+        // Do not wait indefinitely for an untrusted stream to finish cancelling.
+        void reader.cancel().catch(() => {});
+        return { ok: false, status: 413, error: 'Request too large' };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, status: 400, error: 'Invalid request body' };
+  } finally {
+    reader.releaseLock();
+  }
+
+  // Validate Content-Length against actual bytes read (catches misleading headers).
+  if (declared !== null) {
+    const declaredLength = Number(declared);
+    if (declaredLength !== totalBytes) {
+      return { ok: false, status: 400, error: 'Content-Length mismatch' };
+    }
+  }
+
+  // Decode the accumulated bytes as UTF-8, rejecting overlong sequences.
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
   let text: string;
   try {
-    text = await request.text();
+    const combined = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.length;
+    }
+    text = decoder.decode(combined);
   } catch {
     return { ok: false, status: 400, error: 'Invalid request body' };
   }
-  if (text.length > MAX_REQUEST_SIZE) {
-    return { ok: false, status: 413, error: 'Request too large' };
-  }
+
   const rawType = (request.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
   const jsonLike = !rawType || rawType === 'application/json' || rawType === 'text/plain';
   if (jsonLike) {
     try {
       const parsed: unknown = JSON.parse(text);
-      if (typeof parsed !== 'object' || parsed === null) {
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
         return { ok: false, status: 400, error: 'Invalid request body' };
+      }
+      // Reject non-string email/token/honeypot fields instead of letting them
+      // propagate and potentially cause a 500 downstream.
+      const body = parsed as Record<string, unknown>;
+      for (const key of ['email', 'token', 'honeypot']) {
+        if (key in body && body[key] !== undefined && typeof body[key] !== 'string') {
+          return { ok: false, status: 400, error: 'Invalid request body' };
+        }
       }
       return { ok: true, body: parsed as ParsedBody };
     } catch {
-      // Not JSON; fall through to form parsing for native form submissions.
+      // Explicit JSON must never be reinterpreted as a form. Preserve the
+      // existing text/plain/no-type compatibility for older clients.
+      if (rawType === 'application/json') {
+        return { ok: false, status: 400, error: 'Invalid request body' };
+      }
     }
   }
   if (rawType && !jsonLike && rawType !== 'application/x-www-form-urlencoded') {
