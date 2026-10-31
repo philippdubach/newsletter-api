@@ -53,8 +53,7 @@ export function createEgressGuard() {
 }
 
 export const DRAIN_PATH = '/__harness__/drain-background-work';
-// Test-only KV door, so a suite can assert that the shadow was written and can
-// plant a fence without going through the Worker.
+// Test-only KV door for shadow assertions and historical-key fixtures.
 const KV_PATH = '/__harness__/kv';
 
 // Test-only entry. It imports the real Worker and forwards every call to it,
@@ -62,12 +61,57 @@ const KV_PATH = '/__harness__/kv';
 // then awaits everything recorded, including work scheduled while draining.
 // Miniflare exposes no response.waitUntil, so this is how background work is
 // made observable. Production source is not touched.
-function wrapperSource(entry) {
+function wrapperSource(entry, scheduler) {
   return `
 import worker from ${JSON.stringify(entry)};
 // Re-exported so Miniflare can resolve the Durable Object class by name from
 // this entrypoint. A star export skips the default, which is defined below.
 export * from ${JSON.stringify(entry)};
+${scheduler ? `
+import { SubscriptionCoordinator as ProductionCoordinator } from ${JSON.stringify(entry)};
+export class SubscriptionCoordinator extends ProductionCoordinator {
+  constructor(state, env) {
+    const testEnv = { ...env };
+    const metrics = { delays: [], callbacks: 0 };
+    const storage = new Proxy(state.storage, {
+      get(target, key) {
+        if (key === 'setAlarm') return async (at) => {
+          metrics.delays.push(Math.round(Number(at) - Date.now()));
+          return target.setAlarm(Date.now() + 25);
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    const proxy = new Proxy(state, {
+      get(target, key) {
+        if (key === 'storage') return storage;
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    super(proxy, testEnv);
+    this.testState = state;
+    this.testEnv = testEnv;
+    this.metrics = metrics;
+  }
+  async alarm() { this.metrics.callbacks++; return super.alarm(); }
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === '/fixture') {
+      const input = await request.json();
+      if (input.mode) this.testEnv.COORDINATOR_MODE = input.mode;
+      if (input.seed) {
+        await this.testState.storage.put(input.seed);
+        await this.testState.storage.setAlarm(Date.now() + 25);
+      }
+      return Response.json(this.metrics);
+    }
+    if (path === '/metrics') return Response.json(this.metrics);
+    return super.fetch(request);
+  }
+}
+` : ''}
 const pending = new Set();
 const DRAIN_PATH = ${JSON.stringify(DRAIN_PATH)};
 const KV_PATH = ${JSON.stringify(KV_PATH)};
@@ -119,9 +163,9 @@ export default {
 `;
 }
 
-async function bundleWorker(entry) {
+async function bundleWorker(entry, scheduler) {
   const result = await build({
-    stdin: { contents: wrapperSource(entry), resolveDir: workerDir, sourcefile: 'harness-entry.mjs', loader: 'js' },
+    stdin: { contents: wrapperSource(entry, scheduler), resolveDir: workerDir, sourcefile: 'harness-entry.mjs', loader: 'js' },
     bundle: true,
     format: 'esm',
     platform: 'neutral',
@@ -137,8 +181,8 @@ async function bundleWorker(entry) {
  * Starts the Worker in workerd. Returns the runtime, the egress record, a drain
  * function for background work, and a dispose function.
  */
-export async function startRuntime({ entry = join(workerDir, 'src/index.ts'), extraBindings = {}, outboundService, withKv = true } = {}) {
-  const script = await bundleWorker(entry);
+export async function startRuntime({ entry = join(workerDir, 'src/index.ts'), extraBindings = {}, outboundService, withKv = true, scheduler = false, withCoordinator = true } = {}) {
+  const script = await bundleWorker(entry, scheduler);
   const { guard, attempts } = createEgressGuard();
   // An explicit handler lets a suite stand in for the provider; the default is
   // the deny-everything guard, so no suite silently inherits permissive egress.
@@ -153,7 +197,7 @@ export async function startRuntime({ entry = join(workerDir, 'src/index.ts'), ex
       bindings: { ...TEST_BINDINGS, ...extraBindings },
       kvNamespaces: withKv ? ['NEWSLETTER_SUBSCRIBERS'] : undefined,
       r2Buckets: ['R2_BUCKET'],
-      durableObjects: { SUBSCRIPTION_COORDINATOR: 'SubscriptionCoordinator' },
+      durableObjects: withCoordinator ? { SUBSCRIPTION_COORDINATOR: 'SubscriptionCoordinator' } : undefined,
       outboundService: (request) => handler(request),
     }),
   );
@@ -161,7 +205,7 @@ export async function startRuntime({ entry = join(workerDir, 'src/index.ts'), ex
   return {
     runtime,
     attempts,
-    /** Test-only KV access, for asserting the shadow and planting fences. */
+    /** Test-only KV access for shadow assertions and historical-key fixtures. */
     kv: {
       async get(key) {
         const response = await runtime.dispatchFetch(`http://localhost${KV_PATH}?key=${encodeURIComponent(key)}`);

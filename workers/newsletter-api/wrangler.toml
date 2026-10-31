@@ -63,7 +63,7 @@ jurisdiction = "eu"
 ALLOWED_ORIGIN = "https://philippdubach.com,https://www.philippdubach.com,https://phil-dubach.com"
 ENVIRONMENT = "production"
 # Rollback lever: deploying this same code with "legacy" keeps the Durable Object
-# class and its pending operations, and returns writes to the inline path.
+# class and pending operations, but pauses subscriber writes and retries.
 COORDINATOR_MODE = "on"
 # Overall budget for one provider phase, well under the 30-second Durable Object
 # reset threshold that applies while blockConcurrencyWhile is held.

@@ -1,11 +1,10 @@
 export interface Env {
   NEWSLETTER_SUBSCRIBERS: KVNamespace; // dual-write target + rate limit + caches
-  // Optional so environments without the migration still run; the coordinator is
-  // the production path and serializes writes per address.
+  // Optional only for nonproduction unit fixtures; production fails closed.
   SUBSCRIPTION_COORDINATOR?: DurableObjectNamespace;
-  // 'on' routes writes through the coordinator. 'legacy' uses the unserialized
-  // inline path while keeping the binding and every pending operation intact,
-  // which is what makes a rollback possible without crossing a class creation.
+  // 'on' routes writes through the coordinator. 'legacy' pauses writes; never an inline writer.
+  // Historical mode name retained for configuration compatibility. Keep the
+  // class, binding and migrations on rollback-forward deployments.
   COORDINATOR_MODE?: string;
   // Overall budget for one provider phase, in milliseconds. Must stay well under
   // the 30-second limit after which a Durable Object is reset.
@@ -793,88 +792,24 @@ function isLegacyMode(env: Env): boolean {
   return (env.COORDINATOR_MODE ?? 'on') === 'legacy';
 }
 
-/** The stub regardless of mode, so legacy requests can still publish intent. */
-function coordinatorStubFor(env: Env, email: string): DurableObjectStub | null {
-  const namespace = env.SUBSCRIPTION_COORDINATOR;
-  if (!namespace) return null;
-  try {
-    return namespace.get(namespace.idFromName(email.trim().toLowerCase()));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Records a fence for a request that will change intent without this object
- * performing the work. Written before the provider call so a crash still leaves
- * evidence, and read by a retry to decide whether its own work is stale.
- */
-async function publishFence(
-  env: Env,
-  email: string,
-  desired: 'subscribed' | 'unsubscribed',
-  authenticated: boolean,
-): Promise<void> {
-  try {
-    await env.NEWSLETTER_SUBSCRIBERS.put(
-      fenceKey(email),
-      JSON.stringify({ desired, at: Date.now(), authenticated } satisfies IntentFence),
-      { expirationTtl: 86400 },
-    );
-  } catch {
-    // Best effort: the intent publish below is the primary channel.
-  }
-}
-
-/**
- * Tells the coordinator what a legacy request did, so older durable work is
- * fenced by the newer intent. Best effort: the legacy path must keep working when
- * the object is unavailable, which is the situation it exists for.
- */
-async function publishIntent(
-  stub: DurableObjectStub | null,
-  desired: 'subscribed' | 'unsubscribed',
-  email: string,
-  clientIP: string,
-  request: Request,
-  authenticated = false,
-): Promise<IntentResult> {
-  if (!stub) return { outcome: 'completed' };
-  try {
-    const response = await stub.fetch('https://coordinator/intent', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        desired,
-        email,
-        ip: clientIP,
-        userAgent: request.headers.get('User-Agent') || 'unknown',
-        recordOnly: true,
-        authenticated,
-      }),
-    });
-    if (!response.ok) return { outcome: 'failed', error: `coordinator HTTP ${response.status}` };
-    return await response.json() as IntentResult;
-  } catch {
-    // The object is unreachable, which is what the fence is for.
-    return { outcome: 'failed', error: 'coordinator unreachable' };
-  }
-}
-
+/** Missing production bindings must never enable an independent writer. */
 function coordinatorFor(env: Env, email: string): DurableObjectStub | null {
-  // Rolling back across a Durable Object class creation is not permitted by
-  // Cloudflare, so the supported rollback is a forward deploy that keeps the
-  // binding and switches this mode. Pending operations and alarms stay live and
-  // keep converging, because the class is never removed.
-  if ((env.COORDINATOR_MODE ?? 'on') === 'legacy') return null;
-  const namespace = env.SUBSCRIPTION_COORDINATOR;
-  if (!namespace) return null;
   try {
-    return namespace.get(namespace.idFromName(email.trim().toLowerCase()));
+    const namespace = env.SUBSCRIPTION_COORDINATOR;
+    if (!namespace) return null;
+    const stub = namespace.get(namespace.idFromName(email.trim().toLowerCase()));
+    return stub && typeof stub.fetch === 'function' ? stub : null;
   } catch {
-    // A malformed binding must not take signup down; fall back to inline.
     return null;
   }
+}
+
+function writesUnavailable(env: Env): boolean {
+  return isLegacyMode(env) || (env.ENVIRONMENT === 'production' && !coordinatorFor(env, 'binding-check'));
+}
+
+function maintenanceResponse(request: Request, env: Env): Response {
+  return jsonResponse({ success: false, error: 'Subscriber writes are temporarily unavailable. Please try again later.' }, 503, request, env);
 }
 
 async function submitIntent(
@@ -956,6 +891,7 @@ function unsubscribeResponse(result: IntentResult, request: Request, env: Env): 
 }
 
 async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (writesUnavailable(env)) return maintenanceResponse(request, env);
   try {
     // Cheap declared-length rejection before spending rate-limit budget; the
     // streamed body itself is bounded later in readBody.
@@ -987,21 +923,10 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
     // The coordinator is the production path: one serialized object per address,
     // so this request cannot interleave with a concurrent unsubscribe.
     const coordinator = coordinatorFor(env, email);
+    if (!coordinator && env.ENVIRONMENT === 'production') return maintenanceResponse(request, env);
     if (coordinator) {
       const result = await submitIntent(coordinator, 'subscribed', email, clientIP, request, requireAuth(request, env));
       return subscribeResponse(result, request, env);
-    }
-
-    if (isLegacyMode(env)) {
-      const authenticated = requireAuth(request, env);
-      const published = await publishIntent(coordinatorStubFor(env, email), 'subscribed', email, clientIP, request, authenticated);
-      // The object may refuse this because a removal is unresolved. A rejected
-      // publish must stop the inline path, and must not leave a fence that would
-      // let a later retry adopt what was just refused.
-      if (published.outcome === 'unsubscribed') {
-        return subscribeResponse(published, request, env);
-      }
-      await publishFence(env, email, 'subscribed', authenticated);
     }
 
     // Fallback for environments without the binding (unit tests, local runs
@@ -1046,6 +971,7 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
 }
 
 async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (writesUnavailable(env)) return maintenanceResponse(request, env);
   try {
     const parsed = await readBody(request, MAX_UNSUBSCRIBE_REQUEST_SIZE);
     if (!parsed.ok) {
@@ -1068,15 +994,10 @@ async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionConte
     // The coordinator records the unsubscribe as a durable intent, so a signup
     // already in flight cannot quietly restore the subscription afterwards.
     const coordinator = coordinatorFor(env, email);
+    if (!coordinator && env.ENVIRONMENT === 'production') return maintenanceResponse(request, env);
     if (coordinator) {
       const result = await submitIntent(coordinator, 'unsubscribed', email, getClientIP(request), request, true);
       return unsubscribeResponse(result, request, env);
-    }
-
-    if (isLegacyMode(env)) {
-      // An unsubscribe is always authorized here: the token has been checked.
-      await publishFence(env, email, 'unsubscribed', true);
-      await publishIntent(coordinatorStubFor(env, email), 'unsubscribed', email, getClientIP(request), request, true);
     }
 
     if (!isListmonkConfigured(env)) {
@@ -1304,6 +1225,7 @@ async function fetchLinkedInFollowers(env: Env, ctx: ExecutionContext): Promise<
 const INTENT_KEY = 'intent';
 const PENDING_KEY = 'pending';
 const WELCOME_KEY = 'welcome-seq';
+// Total attempts, including the initial request; at most seven scheduled retries.
 const MAX_SYNC_ATTEMPTS = 8;
 // The whole provider phase must finish well inside the 30-second limit after which
 // a Durable Object is reset for holding blockConcurrencyWhile too long. Individual
@@ -1329,55 +1251,11 @@ interface CoordinatorIntent {
   desired: 'subscribed' | 'unsubscribed';
   seq: number;
   updatedAt: string;
-  /** Milliseconds, used only to order this intent against a legacy fence. */
-  recordedAtMs: number;
   /** Caller metadata, kept here so a retry can repair the shadow correctly. */
   ip?: string;
   userAgent?: string;
   /** Whether the caller proved control of the address. */
   authenticated?: boolean;
-}
-
-/**
- * Written by a request that changed intent without reaching this object: the
- * legacy path, or a request whose publish failed. It is the only evidence of
- * supersession for work this object did not record itself.
- */
-interface IntentFence {
-  desired: 'subscribed' | 'unsubscribed';
-  at: number;
-  /** Whether the caller proved control of the address. */
-  authenticated?: boolean;
-}
-
-export function fenceKey(email: string): string {
-  return `intent:fence:${email.trim().toLowerCase()}`;
-}
-
-/**
- * Whether stored work has been superseded by a newer intent recorded elsewhere.
- *
- * The KV shadow is deliberately not consulted. A shadow that disagrees with the
- * stored intent is at least as likely to be this operation's own unfinished write,
- * or an eventually consistent read, as a newer request. Only an explicit fence
- * newer than the intent supersedes it, and a failed read never does.
- */
-export function supersessionDecision(
-  intent: { recordedAtMs: number; desired: 'subscribed' | 'unsubscribed'; removalUnresolved?: boolean },
-  fence: IntentFence | null,
-  fenceReadFailed: boolean,
-): 'run' | 'supersede' {
-  if (fenceReadFailed) return 'run';
-  if (!fence || typeof fence.at !== 'number') return 'run';
-  if (fence.at <= intent.recordedAtMs) return 'run';
-  // The same authorization rule as the intent path: an unauthenticated signup may
-  // not cancel an unsubscribe that has been accepted but not yet completed, so a
-  // fence written by one cannot supersede it either.
-  if (fence.desired === 'subscribed' && intent.desired === 'unsubscribed'
-    && intent.removalUnresolved && fence.authenticated !== true) {
-    return 'run';
-  }
-  return 'supersede';
 }
 
 interface CoordinatorPending {
@@ -1425,9 +1303,10 @@ export class SubscriptionCoordinator {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/intent' && request.method === 'POST') {
+        if (isLegacyMode(this.env)) return new Response('maintenance', { status: 503 });
         const body = await request.json() as {
           desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
-          recordOnly?: boolean;
+          authenticated?: boolean;
         };
         return Response.json(await this.runExclusive(() => this.setIntent(body)));
       }
@@ -1455,6 +1334,10 @@ export class SubscriptionCoordinator {
     await this.runExclusive(async () => {
       const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
       if (!pending) return;
+      if (isLegacyMode(this.env)) {
+        await this.state.storage.setAlarm(Date.now() + 60_000);
+        return;
+      }
       const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
       if (!intent || intent.seq !== pending.seq) {
         await this.state.storage.delete(PENDING_KEY);
@@ -1492,7 +1375,7 @@ export class SubscriptionCoordinator {
    */
   private async setIntent(input: {
     desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
-    recordOnly?: boolean; authenticated?: boolean;
+    authenticated?: boolean;
   }): Promise<SyncResult & { seq: number; desired: string }> {
     const email = input.email.trim().toLowerCase();
     const previous = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
@@ -1503,7 +1386,6 @@ export class SubscriptionCoordinator {
       desired: input.desired,
       seq,
       updatedAt: new Date(recordedAtMs).toISOString(),
-      recordedAtMs,
       ip: input.ip,
       userAgent: input.userAgent,
       authenticated: input.authenticated,
@@ -1531,39 +1413,17 @@ export class SubscriptionCoordinator {
       nextAt: Date.now(),
     });
     await this.state.storage.setAlarm(Date.now());
-    // This object owns the newest intent now, so an older fence cannot supersede it.
-    try {
-      await this.env.NEWSLETTER_SUBSCRIBERS.delete(fenceKey(email));
-    } catch {
-      // Best effort; a stale fence only matters if it is newer.
-    }
-
-    if (input.recordOnly) {
-      // A legacy request publishes its intent so older durable work is superseded
-      // by sequence, but it performs the provider work itself. Existing pending
-      // work is left alone: cancelling it here is what let a rollback discard an
-      // accepted operation, and the seq bump above already makes it stale.
-      return { outcome: 'completed', seq, desired: intent.desired };
-    }
-
-    this.pendingInput = { ip: input.ip, userAgent: input.userAgent };
-    const result = await this.sync({ fresh: true });
+    const result = await this.sync();
     return { ...result, seq, desired: intent.desired };
   }
 
-  // Set immediately before a sync that follows an intent, so the KV shadow can be
-  // written without threading it through every sync call.
-  private pendingInput: { ip?: string; userAgent?: string } = {};
-
-  /**
-   * Converges the KV shadow and the provider toward the stored intent.
-   *
-   * `fresh` means this object has just recorded the intent itself, so the shadow
-   * is ours to write. Otherwise the work is a retry of older intent, and the
-   * shadow may have been updated by a request that never reached this object —
-   * in which case the shadow wins and the work is discarded.
-   */
-  private async sync({ fresh = false }: { fresh?: boolean } = {}): Promise<SyncResult> {
+  /** Converges only this object's authoritative intent; maintenance pauses it. */
+  private async sync(): Promise<SyncResult> {
+    if (isLegacyMode(this.env)) {
+      const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
+      if (pending) await this.state.storage.setAlarm(Date.now() + 60_000);
+      return { outcome: 'pending' };
+    }
     const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
     if (!intent) return { outcome: 'failed', error: 'no intent recorded', retryable: false };
 
@@ -1574,25 +1434,6 @@ export class SubscriptionCoordinator {
       // Including the first attempt: deleting the shadow first would leave KV
       // without the record while Listmonk still mails them.
       return await this.scheduleRetry(intent, { outcome: 'failed', error: 'Listmonk not configured', retryable: false }, 'remove');
-    }
-
-    if (!fresh) {
-      const { decision, fence } = await this.readFence(intent);
-      if (decision === 'supersede') {
-        // A newer request recorded its intent elsewhere and served it itself, so
-        // this work is stale. Adopt that intent rather than acting on the old one.
-        await this.state.storage.put<CoordinatorIntent>(INTENT_KEY, {
-          ...intent,
-          desired: fence!.desired,
-          seq: intent.seq + 1,
-          updatedAt: new Date().toISOString(),
-          recordedAtMs: fence!.at,
-        });
-        await this.state.storage.delete(PENDING_KEY);
-        await this.state.storage.deleteAlarm();
-        console.warn(`coordinator adopted a newer ${fence!.desired} intent for ${redactEmail(intent.email)} and dropped stale ${intent.desired} work`);
-        return { outcome: 'superseded', retryable: false };
-      }
     }
 
     // The shadow is repaired on every attempt, not only the first. Otherwise a
@@ -1640,25 +1481,6 @@ export class SubscriptionCoordinator {
       return result;
     }
     return await this.scheduleRetry(intent, result, intent.desired === 'subscribed' ? 'create' : 'remove');
-  }
-
-  private async readFence(
-    intent: CoordinatorIntent,
-  ): Promise<{ decision: 'run' | 'supersede'; fence: IntentFence | null }> {
-    try {
-      const raw = await this.env.NEWSLETTER_SUBSCRIBERS.get(fenceKey(intent.email));
-      if (!raw) return { decision: 'run', fence: null };
-      const fence = JSON.parse(raw) as IntentFence;
-      const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
-      const removalUnresolved = pending != null && pending.seq === intent.seq;
-      return {
-        decision: supersessionDecision({ ...intent, removalUnresolved }, fence, false),
-        fence,
-      };
-    } catch {
-      // An unreadable fence proves nothing. Never erase accepted work for it.
-      return { decision: 'run', fence: null };
-    }
   }
 
   private async applyShadow(intent: CoordinatorIntent): Promise<{ ok: boolean; error?: string }> {
@@ -1741,7 +1563,7 @@ export class SubscriptionCoordinator {
     const existing = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
     const attempts = (existing?.attempts ?? 0) + 1;
 
-    if (attempts > MAX_SYNC_ATTEMPTS) {
+    if (attempts >= MAX_SYNC_ATTEMPTS) {
       console.error(`coordinator gave up after ${MAX_SYNC_ATTEMPTS} attempts for ${redactEmail(intent.email)}: ${result.error ?? result.reason ?? 'unknown'}`);
       await this.state.storage.delete(PENDING_KEY);
       await this.state.storage.deleteAlarm();

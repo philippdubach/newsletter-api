@@ -184,29 +184,42 @@ Individually:
 
 Rolling back to a version that predates the Durable Object class is not supported
 by Cloudflare: a rollback cannot cross a class creation. The supported path is a
-forward deploy with the same code:
+forward deploy retaining the same `SubscriptionCoordinator` class, binding and
+migration history. The pre-migration `6963` version cannot be a direct rollback target:
 
 ```bash
 # 1. Set the lever in wrangler.toml:  COORDINATOR_MODE = "legacy"
 npm run deploy:production
 ```
 
-`COORDINATOR_MODE = "legacy"` keeps the binding, the class and every pending
-operation, and returns writes to the unserialized inline path. Switch back to
-`"on"` with another deploy. The configuration guard rejects any value other than
-`on` or `legacy`, so the lever cannot be set to something the Worker does not
-understand.
+`COORDINATOR_MODE = "legacy"` is **read-only subscriber maintenance**, not a
+fallback writer. It keeps the binding, class and pending operations. New public
+subscriber writes (including signed unsubscribe and confirmation POSTs) return
+503 before mutations; direct internal `/intent` requests also return 503.
+Alarms and `/sync` pause without provider or shadow I/O or spending attempts,
+rescheduling pending work for one minute later. Switch back to `"on"` with another
+forward deploy to resume the authoritative stored intent at its next alarm.
+The guard accepts only `on` or `legacy`. A missing or malformed production
+coordinator binding fails closed; only nonproduction unit environments retain an
+inline fallback in `on` mode.
 
-Stale work cannot override a newer intent. A legacy request publishes its intent
-to the coordinator when the object is reachable, and writes an explicit fence key
-(`intent:fence:<address>`) before it touches the provider. A pending job is
-superseded only when that fence is newer than the intent the job holds; a fence
-that is older, missing, unreadable or malformed never cancels accepted work.
+There is no independent legacy writer or KV clock/fence authority. Historical
+`intent:` keys remain excluded from subscriber inventory and counts. The KV
+shadow is not evidence of supersession.
 
-The KV shadow is deliberately **not** used as evidence of a newer intent. A shadow
-that disagrees with the stored intent is at least as likely to be this
-operation's own unfinished write, or an eventually consistent read, as a newer
-request — and treating it as supersession discarded valid retries.
+Retries allow eight total attempts (the initial attempt plus seven retries).
+Requested delays after failures are 1, 4, 16, 60, 60, 60 and 60 minutes. Exhausted
+work requires operator investigation; maintenance does not reset this budget.
+Maintenance cannot recall a provider request already in flight or prevent native
+Listmonk actions. Deploy propagation is not a globally instantaneous pause.
+
+`test/alarms.test.mjs` uses actual workerd scheduler callbacks; a test-only storage
+proxy accelerates alarm delivery while recording original requested delays and
+callback counts. It covers convergence, exhaustion, orphan cleanup and pause/
+resume. This in-process mode-switch proof does not prove restart persistence or
+Cloudflare migration/control-plane behavior. A disposable remote migration and
+rollback-forward canary still requires separate upload authorization; neither
+local tests nor the production dry run establish that proof.
 
 An unsubscribe accepted but not yet finished is durable proof of the recipient's
 intent: an unauthenticated signup cannot cancel it, and keeps reporting the

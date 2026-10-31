@@ -29,7 +29,7 @@
     "test:config": "node --test scripts/check-deploy-config.test.mjs scripts/deploy-production.test.mjs",
     "test:inventory": "node --test scripts/inventory-subscribers.test.mjs",
     "test:runtime": "node --test test/runtime.test.mjs",
-    "test:invariants": "node --test test/subscription-invariants.test.mjs",
+    "test:invariants": "node --test test/subscription-invariants.test.mjs test/alarms.test.mjs",
     "check:config": "node scripts/check-deploy-config.mjs",
     "typecheck": "tsc --noEmit",
     "verify": "npm run typecheck && npm run check:config && npm run test:config && npm run test && npm run test:inventory && npm run test:runtime && npm run test:invariants",
