@@ -234,23 +234,33 @@ node scripts/inventory-subscribers.mjs --kv kv-export.json --out /tmp/inventory.
 |---|---|
 | Read-only | The client issues only `GET` and refuses any other method; no KV writes, no welcome mail, no unsubscribe requests |
 | No policy by accident | Recipients needing investigation are reported as such; nothing re-subscribes, re-adds or removes |
-| Incomplete reads stay incomplete | A failed or truncated page marks the report incomplete and exits `2` instead of implying missing subscribers |
+| Membership is not status | Only the target list's own `subscription_status` is read as a status. Appearance in `?list_id=` is recorded as evidence of nothing, because that query returns every status for the list |
+| Absence is a claim | `kv_only_missing_upstream` is used only when the subscriber read proved full coverage. Otherwise the address needs investigation |
+| Unreadable is not absent | Presence and readability are tracked separately, so a malformed value cannot resurface as Listmonk-only |
+| Incomplete reads stay incomplete | A failed page, an early empty page, or a page-limit stop marks the report incomplete and exits `2` |
 | Pseudonymous identifiers | Keyed HMAC-SHA256 under `INVENTORY_HMAC_SECRET`; there is no unsalted fallback, and aggregate counts are the default |
-| No secrets in Git | Reports are refused inside a Git working tree, and `inventory-*.json` is ignored |
+| No secrets in Git | The destination's real path is checked, symlinked destinations are refused, and reports are published from a private temporary file with mode `0600` |
 
 The KV export is a JSON file of `{ key, value }` objects, `[key, value]` pairs,
-or a key-to-value object. `rate_limit:` and `cache:` keys are excluded, since
-they are Worker bookkeeping rather than membership.
+or a key-to-value object. Keys are normalized and deduplicated, and
+`rate_limit:` / `cache:` keys are excluded, since they are Worker bookkeeping
+rather than membership.
 
 Buckets: `both_active`, `kv_only_missing_upstream`, `upstream_unsubscribed`,
-`blocklisted`, `listmonk_only`, `needs_investigation`. An unrecognised status or
-absent list information lands in `needs_investigation` rather than being guessed
-— "never added to this list" and "removed without a status" are
-indistinguishable from Listmonk's subscriber payload.
+`blocklisted`, `listmonk_only`, `neither_active`, `needs_investigation`.
+
+`needs_investigation` is the honest bucket and the one to read first. It holds
+records where the tool will not state a fact: an unrecognised or absent status,
+membership in the list query without a status for the target list, a malformed KV
+value, and an absence that was never proven because a read fell short.
+
+A target-list unsubscribe is reported as `upstream_unsubscribed` even though the
+address still appears in the `?list_id=` query, and an `unsubscribed` marker
+recorded against a *different* list is ignored entirely.
 
 The two stores are read separately, so differences are candidates for
 investigation rather than a transactionally consistent snapshot. The report
-records its own observation window and states that in its `caveats`.
+records its own observation window, per-phase coverage, and these caveats.
 
 ### Export Subscribers
 

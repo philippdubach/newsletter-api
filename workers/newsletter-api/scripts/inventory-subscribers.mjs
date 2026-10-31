@@ -14,15 +14,29 @@
 // Converging Listmonk toward an older KV "subscribed" record would silently
 // undo it, so this tool reports and never resolves.
 //
-// Guarantees:
+// Three rules keep the report from stating things it cannot know:
+//
+//   1. List membership is not subscription status. In the installed Listmonk,
+//      GET /api/subscribers?list_id=N returns every subscription status for
+//      that list unless separately filtered, so a row's presence in that query
+//      is evidence of nothing. Only `lists[].subscription_status` for the
+//      target list id is read as a status.
+//   2. Absence is a claim. An address is reported as missing upstream only when
+//      the subscriber read provably covered the whole space. Otherwise the
+//      absence is unproven and the address needs investigation.
+//   3. Unreadable is not absent. A KV value that does not parse still proves
+//      the address is present, so presence and readability are tracked
+//      separately.
+//
+// Plus:
 //   * Only GET requests are issued to Listmonk. Any other method throws.
 //   * No writes to KV, no subscription changes, no welcome mail, no
 //     unsubscribe requests.
-//   * A failed or truncated read yields an incomplete report. It never renders
-//     as "these subscribers are missing".
 //   * Identifiers are keyed HMAC-SHA256 under a secret you supply. There is no
 //     unsalted fallback, and aggregate counts are the default.
-//   * The report refuses to be written inside a Git working tree.
+//   * Reports are written through a private temporary file and renamed into
+//     place; a symlinked destination or a destination inside a Git working tree
+//     is refused.
 //
 // Usage:
 //   LISTMONK_API_URL=... LISTMONK_API_USER=... LISTMONK_API_TOKEN=... \
@@ -35,8 +49,8 @@
 
 import { createHmac } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { chmodSync, lstatSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Keys the Worker writes that are not subscriber records. Anything else in the
@@ -45,12 +59,16 @@ const NON_SUBSCRIBER_PREFIXES = ['rate_limit:', 'cache:'];
 
 const EXPECTED_EMAIL = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
 
+const GLOBAL_STATUSES = new Set(['enabled', 'disabled', 'blocklisted', 'unknown']);
+const LIST_STATUSES = new Set(['confirmed', 'unconfirmed', 'unsubscribed', 'unknown']);
+
 export const BUCKETS = [
   'both_active',
   'kv_only_missing_upstream',
   'upstream_unsubscribed',
   'blocklisted',
   'listmonk_only',
+  'neither_active',
   'needs_investigation',
 ];
 
@@ -59,22 +77,62 @@ export function isNonSubscriberKey(key) {
   return NON_SUBSCRIBER_PREFIXES.some((prefix) => key.startsWith(prefix));
 }
 
+function normalizeEmail(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : null;
+}
+
 /**
- * Normalizes a raw KV export into subscriber records plus a list of records
- * that could not be read. Never throws on malformed input: unreadable entries
- * are reported, because a parse failure is not evidence of absence.
+ * Normalizes a raw KV export into a presence index plus the records that could
+ * be read.
+ *
+ * Presence and readability are deliberately separate: an entry whose value does
+ * not parse still proves that the address exists in KV, so treating it as
+ * absent would let it surface later as "Listmonk-only". Keys are normalized and
+ * deduplicated, and a readable duplicate wins over an unreadable one.
  */
 export function readKvExport(raw) {
-  const entries = [];
+  const byEmail = new Map();
   const unreadable = [];
+  let scannedKeys = 0;
+  let excludedKeys = 0;
 
   const push = (key, value) => {
     if (typeof key !== 'string' || key.length === 0) {
       unreadable.push({ reason: 'key is not a non-empty string' });
       return;
     }
-    if (isNonSubscriberKey(key)) return;
-    entries.push({ key, value });
+    scannedKeys += 1;
+    if (isNonSubscriberKey(key)) {
+      excludedKeys += 1;
+      return;
+    }
+    const email = normalizeEmail(key);
+    if (!email || !EXPECTED_EMAIL.test(email)) {
+      unreadable.push({ key, reason: 'key is not a valid address' });
+      return;
+    }
+
+    let record = value;
+    let readable = true;
+    let reason;
+    if (typeof record === 'string') {
+      try {
+        record = JSON.parse(record);
+      } catch {
+        readable = false;
+        reason = 'record is not valid JSON';
+      }
+    }
+    if (readable && (!record || typeof record !== 'object' || Array.isArray(record))) {
+      readable = false;
+      reason = 'record is not an object';
+    }
+
+    const existing = byEmail.get(email);
+    if (!existing || (!existing.readable && readable)) {
+      byEmail.set(email, readable ? { email, readable: true, record } : { email, readable: false, reason });
+    }
+    if (!readable) unreadable.push({ email, reason });
   };
 
   if (Array.isArray(raw)) {
@@ -89,138 +147,140 @@ export function readKvExport(raw) {
     unreadable.push({ reason: 'export is neither an array nor an object' });
   }
 
-  const subscribers = [];
-  for (const { key, value } of entries) {
-    const email = key.trim().toLowerCase();
-    if (!EXPECTED_EMAIL.test(email)) {
-      unreadable.push({ key, reason: 'key is not a valid address' });
-      continue;
-    }
-    let record = value;
-    if (typeof record === 'string') {
-      try {
-        record = JSON.parse(record);
-      } catch {
-        unreadable.push({ email, reason: 'record is not valid JSON' });
-        continue;
-      }
-    }
-    if (!record || typeof record !== 'object' || Array.isArray(record)) {
-      unreadable.push({ email, reason: 'record is not an object' });
-      continue;
-    }
-    subscribers.push({ email, record });
-  }
-
-  return { subscribers, unreadable };
-}
-
-/**
- * Classifies one address. `upstream` is `{ found, globalStatus, listStatus }`
- * where `listStatus` is 'confirmed', 'unsubscribed', or 'unknown'. A status the
- * tool cannot interpret becomes `needs_investigation` rather than a guess.
- */
-export function classifyAddress(upstream, hasKvRecord) {
-  if (!upstream || upstream.readable === false) return 'needs_investigation';
-
-  const listStatus = upstream.listStatus ?? 'unknown';
-  const globalStatus = upstream.globalStatus ?? 'unknown';
-
-  if (globalStatus === 'blocklisted') return 'blocklisted';
-
-  const listed = listStatus === 'confirmed';
-  const unsubscribedUpstream = listStatus === 'unsubscribed';
-
-  // A status the tool cannot interpret must not be bucketed as a fact.
-  if (!['confirmed', 'unsubscribed', 'unknown'].includes(listStatus)) return 'needs_investigation';
-  if (!['enabled', 'disabled', 'blocklisted', 'unknown'].includes(globalStatus)) return 'needs_investigation';
-
-  if (hasKvRecord) {
-    if (listed) return 'both_active';
-    if (upstream.found && unsubscribedUpstream) return 'upstream_unsubscribed';
-    if (!upstream.found) return 'kv_only_missing_upstream';
-    // Present upstream, not in the list, but not recorded as unsubscribed:
-    // "never added to this list" and "removed without a status" look identical
-    // here, so this is not reported as either.
-    return 'needs_investigation';
-  }
-
-  if (listed) return 'listmonk_only';
-  return 'needs_investigation';
-}
-
-/** Buckets every address, keeping unreadable records separate from facts. */
-export function buildInventory({ kv, upstreamByEmail }) {
-  const buckets = Object.fromEntries(BUCKETS.map((name) => [name, []]));
-  const seen = new Set();
-
-  for (const { email } of kv.subscribers) {
-    seen.add(email);
-    const upstream = upstreamByEmail.get(email) ?? { found: false, readable: true };
-    buckets[classifyAddress(upstream, true)].push(email);
-  }
-
-  for (const [email, upstream] of upstreamByEmail) {
-    if (seen.has(email)) continue;
-    buckets[classifyAddress(upstream, false)].push(email);
-  }
-
-  const counts = Object.fromEntries(BUCKETS.map((name) => [name, buckets[name].length]));
+  const records = [...byEmail.values()];
   return {
-    counts,
-    buckets,
-    unreadable: kv.unreadable,
-    kvRecords: kv.subscribers.length,
-    upstreamRecords: upstreamByEmail.size,
+    byEmail,
+    records,
+    presentEmails: new Set(byEmail.keys()),
+    unreadable,
+    scannedKeys,
+    excludedKeys,
   };
 }
 
 /**
- * Derives the inventory from Listmonk's paginated read model.
+ * Classifies one address.
  *
- * `pages` are the raw `{ data: { results, total, page, per_page } }` payloads
- * from GET /api/subscribers. `listedEmails` is the set returned by
- * GET /api/subscribers?list_id=<id>. Neither is trusted to be complete: a
- * caller that failed to read a page must pass `complete: false`, and the report
- * says so instead of implying absence.
+ * `upstream` is `{ found, readable, globalStatus, listStatus }` where
+ * `listStatus` is the status recorded for the target list only.
+ * `presence` is `{ inKv, readable }`.
+ * `coverage` is `{ subscribersComplete }` — absence is only asserted when the
+ * subscriber read covered the whole space.
  */
-export function collectUpstream({ pages, listedEmails, complete, failures }) {
+export function classifyAddress(upstream, presence, coverage = { subscribersComplete: false }) {
+  // An unreadable KV record is present but not understood: it is not absence,
+  // and it must not be resolved by looking at the other store.
+  if (presence.inKv && !presence.readable) return 'needs_investigation';
+
+  if (upstream?.found) {
+    const globalStatus = upstream.globalStatus ?? 'unknown';
+    const listStatus = upstream.listStatus ?? 'unknown';
+
+    if (globalStatus === 'blocklisted') return 'blocklisted';
+    // A status the tool cannot interpret must not be bucketed as a fact.
+    if (!GLOBAL_STATUSES.has(globalStatus) || !LIST_STATUSES.has(listStatus)) return 'needs_investigation';
+    if (globalStatus === 'unknown' || listStatus === 'unknown') return 'needs_investigation';
+
+    if (listStatus === 'confirmed') {
+      // A confirmed list membership next to a globally disabled subscriber is
+      // contradictory, and slicing it either way would invent a fact.
+      if (globalStatus !== 'enabled') return 'needs_investigation';
+      return presence.inKv ? 'both_active' : 'listmonk_only';
+    }
+    if (listStatus === 'unsubscribed') {
+      return presence.inKv ? 'upstream_unsubscribed' : 'neither_active';
+    }
+    // 'unconfirmed' is an opt-in that has not completed: not active, and not a
+    // drift the tool can interpret.
+    return 'needs_investigation';
+  }
+
+  if (!presence.inKv) return 'needs_investigation';
+  // Absence upstream is only a fact when the read provably covered everything.
+  return coverage.subscribersComplete ? 'kv_only_missing_upstream' : 'needs_investigation';
+}
+
+/**
+ * Normalizes Listmonk's read model.
+ *
+ * `pages` are `{ data: { results, total } }` payloads from GET /api/subscribers.
+ * `queriedEmails` is the set returned by GET /api/subscribers?list_id=<id>; it
+ * is kept as evidence of appearance only, because that endpoint returns every
+ * subscription status for the list unless separately filtered.
+ */
+export function collectUpstream({ pages, queriedEmails, complete, failures, listId }) {
   const upstreamByEmail = new Map();
-  const listed = listedEmails instanceof Set ? listedEmails : new Set(listedEmails ?? []);
+  const queried = queriedEmails instanceof Set ? queriedEmails : new Set(queriedEmails ?? []);
+  const targetListId = Number(listId);
 
   for (const page of pages) {
     const results = page?.data?.results;
     if (!Array.isArray(results)) continue;
     for (const subscriber of results) {
-      const email = typeof subscriber?.email === 'string' ? subscriber.email.trim().toLowerCase() : null;
+      const email = normalizeEmail(subscriber?.email);
       if (!email || !EXPECTED_EMAIL.test(email)) continue;
 
-      const globalStatus = typeof subscriber.status === 'string' ? subscriber.status : 'unknown';
-      // The list status is read only when the payload carries it for this list.
-      // Absent means unknown, which is reported rather than assumed.
+      const rawGlobal = typeof subscriber?.status === 'string' ? subscriber.status.trim().toLowerCase() : null;
+      const globalStatus = rawGlobal && GLOBAL_STATUSES.has(rawGlobal) ? rawGlobal : 'unknown';
+
+      // Only the entry for the target list carries a status this report can
+      // attribute to the target list. A marker on any other list is ignored.
       let listStatus = 'unknown';
-      if (Array.isArray(subscriber.lists)) {
-        if (listed.has(email)) listStatus = 'confirmed';
-        else if (subscriber.lists.some((entry) => entry?.subscription_status === 'unsubscribed')) {
-          listStatus = 'unsubscribed';
+      let listEvidence = 'no-list-entry';
+      if (Array.isArray(subscriber?.lists)) {
+        const entry = subscriber.lists.find((candidate) => Number(candidate?.id) === targetListId);
+        if (entry) {
+          const raw = typeof entry.subscription_status === 'string' ? entry.subscription_status.trim().toLowerCase() : null;
+          if (raw && LIST_STATUSES.has(raw)) {
+            listStatus = raw;
+            listEvidence = 'target-list-entry';
+          } else {
+            listEvidence = 'unrecognized-list-status';
+          }
         }
       }
+      // Appearance in the list query is recorded but never promoted to a status.
+      if (listStatus === 'unknown' && queried.has(email)) listEvidence = 'list-query-only';
 
-      upstreamByEmail.set(email, { found: true, readable: true, globalStatus, listStatus });
+      upstreamByEmail.set(email, {
+        found: true,
+        readable: true,
+        globalStatus,
+        listStatus,
+        listEvidence,
+      });
     }
   }
 
-  for (const email of listed) {
-    const existing = upstreamByEmail.get(email);
-    upstreamByEmail.set(email, {
-      found: true,
-      readable: true,
-      globalStatus: existing?.globalStatus ?? 'unknown',
-      listStatus: 'confirmed',
-    });
+  return { upstreamByEmail, complete, failures };
+}
+
+/** Buckets every address. Coverage gates the one bucket that asserts absence. */
+export function buildInventory({ kv, upstreamByEmail, coverage }) {
+  const buckets = Object.fromEntries(BUCKETS.map((name) => [name, []]));
+  const seen = new Set();
+
+  for (const email of kv.presentEmails) {
+    seen.add(email);
+    const record = kv.byEmail.get(email);
+    const upstream = upstreamByEmail.get(email) ?? { found: false, readable: true };
+    buckets[classifyAddress(upstream, { inKv: true, readable: record.readable }, coverage)].push(email);
   }
 
-  return { upstreamByEmail, complete, failures };
+  for (const [email, upstream] of upstreamByEmail) {
+    if (seen.has(email)) continue;
+    buckets[classifyAddress(upstream, { inKv: false, readable: true }, coverage)].push(email);
+  }
+
+  return {
+    counts: Object.fromEntries(BUCKETS.map((name) => [name, buckets[name].length])),
+    buckets,
+    unreadable: kv.unreadable,
+    kvRecords: kv.presentEmails.size,
+    kvReadable: kv.records.filter((entry) => entry.readable).length,
+    kvExcludedKeys: kv.excludedKeys,
+    upstreamRecords: upstreamByEmail.size,
+  };
 }
 
 /** Keyed pseudonym. Refuses to run without a secret; there is no sha256 fallback. */
@@ -241,21 +301,26 @@ export function buildReport({ inventory, window, source, includeIdentifiers, pse
     observationWindow: window,
     source,
     complete: source.complete !== false,
+    coverage: source.coverage,
     // Stated in the artefact itself so a reader cannot mistake it for a
     // consistent snapshot or an action plan.
     caveats: [
       'Two live stores were read separately; differences are candidates for investigation, not a transactionally consistent snapshot.',
       'No bucket implies an action. A KV-only record is not a queued re-subscription.',
       'A native Listmonk unsubscribe expresses user intent and must not be overwritten from KV.',
+      'List membership is not subscription status: only the target list entry is read as a status.',
+      'needs_investigation includes unproven absence and unreadable records, which are not evidence of a missing subscriber.',
     ],
     counts: inventory.counts,
     unreadable: inventory.unreadable.length,
     kvRecords: inventory.kvRecords,
+    kvReadable: inventory.kvReadable,
+    kvExcludedKeys: inventory.kvExcludedKeys,
     upstreamRecords: inventory.upstreamRecords,
   };
 
   if (!report.complete) {
-    report.incompleteReason = 'at least one page could not be read; counts describe only what was read';
+    report.incompleteReason = 'at least one phase did not cover its full space; absence is not asserted from it';
     report.failures = source.failures ?? [];
   }
 
@@ -295,79 +360,176 @@ export function createListmonkReader({ apiUrl, user, token, fetchImpl = fetch, r
     throw new Error(`read-only client: refusing ${method}`);
   }
 
+  return { get, refuseMutation };
+}
+
+/**
+ * Walks a paginated endpoint and reports whether the walk covered everything.
+ *
+ * Complete means: no exception, a non-empty final page, the reported total was
+ * reached (when one was given), and maxPages was not exhausted. An empty page
+ * before the reported total is a contradiction and is treated as incomplete,
+ * because the missing rows are exactly the ones the report would otherwise call
+ * absent.
+ */
+async function walkPages(fetchPage, { perPage, maxPages }) {
+  const pages = [];
+  let read = 0;
+  let total = null;
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    let payload;
+    try {
+      payload = await fetchPage(page);
+    } catch (error) {
+      // Pages already read stay in the result: a failure on page 3 does not
+      // make pages 1 and 2 unread, and discarding them would throw away the
+      // only evidence the run produced.
+      return { pages, read, total, complete: false, reason: String(error?.message ?? error) };
+    }
+    const results = payload?.data?.results;
+    if (!Array.isArray(results)) {
+      return { pages, read, total, complete: false, reason: 'response has no results array' };
+    }
+    pages.push(payload);
+    const reported = Number(payload?.data?.total ?? 0);
+    if (Number.isFinite(reported) && reported > 0) total = reported;
+
+    if (results.length === 0) {
+      if (total !== null && read < total) {
+        return { pages, read, total, complete: false, reason: `empty page after ${read} of ${total} reported records` };
+      }
+      return { pages, read, total, complete: true };
+    }
+
+    read += results.length;
+    if (total !== null && read >= total) return { pages, read, total, complete: true };
+  }
+
+  return { pages, read, total, complete: false, reason: `stopped after the ${maxPages}-page limit with ${read} of ${total ?? '?'} records` };
+}
+
+/** Reads every subscriber page and the list membership pages, with coverage. */
+export async function readUpstream(reader, { listId, perPage = 100, maxPages = 500 }) {
+  const failures = [];
+
+  let subscribers;
+  try {
+    subscribers = await walkPages(
+      (page) => reader.get(`/api/subscribers?per_page=${perPage}&page=${page}`),
+      { perPage, maxPages },
+    );
+  } catch (error) {
+    subscribers = { pages: [], read: 0, total: null, complete: false, reason: String(error?.message ?? error) };
+  }
+  if (!subscribers.complete) failures.push({ phase: 'subscribers', error: subscribers.reason });
+
+  const queriedEmails = new Set();
+  let listWalk;
+  try {
+    listWalk = await walkPages(
+      (page) => reader.get(`/api/subscribers?list_id=${listId}&per_page=${perPage}&page=${page}`),
+      { perPage, maxPages },
+    );
+    for (const payload of listWalk.pages) {
+      const results = payload?.data?.results;
+      if (!Array.isArray(results)) continue;
+      for (const subscriber of results) {
+        const email = normalizeEmail(subscriber?.email);
+        if (email) queriedEmails.add(email);
+      }
+    }
+  } catch (error) {
+    listWalk = { complete: false, reason: String(error?.message ?? error) };
+  }
+  if (!listWalk.complete) failures.push({ phase: 'list', error: listWalk.reason });
+
   return {
-    get,
-    // Exposed so callers and tests can assert the refusal rather than trust it.
-    refuseMutation,
+    pages: subscribers.pages,
+    queriedEmails,
+    // The list query only supplies appearance evidence, so an incomplete list
+    // walk cannot invalidate a status read from the subscriber pages. It is
+    // still reported, because coverage of the query itself is weaker.
+    complete: subscribers.complete,
+    failures,
+    coverage: {
+      subscribersComplete: subscribers.complete,
+      subscribersRead: subscribers.read,
+      subscribersReportedTotal: subscribers.total,
+      listQueryComplete: listWalk.complete,
+      listQueryRead: listWalk.pages?.length ? queriedEmails.size : 0,
+    },
   };
 }
 
-/** Reads every subscriber page and the list membership pages. */
-export async function readUpstream(reader, { listId, perPage = 100, maxPages = 500 }) {
-  const pages = [];
-  const failures = [];
-  let seen = 0;
-
-  try {
-    for (let page = 1; page <= maxPages; page += 1) {
-      const payload = await reader.get(`/api/subscribers?per_page=${perPage}&page=${page}`);
-      pages.push(payload);
-      const results = payload?.data?.results;
-      if (!Array.isArray(results) || results.length === 0) break;
-      seen += results.length;
-      // `total` is the count upstream reports; `seen` is what was actually read.
-      // Comparing seen against total stops on a short final page without
-      // assuming every page is full.
-      const total = Number(payload?.data?.total ?? 0);
-      if (total > 0 && seen >= total) break;
-    }
-  } catch (error) {
-    failures.push({ phase: 'subscribers', error: String(error?.message ?? error) });
-  }
-
-  const listedEmails = new Set();
-  let listedSeen = 0;
-  try {
-    for (let page = 1; page <= maxPages; page += 1) {
-      const payload = await reader.get(`/api/subscribers?list_id=${listId}&per_page=${perPage}&page=${page}`);
-      const results = payload?.data?.results;
-      if (!Array.isArray(results)) {
-        failures.push({ phase: 'list', error: 'response has no results array' });
-        break;
-      }
-      for (const subscriber of results) {
-        const email = typeof subscriber?.email === 'string' ? subscriber.email.trim().toLowerCase() : null;
-        if (email) listedEmails.add(email);
-      }
-      if (results.length === 0) break;
-      listedSeen += results.length;
-      const total = Number(payload?.data?.total ?? 0);
-      if (total > 0 && listedSeen >= total) break;
-    }
-  } catch (error) {
-    failures.push({ phase: 'list', error: String(error?.message ?? error) });
-  }
-
-  return { pages, listedEmails, complete: failures.length === 0, failures };
-}
-
-/** Refuses to place a report inside a Git working tree. */
-export function assertOutsideRepository(target) {
-  const resolved = isAbsolute(target) ? target : resolve(target);
+function insideRepository(target) {
   try {
     const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      cwd: dirname(resolved),
+      cwd: dirname(target),
       stdio: ['ignore', 'pipe', 'ignore'],
       encoding: 'utf8',
     }).trim();
-    if (root && resolved.startsWith(`${root}/`)) {
-      throw new Error(`refusing to write a report inside the Git working tree at ${root}`);
-    }
-  } catch (error) {
-    if (String(error?.message ?? '').startsWith('refusing')) throw error;
+    return root ? target === root || target.startsWith(`${root}/`) : false;
+  } catch {
     // Not a Git working tree, which is the expected case for a report path.
+    return false;
   }
-  return resolved;
+}
+
+/**
+ * Validates a report destination and returns the resolved, safe path.
+ *
+ * The parent directory is resolved through `realpath`, so a symlinked directory
+ * cannot smuggle the write into a repository. An existing destination that is a
+ * symlink is refused outright: following it would write wherever it points, and
+ * replacing it would silently discard the link.
+ */
+export function assertOutsideRepository(target) {
+  const requested = isAbsolute(target) ? target : resolve(target);
+  let realDir;
+  try {
+    realDir = realpathSync(dirname(requested));
+  } catch {
+    throw new Error(`report directory does not exist: ${dirname(requested)}`);
+  }
+  const effective = join(realDir, basename(requested));
+
+  let stats = null;
+  try {
+    stats = lstatSync(effective);
+  } catch {
+    // Destination does not exist yet, which is the normal case.
+  }
+  if (stats?.isSymbolicLink()) {
+    throw new Error('refusing to write a report to a symbolic link');
+  }
+  if (stats && !stats.isFile()) {
+    throw new Error('refusing to write a report to a path that is not a regular file');
+  }
+
+  if (insideRepository(effective)) {
+    throw new Error(`refusing to write a report inside the Git working tree at ${realDir}`);
+  }
+  return effective;
+}
+
+/** Publishes through a private temporary file, then renames into place. */
+export function writeReport(target, contents) {
+  const effective = assertOutsideRepository(target);
+  const temporary = join(dirname(effective), `.${basename(effective)}.${process.pid}.tmp`);
+  try {
+    writeFileSync(temporary, contents, { mode: 0o600, flag: 'wx' });
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, effective);
+  } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // The temporary file may not have been created.
+    }
+    throw error;
+  }
+  return effective;
 }
 
 function parseArgs(argv) {
@@ -401,26 +563,28 @@ async function main() {
   const kv = readKvExport(JSON.parse(readFileSync(options.kv, 'utf8')));
 
   const reader = createListmonkReader({ apiUrl: LISTMONK_API_URL, user: LISTMONK_API_USER, token: LISTMONK_API_TOKEN });
-  const upstream = await readUpstream(reader, { listId: Number(LISTMONK_LIST_ID) });
+  const listId = Number(LISTMONK_LIST_ID);
+  const upstream = await readUpstream(reader, { listId });
   const collected = collectUpstream({
     pages: upstream.pages,
-    listedEmails: upstream.listedEmails,
+    queriedEmails: upstream.queriedEmails,
     complete: upstream.complete,
     failures: upstream.failures,
+    listId,
   });
 
-  const inventory = buildInventory({ kv, upstreamByEmail: collected.upstreamByEmail });
+  const inventory = buildInventory({ kv, upstreamByEmail: collected.upstreamByEmail, coverage: upstream.coverage });
   const report = buildReport({
     inventory,
     window: { startedAt, finishedAt: new Date().toISOString() },
-    source: { complete: collected.complete, failures: collected.failures, listId: Number(LISTMONK_LIST_ID) },
+    source: { complete: upstream.complete, failures: upstream.failures, listId, coverage: upstream.coverage },
     includeIdentifiers: options.includeIdentifiers,
     pseudonymize: createPseudonymizer(INVENTORY_HMAC_SECRET),
   });
 
   const output = `${JSON.stringify(report, null, 2)}\n`;
   if (options.out) {
-    writeFileSync(assertOutsideRepository(options.out), output);
+    writeReport(options.out, output);
     console.error(`wrote ${options.out}`);
   }
   console.log(output);
