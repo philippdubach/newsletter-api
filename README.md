@@ -210,6 +210,48 @@ behaviour and are not filtered.
 
 ## Scripts
 
+### Subscriber Drift Inventory
+
+`scripts/inventory-subscribers.mjs` compares subscriber records in KV with list
+membership in Listmonk and reports what differs. It is a **read-only inventory,
+not a migration**: no bucket implies an action, and a KV-only record must never
+be treated as a queued re-subscription.
+
+That distinction is deliberate. Listmonk's own unsubscribe links —
+`{{ UnsubscribeURL }}` and the `List-Unsubscribe` header, which targets
+`/subscription/<campaign>/<subscriber>` — change subscription state without the
+Worker being involved. A native unsubscribe is an expression of user intent, so
+converging Listmonk toward an older KV "subscribed" record would silently undo
+it. The inventory reports; a human decides.
+
+```bash
+LISTMONK_API_URL=... LISTMONK_API_USER=... LISTMONK_API_TOKEN=... \
+LISTMONK_LIST_ID=3 INVENTORY_HMAC_SECRET=... \
+node scripts/inventory-subscribers.mjs --kv kv-export.json --out /tmp/inventory.json
+```
+
+| Guarantee | How |
+|---|---|
+| Read-only | The client issues only `GET` and refuses any other method; no KV writes, no welcome mail, no unsubscribe requests |
+| No policy by accident | Recipients needing investigation are reported as such; nothing re-subscribes, re-adds or removes |
+| Incomplete reads stay incomplete | A failed or truncated page marks the report incomplete and exits `2` instead of implying missing subscribers |
+| Pseudonymous identifiers | Keyed HMAC-SHA256 under `INVENTORY_HMAC_SECRET`; there is no unsalted fallback, and aggregate counts are the default |
+| No secrets in Git | Reports are refused inside a Git working tree, and `inventory-*.json` is ignored |
+
+The KV export is a JSON file of `{ key, value }` objects, `[key, value]` pairs,
+or a key-to-value object. `rate_limit:` and `cache:` keys are excluded, since
+they are Worker bookkeeping rather than membership.
+
+Buckets: `both_active`, `kv_only_missing_upstream`, `upstream_unsubscribed`,
+`blocklisted`, `listmonk_only`, `needs_investigation`. An unrecognised status or
+absent list information lands in `needs_investigation` rather than being guessed
+— "never added to this list" and "removed without a status" are
+indistinguishable from Listmonk's subscriber payload.
+
+The two stores are read separately, so differences are candidates for
+investigation rather than a transactionally consistent snapshot. The report
+records its own observation window and states that in its `caveats`.
+
 ### Export Subscribers
 
 Export all subscriber emails to a CSV file:
