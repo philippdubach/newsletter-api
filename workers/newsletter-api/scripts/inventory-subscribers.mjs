@@ -55,7 +55,7 @@ import { fileURLToPath } from 'node:url';
 
 // Keys the Worker writes that are not subscriber records. Anything else in the
 // namespace is expected to be keyed by normalized address.
-const NON_SUBSCRIBER_PREFIXES = ['rate_limit:', 'cache:'];
+const NON_SUBSCRIBER_PREFIXES = ['rate_limit:', 'cache:', 'intent:'];
 
 const EXPECTED_EMAIL = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
 

@@ -198,11 +198,19 @@ operation, and returns writes to the unserialized inline path. Switch back to
 understand.
 
 Stale work cannot override a newer intent. A legacy request publishes its intent
-to the coordinator when the object is reachable, and any pending job is fenced
-against the KV shadow before it runs: if the shadow disagrees with the stored
-intent, the job is discarded rather than acting on superseded intent. That means
-an unsubscribe served inline while an older create is still pending cannot be
-undone by that create when it retries.
+to the coordinator when the object is reachable, and writes an explicit fence key
+(`intent:fence:<address>`) before it touches the provider. A pending job is
+superseded only when that fence is newer than the intent the job holds; a fence
+that is older, missing, unreadable or malformed never cancels accepted work.
+
+The KV shadow is deliberately **not** used as evidence of a newer intent. A shadow
+that disagrees with the stored intent is at least as likely to be this
+operation's own unfinished write, or an eventually consistent read, as a newer
+request — and treating it as supersession discarded valid retries.
+
+An unsubscribe accepted but not yet finished is durable proof of the recipient's
+intent: an unauthenticated signup cannot cancel it, and keeps reporting the
+address as unsubscribed until the removal completes or the caller proves control.
 
 ### Runtime suite
 

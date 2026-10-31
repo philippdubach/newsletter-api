@@ -53,6 +53,9 @@ export function createEgressGuard() {
 }
 
 export const DRAIN_PATH = '/__harness__/drain-background-work';
+// Test-only KV door, so a suite can assert that the shadow was written and can
+// plant a fence without going through the Worker.
+const KV_PATH = '/__harness__/kv';
 
 // Test-only entry. It imports the real Worker and forwards every call to it,
 // but hands it a ctx whose waitUntil also records the promise. A private route
@@ -67,8 +70,26 @@ import worker from ${JSON.stringify(entry)};
 export * from ${JSON.stringify(entry)};
 const pending = new Set();
 const DRAIN_PATH = ${JSON.stringify(DRAIN_PATH)};
+const KV_PATH = ${JSON.stringify(KV_PATH)};
 export default {
   async fetch(request, env, ctx) {
+    const kvUrl = new URL(request.url);
+    if (kvUrl.pathname === KV_PATH) {
+      const key = kvUrl.searchParams.get('key');
+      if (request.method === 'PUT') {
+        const body = await request.json();
+        if (key) await env.NEWSLETTER_SUBSCRIBERS.put(key, JSON.stringify(body.value ?? null));
+        return Response.json({ ok: true });
+      }
+      if (request.method === 'GET') {
+        const value = key ? await env.NEWSLETTER_SUBSCRIBERS.get(key) : null;
+            return Response.json({ value });
+      }
+      if (request.method === 'DELETE') {
+        if (key) await env.NEWSLETTER_SUBSCRIBERS.delete(key);
+        return Response.json({ ok: true });
+      }
+    }
     if (new URL(request.url).pathname === DRAIN_PATH) {
       let settled = 0;
       while (pending.size > 0) {
@@ -140,6 +161,24 @@ export async function startRuntime({ entry = join(workerDir, 'src/index.ts'), ex
   return {
     runtime,
     attempts,
+    /** Test-only KV access, for asserting the shadow and planting fences. */
+    kv: {
+      async get(key) {
+        const response = await runtime.dispatchFetch(`http://localhost${KV_PATH}?key=${encodeURIComponent(key)}`);
+        const { value } = await response.json();
+        return value;
+      },
+      async put(key, value) {
+        await runtime.dispatchFetch(`http://localhost${KV_PATH}?key=${encodeURIComponent(key)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value }),
+        });
+      },
+      async remove(key) {
+        await runtime.dispatchFetch(`http://localhost${KV_PATH}?key=${encodeURIComponent(key)}`, { method: 'DELETE' });
+      },
+    },
     /** Direct handle on the coordinator, for asserting durable state. */
     coordinator: async (email) => {
       const namespace = await runtime.getDurableObjectNamespace('SUBSCRIPTION_COORDINATOR');

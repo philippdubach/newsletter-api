@@ -1179,3 +1179,224 @@ describe('the deadline reaches welcome and fallback', () => {
     }
   });
 });
+
+describe('supersession end to end', () => {
+  it('drops a pending job when a newer fence exists, and adopts the fence', async () => {
+    const email = 'invariant-fence-newer@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    let createFails = true;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (createFails && url.pathname === '/api/subscribers' && request.method === 'POST') {
+        store.calls.push({ method: 'POST', path: url.pathname, search: url.search, body: null });
+        return new Response('{"error":"boom"}', { status: 500 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.280' },
+        body: JSON.stringify({ email }),
+      });
+      await signup.json();
+      await local.drain();
+
+      const stub = await local.coordinator(email);
+      let state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.ok(state.pending, 'the failed create must be pending');
+      const intentAt = state.intent.recordedAtMs;
+
+      // A request that changed intent without reaching this object.
+      createFails = false;
+      await local.kv.put(`intent:fence:${email}`, { desired: 'unsubscribed', at: intentAt + 1000 });
+      const before = store.calls.length;
+
+      const sync = await (await stub.fetch('https://coordinator/sync', { method: 'POST' })).json();
+
+      assert.equal(sync.outcome, 'superseded');
+      state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.pending, null);
+      assert.equal(state.alarm, null);
+      // The fence is adopted, and the stale create is not performed.
+      assert.equal(state.intent.desired, 'unsubscribed');
+      assert.equal(store.calls.filter((c, i) => i >= before && c.method !== 'GET').length, 0);
+      assert.equal(store.membership.get(email), undefined);
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it('runs a pending job when the fence is older than the intent', async () => {
+    const email = 'invariant-fence-older@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    let createFails = true;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (createFails && url.pathname === '/api/subscribers' && request.method === 'POST') {
+        store.calls.push({ method: 'POST', path: url.pathname, search: url.search, body: null });
+        return new Response('{"error":"boom"}', { status: 500 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.281' },
+        body: JSON.stringify({ email }),
+      });
+      await signup.json();
+      await local.drain();
+
+      const stub = await local.coordinator(email);
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+      createFails = false;
+      await local.kv.put(`intent:fence:${email}`, { desired: 'unsubscribed', at: state.intent.recordedAtMs - 1000 });
+
+      const sync = await (await stub.fetch('https://coordinator/sync', { method: 'POST' })).json();
+      assert.equal(sync.outcome, 'completed');
+      assert.equal(store.membership.get(email), true, 'an older fence must not block the work');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('the KV shadow is actually maintained', () => {
+  it('writes the record on subscribe and removes it on unsubscribe', async () => {
+    const email = 'invariant-shadow@example.com';
+    const store = createProviderStub();
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.282' },
+        body: JSON.stringify({ email }),
+      });
+      await signup.json();
+      await local.drain();
+      assert.ok(await local.kv.get(email), 'subscribe must write the KV shadow');
+
+      const removal = await local.runtime.dispatchFetch('http://localhost/api/unsubscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.283' },
+        body: JSON.stringify({ email, token: tokenFor(email) }),
+      });
+      await removal.json();
+      await local.drain();
+      assert.equal(await local.kv.get(email), null, 'unsubscribe must remove the KV shadow');
+      assert.equal(store.membership.get(email), false);
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('an anonymous signup cannot cancel an accepted removal', () => {
+  it('keeps the pending removal and reports the address as unsubscribed', async () => {
+    const email = 'invariant-cancel-removal@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    let removeFails = true;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (removeFails && url.pathname === '/api/subscribers/query/lists' && request.method === 'PUT') {
+        store.calls.push({ method: 'PUT', path: url.pathname, search: url.search, body: null });
+        return new Response('{"error":"boom"}', { status: 500 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.284' },
+        body: JSON.stringify({ email }),
+      });
+      await signup.json();
+      await local.drain();
+
+      // An authenticated unsubscribe is accepted but cannot complete yet.
+      const removal = await local.runtime.dispatchFetch('http://localhost/api/unsubscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.285' },
+        body: JSON.stringify({ email, token: tokenFor(email) }),
+      });
+      const removalBody = await removal.json();
+      await local.drain();
+      assert.equal(removal.status, 202);
+      assert.equal(removalBody.status, 'accepted');
+
+      // Anyone who knows the address tries to sign it up again.
+      const stranger = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.286' },
+        body: JSON.stringify({ email }),
+      });
+      const strangerBody = await stranger.json();
+      await local.drain();
+
+      const stub = await local.coordinator(email);
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+
+      assert.notEqual(strangerBody.message, 'Subscribed successfully');
+      assert.equal(state.intent.desired, 'unsubscribed', 'the accepted removal must survive');
+      assert.ok(state.pending, 'its retry must still be scheduled');
+      assert.equal(state.pending.kind, 'remove');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('publishing an intent does not cancel durable work', () => {
+  it('keeps the pending job when a request records intent without doing the work', async () => {
+    const email = 'invariant-record-only@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/subscribers' && request.method === 'POST') {
+        store.calls.push({ method: 'POST', path: url.pathname, search: url.search, body: null });
+        return new Response('{"error":"boom"}', { status: 500 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.290' },
+        body: JSON.stringify({ email }),
+      });
+      await signup.json();
+      await local.drain();
+
+      const stub = await local.coordinator(email);
+      let state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.ok(state.pending, 'the failed create must be pending');
+
+      // A legacy request publishes its intent without performing provider work.
+      await stub.fetch('https://coordinator/intent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ desired: 'subscribed', email, recordOnly: true }),
+      });
+
+      state = await (await stub.fetch('https://coordinator/state')).json();
+      // Cancelling it here is what let a rollback discard an accepted operation.
+      assert.ok(state.pending, 'publishing an intent must not delete pending work');
+      assert.ok(state.alarm, 'the wakeup must survive too');
+    } finally {
+      await local.dispose();
+    }
+  });
+});

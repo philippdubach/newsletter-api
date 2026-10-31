@@ -877,6 +877,7 @@ async function submitIntent(
   email: string,
   clientIP: string,
   request: Request,
+  authenticated = false,
 ): Promise<IntentResult> {
   try {
     const response = await coordinator.fetch('https://coordinator/intent', {
@@ -887,6 +888,7 @@ async function submitIntent(
         email,
         ip: clientIP,
         userAgent: request.headers.get('User-Agent') || 'unknown',
+        authenticated,
       }),
     });
     if (!response.ok) return { outcome: 'failed', error: `coordinator HTTP ${response.status}` };
@@ -980,7 +982,7 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
     // so this request cannot interleave with a concurrent unsubscribe.
     const coordinator = coordinatorFor(env, email);
     if (coordinator) {
-      const result = await submitIntent(coordinator, 'subscribed', email, clientIP, request);
+      const result = await submitIntent(coordinator, 'subscribed', email, clientIP, request, requireAuth(request, env));
       return subscribeResponse(result, request, env);
     }
 
@@ -997,16 +999,22 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
     if (existing) {
       const { state: upstream } = await lookupListmonkSubscriber(email, env);
       // Map the lookup's vocabulary onto the coordinator's outcome vocabulary.
-      // In the fallback path a confirmed upstream means no work to do, and an
-      // absent one would need a create this path cannot serialize, so it is
-      // reported as accepted rather than silently faked.
       const outcome: SyncOutcome = upstream === 'confirmed'
         ? 'completed'
-        : upstream === 'absent'
-          ? 'pending'
-          : upstream === 'pending'
-            ? 'unverified'
+        : upstream === 'pending'
+          ? 'unverified'
+          : upstream === 'absent'
+            ? 'pending'
             : upstream;
+
+      // Absent upstream is the state a failed background write leaves behind. This
+      // path must schedule its own recovery: the coordinator may be unreachable,
+      // which is the reason it is being used.
+      if (upstream === 'absent') {
+        const record = await readRecord(email, env);
+        ctx.waitUntil(reconcileSignup(email, record?.seq ?? 0, clientIP, env, { welcome: false }));
+        return subscribeResponse({ outcome: 'pending', created: false }, request, env);
+      }
       return subscribeResponse({ outcome, created: false }, request, env);
     }
 
@@ -1048,7 +1056,7 @@ async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionConte
     // already in flight cannot quietly restore the subscription afterwards.
     const coordinator = coordinatorFor(env, email);
     if (coordinator) {
-      const result = await submitIntent(coordinator, 'unsubscribed', email, getClientIP(request), request);
+      const result = await submitIntent(coordinator, 'unsubscribed', email, getClientIP(request), request, true);
       return unsubscribeResponse(result, request, env);
     }
 
@@ -1309,6 +1317,11 @@ interface CoordinatorIntent {
   updatedAt: string;
   /** Milliseconds, used only to order this intent against a legacy fence. */
   recordedAtMs: number;
+  /** Caller metadata, kept here so a retry can repair the shadow correctly. */
+  ip?: string;
+  userAgent?: string;
+  /** Whether the caller proved control of the address. */
+  authenticated?: boolean;
 }
 
 /**
@@ -1454,7 +1467,8 @@ export class SubscriptionCoordinator {
    * thing and nothing is scheduled to act on it.
    */
   private async setIntent(input: {
-    desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string; recordOnly?: boolean;
+    desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
+    recordOnly?: boolean; authenticated?: boolean;
   }): Promise<SyncResult & { seq: number; desired: string }> {
     const email = input.email.trim().toLowerCase();
     const previous = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
@@ -1466,7 +1480,19 @@ export class SubscriptionCoordinator {
       seq,
       updatedAt: new Date(recordedAtMs).toISOString(),
       recordedAtMs,
+      ip: input.ip,
+      userAgent: input.userAgent,
+      authenticated: input.authenticated,
     };
+
+    // An accepted-but-unfinished removal is durable proof of the recipient's
+    // intent. An anonymous request must not cancel it; only a caller who proved
+    // control of the address may resubscribe while it is in flight.
+    const pendingBefore = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
+    const removalInFlight = pendingBefore?.kind === 'remove' && pendingBefore.seq === previous?.seq;
+    if (input.desired === 'subscribed' && removalInFlight && !input.authenticated) {
+      return { outcome: 'unsubscribed', seq: previous!.seq, desired: 'unsubscribed' };
+    }
 
     await this.state.storage.put(INTENT_KEY, intent);
     await this.state.storage.put<CoordinatorPending>(PENDING_KEY, {
@@ -1485,10 +1511,10 @@ export class SubscriptionCoordinator {
     }
 
     if (input.recordOnly) {
-      // A legacy request publishes its intent so older durable work can be fenced,
-      // but performs the provider work itself. Nothing is left pending here.
-      await this.state.storage.delete(PENDING_KEY);
-      await this.state.storage.deleteAlarm();
+      // A legacy request publishes its intent so older durable work is superseded
+      // by sequence, but it performs the provider work itself. Existing pending
+      // work is left alone: cancelling it here is what let a rollback discard an
+      // accepted operation, and the seq bump above already makes it stale.
       return { outcome: 'completed', seq, desired: intent.desired };
     }
 
@@ -1513,10 +1539,14 @@ export class SubscriptionCoordinator {
     const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
     if (!intent) return { outcome: 'failed', error: 'no intent recorded', retryable: false };
 
-    if (fresh) {
-      const shadow = await this.applyShadow(intent);
-      if (!shadow.ok) return await this.scheduleRetry(intent, { outcome: 'failed', error: shadow.error, retryable: true }, 'shadow');
-    } else {
+    // A removal must not mutate the shadow before it is known to be performable:
+    // otherwise a missing provider configuration leaves KV without the record and
+    // Listmonk still mailing them.
+    if (intent.desired === 'unsubscribed' && !isListmonkConfigured(this.env)) {
+      if (!fresh) return await this.scheduleRetry(intent, { outcome: 'failed', error: 'Listmonk not configured', retryable: false }, 'remove');
+    }
+
+    if (!fresh) {
       const { decision, fence } = await this.readFence(intent);
       if (decision === 'supersede') {
         // A newer request recorded its intent elsewhere and served it itself, so
@@ -1533,6 +1563,13 @@ export class SubscriptionCoordinator {
         console.warn(`coordinator adopted a newer ${fence!.desired} intent for ${redactEmail(intent.email)} and dropped stale ${intent.desired} work`);
         return { outcome: 'superseded', retryable: false };
       }
+    }
+
+    // The shadow is repaired on every attempt, not only the first. Otherwise a
+    // failed shadow write is never retried and the two stores drift permanently.
+    const shadow = await this.applyShadow(intent);
+    if (!shadow.ok) {
+      return await this.scheduleRetry(intent, { outcome: 'failed', error: shadow.error, retryable: true }, 'shadow');
     }
 
     // One deadline covers lookup, create, welcome and fallback, so the exclusive
@@ -1594,8 +1631,8 @@ export class SubscriptionCoordinator {
       if (intent.desired === 'subscribed') {
         await this.env.NEWSLETTER_SUBSCRIBERS.put(intent.email, JSON.stringify({
           timestamp: intent.updatedAt,
-          ip: this.pendingInput.ip ?? 'unknown',
-          userAgent: this.pendingInput.userAgent ?? 'unknown',
+          ip: intent.ip ?? 'unknown',
+          userAgent: intent.userAgent ?? 'unknown',
           seq: Date.now(),
         }));
       } else {
@@ -1761,6 +1798,7 @@ export default {
             const result = await env.NEWSLETTER_SUBSCRIBERS.list({ cursor, limit: 1000 });
             count += result.keys.filter(key =>
               !key.name.startsWith('rate_limit:') && !key.name.startsWith('cache:')
+              && !key.name.startsWith('intent:')
             ).length;
             cursor = result.list_complete ? undefined : result.cursor;
           } while (cursor);
