@@ -19,6 +19,18 @@ id = "dev-local-only-placeholder"
 binding = "R2_BUCKET"
 bucket_name = "newsletter-dev-local"
 
+# The coordinator is one serialized object per address, so a subscribe and a
+# later unsubscribe cannot interleave. Local simulation only; the production
+# binding is declared under [env.production] below.
+[durable_objects]
+bindings = [
+  { name = "SUBSCRIPTION_COORDINATOR", class_name = "SubscriptionCoordinator" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SubscriptionCoordinator"]
+
 # Development has no Listmonk or Plunk configuration on purpose: a development
 # Worker must not email real subscribers. Supply local values through
 # `.dev.vars` when testing that path.
@@ -29,6 +41,10 @@ ALLOWED_ORIGIN = "http://localhost:1313,http://localhost:3000"
 # Production environment
 [env.production]
 name = "newsletter-api"
+
+[[env.production.durable_objects.bindings]]
+name = "SUBSCRIPTION_COORDINATOR"
+class_name = "SubscriptionCoordinator"
 
 # Production KV namespace binding
 [[env.production.kv_namespaces]]

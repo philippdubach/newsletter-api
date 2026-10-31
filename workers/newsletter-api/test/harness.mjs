@@ -62,6 +62,9 @@ export const DRAIN_PATH = '/__harness__/drain-background-work';
 function wrapperSource(entry) {
   return `
 import worker from ${JSON.stringify(entry)};
+// Re-exported so Miniflare can resolve the Durable Object class by name from
+// this entrypoint. A star export skips the default, which is defined below.
+export * from ${JSON.stringify(entry)};
 const pending = new Set();
 const DRAIN_PATH = ${JSON.stringify(DRAIN_PATH)};
 export default {
@@ -129,6 +132,7 @@ export async function startRuntime({ entry = join(workerDir, 'src/index.ts'), ex
       bindings: { ...TEST_BINDINGS, ...extraBindings },
       kvNamespaces: ['NEWSLETTER_SUBSCRIBERS'],
       r2Buckets: ['R2_BUCKET'],
+      durableObjects: { SUBSCRIPTION_COORDINATOR: 'SubscriptionCoordinator' },
       outboundService: (request) => handler(request),
     }),
   );
@@ -136,6 +140,11 @@ export async function startRuntime({ entry = join(workerDir, 'src/index.ts'), ex
   return {
     runtime,
     attempts,
+    /** Direct handle on the coordinator, for asserting durable state. */
+    coordinator: async (email) => {
+      const namespace = await runtime.getDurableObjectNamespace('SUBSCRIPTION_COORDINATOR');
+      return namespace.get(namespace.idFromName(email.trim().toLowerCase()));
+    },
     /** Waits until every ctx.waitUntil promise the Worker registered has settled. */
     // Consume any response body before calling this. `dispatchFetch` returns a
     // live stream, and issuing the drain request first can leave the body

@@ -44,6 +44,7 @@ const MAX_BODY = 1024;
 
 let runtime;
 let attempts;
+let coordinatorFor;
 let dispose;
 let drain;
 let ipCounter = 0;
@@ -64,13 +65,19 @@ function send(path, init = {}) {
   return runtime.dispatchFetch(`http://localhost${path}`, { ...init, headers });
 }
 
-// With no provider configured the Worker declines to claim a subscription for
-// an address it already holds, so `status: 'unverified'` is the signal that the
-// KV record survived. It is a stronger presence proof than the old message,
-// which asserted provider state the Worker had never checked.
-function assertRecordPresent(body) {
+// With no provider configured the Worker declines to claim a subscription, so
+// `status: 'unverified'` is what a fresh or repeated signup both return. Presence
+// is therefore read from the coordinator's durable intent, which is the authority
+// on what was asked for, rather than inferred from a response message.
+function assertUnverified(body) {
   assert.equal(body.success, false);
   assert.equal(body.status, 'unverified');
+}
+
+async function intentFor(email) {
+  const stub = await coordinatorFor(email);
+  const response = await stub.fetch('https://coordinator/state');
+  return (await response.json()).intent;
 }
 
 function subscribe(email, extra = {}) {
@@ -89,7 +96,7 @@ before(async () => {
     throw new Error(`refusing to start workerd against an unsafe configuration:\n- ${errors.join('\n- ')}`);
   }
 
-  ({ runtime, attempts, dispose, drain } = await startRuntime());
+  ({ runtime, attempts, coordinator: coordinatorFor, dispose, drain } = await startRuntime());
 });
 
 after(async () => {
@@ -157,17 +164,24 @@ describe('health', () => {
 });
 
 describe('subscribe', () => {
-  it('accepts a first subscription and records it in KV', async () => {
-    const response = await subscribe('runtime-first@example.com');
+  it('accepts a first subscription and records the intent durably', async () => {
+    const email = 'runtime-first@example.com';
+    const response = await subscribe(email);
     assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.success, true);
-    assert.equal(body.message, 'Subscribed successfully');
+    // No provider is configured in this suite, so the subscription is recorded
+    // but cannot be confirmed upstream.
+    assertUnverified(await response.json());
 
-    // A second request reads the record back through the real KV binding.
-    const duplicate = await subscribe('runtime-first@example.com');
+    const intent = await intentFor(email);
+    assert.equal(intent.desired, 'subscribed');
+    assert.equal(intent.email, email);
+
+    // A second request reads the same intent back; it does not create a new one.
+    const duplicate = await subscribe(email);
     assert.equal(duplicate.status, 200);
-    assertRecordPresent(await duplicate.json());
+    assertUnverified(await duplicate.json());
+    const after = await intentFor(email);
+    assert.ok(after.seq > intent.seq, 'a repeated signup records a newer intent');
   });
 
   it('rejects a malformed JSON body as a client error', async () => {
@@ -215,9 +229,9 @@ describe('unsubscribe', () => {
     assert.equal(refused.status, 403);
     assert.match((await refused.json()).error, /token/i);
 
-    // The record still exists, which the duplicate path can only answer.
-    const again = await subscribe(email);
-    assertRecordPresent(await again.json());
+    // The intent is unchanged by the refused unsubscribe.
+    const intent = await intentFor(email);
+    assert.equal(intent.desired, 'subscribed');
   });
 
   it('fails closed when the provider is not configured', async () => {
@@ -232,7 +246,10 @@ describe('unsubscribe', () => {
     assert.equal(response.status, 502);
     const body = await response.json();
     assert.equal(body.success, false);
-    assert.match(body.error, /unavailable/i);
+    // A missing provider configuration is permanent, so the request fails
+    // closed instead of being accepted and retried.
+    assert.equal(typeof body.error, 'string');
+    assert.match(body.error, /failed|unavailable/i);
   });
 
   it('does not mutate on a GET with a bad token', async () => {
@@ -243,8 +260,8 @@ describe('unsubscribe', () => {
     assert.equal(response.status, 403);
     assert.match(response.headers.get('content-security-policy') ?? '', /form-action 'self'/);
 
-    const again = await subscribe(email);
-    assertRecordPresent(await again.json());
+    const intent = await intentFor(email);
+    assert.equal(intent.desired, 'subscribed');
   });
 
   it('renders a confirmation form for a signed GET without removing anything', async () => {
@@ -259,8 +276,8 @@ describe('unsubscribe', () => {
     assert.match(html, /action="\/api\/unsubscribe\/confirm"/);
     assert.match(html, /method="post"/);
 
-    const again = await subscribe(email);
-    assertRecordPresent(await again.json());
+    const intent = await intentFor(email);
+    assert.equal(intent.desired, 'subscribed');
   });
 
   it('accepts the form post that the confirmation page sends', async () => {

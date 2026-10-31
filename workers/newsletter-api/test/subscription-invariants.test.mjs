@@ -17,10 +17,12 @@
 
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 
-import { startRuntime } from './harness.mjs';
+import { TEST_BINDINGS, startRuntime } from './harness.mjs';
 
 const LIST_URL = 'https://listmonk.runtime-suite.invalid';
+const HMAC_SECRET = TEST_BINDINGS.UNSUBSCRIBE_HMAC_SECRET;
 const LIST_ID = 3;
 
 const PROVIDER_BINDINGS = {
@@ -102,6 +104,18 @@ function subscribe(email) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': nextIP() },
     body: JSON.stringify({ email }),
+  });
+}
+
+function tokenFor(email) {
+  return `v1:${createHmac('sha256', HMAC_SECRET).update(email).digest('hex')}`;
+}
+
+function unsubscribe(email) {
+  return harness.runtime.dispatchFetch('http://localhost/api/unsubscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': nextIP() },
+    body: JSON.stringify({ email, token: tokenFor(email) }),
   });
 }
 
@@ -412,6 +426,209 @@ describe('the browser can show the explanation', () => {
       assert.match(body.error, /verify/i);
     } finally {
       provider.clearRawLookup();
+    }
+  });
+});
+
+describe('ordering is serialized per address', () => {
+  async function coordinatorState(email) {
+    const stub = await harness.coordinator(email);
+    const response = await stub.fetch('https://coordinator/state');
+    return response.json();
+  }
+
+  it('does not let a concurrent signup and unsubscribe both win', async () => {
+    const email = 'invariant-race@example.com';
+    await seedSubscriber(email);
+    setProviderStatus(email, { listStatus: 'confirmed' });
+
+    // Both are issued without awaiting the first. Before the coordinator these
+    // could interleave and leave the stores disagreeing.
+    const [first, second] = await Promise.all([subscribe(email), unsubscribe(email)]);
+    await drain();
+
+    // Either request may report accepted instead of completed, because one of
+    // them is superseded by the other. What must hold is that neither claims a
+    // conflicting final state and the provider sees at most one write.
+    assert.ok([200, 202].includes(first.status), `unexpected subscribe status ${first.status}`);
+    assert.ok([200, 202].includes(second.status), `unexpected unsubscribe status ${second.status}`);
+
+    const state = await coordinatorState(email);
+    const desired = state.intent.desired;
+    // Whichever arrived last owns the outcome; the point is that exactly one
+    // intent survives and the provider is converged to it.
+    assert.ok(['subscribed', 'unsubscribed'].includes(desired));
+
+    const writes = provider.calls.filter((c) => c.method !== 'GET');
+    assert.ok(writes.length <= 1, `expected at most one provider write, saw ${JSON.stringify(writes)}`);
+  });
+
+  it('keeps the later unsubscribe when a signup is already recorded', async () => {
+    const email = 'invariant-sub-then-unsub@example.com';
+    await seedSubscriber(email);
+    setProviderStatus(email, { listStatus: 'confirmed' });
+
+    await unsubscribe(email);
+    await drain();
+
+    const state = await coordinatorState(email);
+    assert.equal(state.intent.desired, 'unsubscribed');
+    // The replacement intent is the tombstone: the KV shadow is gone but the
+    // request to leave is still recorded.
+    assert.ok(state.intent.seq >= 2);
+  });
+
+  it('does not resurrect an address after an unsubscribe', async () => {
+    const email = 'invariant-no-resurrect@example.com';
+    await seedSubscriber(email);
+    setProviderStatus(email, { listStatus: 'unsubscribed' });
+
+    await subscribe(email);
+    await drain();
+    const body = await (await subscribe(email)).json();
+
+    // A fresh explicit signup is not silently turned into a re-subscription.
+    assert.notEqual(body.message, 'Already subscribed');
+    assert.equal(provider.mutations().length, 0);
+  });
+});
+
+describe('failed provider work is durable', () => {
+  it('accepts the intent, records a retry, and completes it later', async () => {
+    const email = 'invariant-retry@example.com';
+    // The address is absent upstream, so the coordinator will attempt a create —
+    // and the provider refuses it.
+    let failing = true;
+    const store = createProviderStub();
+    const base = store.handler;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (failing && url.pathname === '/api/subscribers' && request.method === 'POST') {
+        store.calls.push({ method: 'POST', path: url.pathname, search: url.search, body: null });
+        return new Response('{"error":"boom"}', { status: 500 });
+      }
+      return base(request);
+    };
+
+    const retryHarness = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const response = await retryHarness.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.210' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json();
+      await retryHarness.drain();
+
+      assert.equal(response.status, 202);
+      assert.equal(body.status, 'accepted');
+
+      const stub = await retryHarness.coordinator(email);
+      let state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.intent.desired, 'subscribed');
+      assert.equal(state.pending.attempts, 1);
+      assert.ok(state.alarm, 'a retry alarm must be armed');
+
+      // The provider recovers; the stored retry converges without a new request.
+      failing = false;
+      const syncResponse = await stub.fetch('https://coordinator/sync', { method: 'POST' });
+      const synced = await syncResponse.json();
+      assert.equal(synced.outcome, 'completed');
+
+      state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.pending, null);
+      assert.ok(store.calls.some((c) => c.method === 'POST' && c.path === '/api/subscribers'));
+    } finally {
+      await retryHarness.dispose();
+    }
+  });
+});
+
+describe('a superseded intent is reported honestly', () => {
+  it('does not report a signup as completed when an unsubscribe arrives mid-flight', async () => {
+    const email = 'invariant-supersede@example.com';
+    let releaseCreate;
+    const createGate = new Promise((resolve) => { releaseCreate = resolve; });
+
+    const store = createProviderStub();
+    const base = store.handler;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/subscribers' && request.method === 'POST') {
+        store.calls.push({ method: 'POST', path: url.pathname, search: url.search, body: null });
+        // Hold the create open so a later unsubscribe can arrive while it is in
+        // flight, which is the case the intent re-read exists for.
+        await createGate;
+        return new Response('{}', { status: 200 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    const post = (path, body, ip) => local.runtime.dispatchFetch(`http://localhost${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+      body: JSON.stringify(body),
+    });
+
+    try {
+      const signup = post('/api/subscribe', { email }, '198.51.100.220');
+      // Give the signup time to reach the held provider call.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const removal = post('/api/unsubscribe', { email, token: tokenFor(email) }, '198.51.100.221');
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      releaseCreate();
+
+      const signupResponse = await signup;
+      const signupBody = await signupResponse.json();
+      await removal;
+      await local.drain();
+
+      // The create it issued cannot be recalled, so the honest answer is that the
+      // request was accepted, not that the subscription completed.
+      assert.notEqual(signupBody.message, 'Subscribed successfully');
+      assert.equal(signupBody.status, 'accepted');
+
+      const stub = await local.coordinator(email);
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.intent.desired, 'unsubscribed');
+      // The later intent converged the provider rather than being overwritten by
+      // the create that was already in flight.
+      assert.ok(store.calls.some((c) => c.method === 'PUT' || c.method === 'DELETE'),
+        `expected a provider removal, saw ${JSON.stringify(store.calls.map((c) => c.method + ' ' + c.path))}`);
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('welcome mail is sent once per intent', () => {
+  it('does not resend the welcome when the same intent is synced again', async () => {
+    const email = 'invariant-welcome-once@example.com';
+    const store = createProviderStub();
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.230' },
+        body: JSON.stringify({ email }),
+      });
+      assert.equal(response.status, 200);
+      await response.json();
+      await local.drain();
+
+      const welcomes = () => store.calls.filter((c) => c.method === 'POST' && c.path === '/api/tx').length;
+      assert.equal(welcomes(), 1, 'the create should send exactly one welcome');
+
+      // A second convergence of the same intent must not send another.
+      const stub = await local.coordinator(email);
+      await stub.fetch('https://coordinator/sync', { method: 'POST' });
+      await stub.fetch('https://coordinator/sync', { method: 'POST' });
+
+      assert.equal(welcomes(), 1, 'a re-sync must not duplicate the welcome');
+    } finally {
+      await local.dispose();
     }
   });
 });

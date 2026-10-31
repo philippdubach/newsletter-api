@@ -23,6 +23,8 @@ const isObject = (value) => value !== null && typeof value === 'object' && !Arra
 const asArray = (value) => (Array.isArray(value) ? value : []);
 const REQUIRED_KV = 'NEWSLETTER_SUBSCRIBERS';
 const REQUIRED_R2 = 'R2_BUCKET';
+const REQUIRED_DO = 'SUBSCRIPTION_COORDINATOR';
+const REQUIRED_DO_CLASS = 'SubscriptionCoordinator';
 const PROD_NAME = 'newsletter-api';
 
 // Parses with a real TOML parser so single-quoted values, quoted keys and
@@ -111,6 +113,35 @@ export function checkConfig(config) {
   for (const bucket of strings(devR2Entries, 'bucket_name', 'preview_bucket_name')) {
     if (prodR2.includes(bucket)) errors.push(`development R2 bucket ${bucket} is a production bucket`);
   }
+
+  // The coordinator is what serializes writes per address. A missing binding
+  // silently downgrades to the unserialized inline path, so its absence is an
+  // error rather than something to discover in production. Unlike KV and R2 the
+  // binding carries `name` and `class_name` rather than `binding`.
+  for (const [label, owner] of [['development', dev], ['production', prod]]) {
+    const table = owner?.durable_objects;
+    const entries = isObject(table) && Array.isArray(table.bindings) ? table.bindings.filter(isObject) : [];
+    if (entries.length === 0) errors.push(`${label} has no Durable Object`);
+    const named = entries.filter((entry) => entry.name === REQUIRED_DO);
+    if (entries.length > 0 && named.length === 0) {
+      errors.push(`${label} Durable Object binding must be named ${REQUIRED_DO}`);
+    }
+    for (const entry of named) {
+      if (entry.class_name !== REQUIRED_DO_CLASS) {
+        errors.push(`${label} Durable Object class must be ${REQUIRED_DO_CLASS}, found ${JSON.stringify(entry.class_name)}`);
+      }
+    }
+  }
+
+  const migrations = Array.isArray(dev.migrations) ? dev.migrations.filter(isObject) : [];
+  const declaresClass = migrations.some((migration) => {
+    for (const key of ['new_classes', 'new_sqlite_classes']) {
+      const list = migration[key];
+      if (Array.isArray(list) && list.includes(REQUIRED_DO_CLASS)) return true;
+    }
+    return false;
+  });
+  if (!declaresClass) errors.push(`no migration declares the ${REQUIRED_DO_CLASS} class`);
 
   const remote = [];
   const { env: _env, ...devOnly } = dev;

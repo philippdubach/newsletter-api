@@ -21,11 +21,19 @@ id = "dev-placeholder"
 [[r2_buckets]]
 binding = "R2_BUCKET"
 bucket_name = "newsletter-dev-local"
+[durable_objects]
+bindings = [{ name = "SUBSCRIPTION_COORDINATOR", class_name = "SubscriptionCoordinator" }]
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SubscriptionCoordinator"]
 [vars]
 ENVIRONMENT = "development"
 ALLOWED_ORIGIN = "http://localhost:1313"
 [env.production]
 name = "newsletter-api"
+[[env.production.durable_objects.bindings]]
+name = "SUBSCRIPTION_COORDINATOR"
+class_name = "SubscriptionCoordinator"
 [[env.production.kv_namespaces]]
 binding = "NEWSLETTER_SUBSCRIBERS"
 id = "prod-kv-id"
@@ -87,6 +95,11 @@ id = "dev-placeholder"
 [[r2_buckets]]
 binding = "R2_BUCKET"
 bucket_name = "dev-bucket"
+[durable_objects]
+bindings = [{ name = "SUBSCRIPTION_COORDINATOR", class_name = "SubscriptionCoordinator" }]
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SubscriptionCoordinator"]
 [vars]
 ENVIRONMENT = "development"
 ALLOWED_ORIGIN = "https://example.invalid/#fragment"
@@ -98,6 +111,9 @@ id = "prod-kv-id"
 [[env.production.r2_buckets]]
 binding = "R2_BUCKET"
 bucket_name = "static-eu"
+[[env.production.durable_objects.bindings]]
+name = "SUBSCRIPTION_COORDINATOR"
+class_name = "SubscriptionCoordinator"
 [env.production.vars]
 ENVIRONMENT = "production"
 `);
@@ -184,4 +200,26 @@ test('malformed TOML throws from the parser and gives a clean CLI failure', () =
   assert.equal(result.status, 1);
   assert.match(result.stderr, /could not be read/);
   assert.doesNotMatch(result.stderr, /\n\s+at /);
+});
+
+test('a missing coordinator binding is rejected', () => {
+  const withoutDo = SAFE.replace(/\[durable_objects\]\nbindings = .*\n/, '');
+  const errors = check(withoutDo);
+  has(errors, /has no Durable Object/);
+});
+
+test('a wrongly named coordinator binding is rejected', () => {
+  const errors = check(SAFE.replaceAll('name = "SUBSCRIPTION_COORDINATOR"', 'name = "COORDINATOR"'));
+  has(errors, /must be named SUBSCRIPTION_COORDINATOR/);
+});
+
+test('a wrong coordinator class is rejected', () => {
+  const errors = check(SAFE.replaceAll('class_name = "SubscriptionCoordinator"', 'class_name = "Other"'));
+  has(errors, /class must be SubscriptionCoordinator/);
+});
+
+test('a missing migration is rejected', () => {
+  const withoutMigration = SAFE.replace(/\[\[migrations\]\]\ntag = "v1"\nnew_sqlite_classes = .*\n/, '');
+  const errors = check(withoutMigration);
+  has(errors, /no migration declares the SubscriptionCoordinator class/);
 });
