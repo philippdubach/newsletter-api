@@ -181,14 +181,26 @@ Individually:
 
 ### Runtime suite
 
-The suite in `test/runtime.test.mjs` starts the Worker with
-`unstable_startWorker` and drives it over HTTP, so KV, R2, `Request`/`Response`
-and the streamed body parser behave as they do in production. It is not a
-live-provider test: `dev.persist` is disabled, giving each run a throwaway
-namespace, and outbound networking is denied through `disableNetConnect()` with
-an interceptor that fails the suite if the Worker ever contacts the provider.
-It therefore proves the development Worker cannot send mail, rather than
-assuming it.
+The suite in `test/runtime.test.mjs` runs the Worker in workerd through Miniflare
+(the runtime `wrangler` drives itself) and exercises it over HTTP, so KV, R2,
+`Request`/`Response` and the streamed body parser behave as they do in
+production. It is not a live-provider test.
+
+Isolation is enforced rather than described:
+
+- `test/harness.mjs` supplies every binding, so `wrangler.toml`, `.dev.vars` and
+  `.env` are never read — Miniflare has no configuration-file awareness. A test
+  asserts the Worker echoes the harness origin rather than the configured one.
+- KV and R2 are in memory, so nothing is written to `.wrangler/state` or to a
+  namespace that exists in the account.
+- Outbound traffic is wired through Miniflare's `outboundService` to a guard
+  that records each requested host and answers 403. A positive control makes the
+  Worker perform a real outbound request and asserts the guard saw it, which is
+  what shows the guard is on the path at all; a second test asserts the provider
+  was never contacted.
+- The deploy-configuration guard runs before workerd starts, so an unsafe
+  `wrangler.toml` aborts the suite even when it is invoked on its own. `npm run
+  verify` also runs it first.
 
 The expected `Listmonk not configured` / `PLUNK_SECRET_KEY not configured`
 lines are filtered from the runtime logs, because they are the intended

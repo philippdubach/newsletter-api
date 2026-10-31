@@ -1,19 +1,19 @@
 // Runtime integration suite.
 //
 // The unit tests in src/*.test.ts run under Node with mocked KV, R2 and fetch.
-// This suite runs the same Worker in the real workerd runtime through
-// `unstable_startWorker`, so bindings, request/response objects and the body
-// parser behave as they do in production. It complements the unit tests
-// instead of replacing them.
+// This suite runs the same Worker in workerd through Miniflare, so bindings,
+// request/response objects and the body parser behave as they do in production.
+// It complements the unit tests instead of replacing them.
 //
-// Two properties make it safe to run anywhere:
+// Isolation is proven, not assumed:
 //
-//   * `dev.persist: false` gives each run a fresh, throwaway KV and R2. Nothing
-//     is written under `.wrangler/state`, and no real namespace is reachable.
-//   * outbound networking is denied. `disableNetConnect()` makes every
-//     non-intercepted connection throw, so a provider call cannot silently
-//     reach the internet, and the Listmonk interceptor below asserts that the
-//     unconfigured development Worker never attempts one at all.
+//   * the deploy-configuration guard runs before workerd starts, so a
+//     dangerous wrangler.toml aborts the suite even when it is invoked directly;
+//   * bindings are supplied by the harness, so `.dev.vars` and `.env` are never
+//     read — asserted behaviourally by the CORS test below;
+//   * outbound traffic is wired through `outboundService`, and a positive
+//     control makes the Worker fetch a URL and asserts the guard saw it, which
+//     is what shows the guard is on the path at all.
 //
 // The Worker is started once per file; each test uses its own client IP so the
 // per-IP rate limit cannot couple unrelated cases.
@@ -21,21 +21,27 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
-import { unstable_startWorker } from 'wrangler';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { checkConfig, loadConfig } from '../scripts/check-deploy-config.mjs';
+import { EGRESS_PROBE_HOST, TEST_BINDINGS, startRuntime } from './harness.mjs';
+
+const workerDir = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 // A test-only value. The Worker reads UNSUBSCRIBE_HMAC_SECRET from its bindings;
 // injecting it here lets the signed-token paths be exercised without secrets.
-const HMAC_SECRET = 'runtime-suite-hmac-secret-not-a-production-value';
-const ALLOWED_ORIGIN = 'http://localhost:1313';
+const HMAC_SECRET = TEST_BINDINGS.UNSUBSCRIBE_HMAC_SECRET;
+
+// The origin the harness supplies, which is not the one in wrangler.toml.
+const ALLOWED_ORIGIN = TEST_BINDINGS.ALLOWED_ORIGIN;
 
 // Mirrors MAX_REQUEST_SIZE in src/index.ts.
 const MAX_BODY = 1024;
 
-let worker;
-let agent;
-let previousDispatcher;
-let listmonkCalls = 0;
+let runtime;
+let attempts;
+let dispose;
 let ipCounter = 0;
 
 function nextIP() {
@@ -51,7 +57,7 @@ function tokenFor(email) {
 function send(path, init = {}) {
   const headers = new Headers(init.headers);
   headers.set('CF-Connecting-IP', init.ip ?? nextIP());
-  return worker.fetch(`http://localhost${path}`, { ...init, headers });
+  return runtime.dispatchFetch(`http://localhost${path}`, { ...init, headers });
 }
 
 function subscribe(email, extra = {}) {
@@ -63,48 +69,41 @@ function subscribe(email, extra = {}) {
 }
 
 before(async () => {
-  agent = new MockAgent();
-  agent.disableNetConnect();
-  // Records any attempt to reach the Listmonk host. The development
-  // configuration has no provider URL, so this must stay at zero.
-  agent
-    .get('https://mail.philippdubach.com')
-    .intercept({ path: () => true, method: () => true })
-    .reply(200, () => {
-      listmonkCalls += 1;
-      return '{}';
-    })
-    .persist();
+  // Blocked here so a directly-invoked `npm run test:runtime` cannot initialise
+  // workerd against an unsafe configuration. `verify` also runs it first.
+  const errors = checkConfig(loadConfig(join(workerDir, 'wrangler.toml')));
+  if (errors.length > 0) {
+    throw new Error(`refusing to start workerd against an unsafe configuration:\n- ${errors.join('\n- ')}`);
+  }
 
-  previousDispatcher = getGlobalDispatcher();
-  setGlobalDispatcher(agent);
-
-  worker = await unstable_startWorker({
-    config: 'wrangler.toml',
-    logLevel: 'error',
-    bindings: {
-      UNSUBSCRIBE_HMAC_SECRET: { type: 'plain_text', value: HMAC_SECRET },
-    },
-    dev: {
-      persist: false,
-      mockFetch: agent,
-      // The development Worker reports "Listmonk not configured" and
-      // "PLUNK_SECRET_KEY not configured" for every accepted signup. Those are
-      // the expected dev behaviour and not test failures, so they are dropped;
-      // anything else still reaches the terminal.
-      structuredLogsHandler: (log) => {
-        const message = String(log?.message ?? JSON.stringify(log));
-        if (/not configured/i.test(message)) return;
-        console.error(message);
-      },
-    },
-  });
+  ({ runtime, attempts, dispose } = await startRuntime());
 });
 
 after(async () => {
-  if (worker) await worker.dispose();
-  if (previousDispatcher) setGlobalDispatcher(previousDispatcher);
-  if (agent) await agent.close();
+  if (dispose) await dispose();
+});
+
+describe('egress guard', () => {
+  it('intercepts a Worker-originated fetch and denies it', async () => {
+    // `/api/subscriber-count` fetches the LinkedIn URLs from its bindings, so
+    // this is a real outbound request from inside the Worker under test. If the
+    // guard were not wired, the reserved-TLD host would fail to resolve and the
+    // attempt would never be recorded.
+    assert.equal(attempts.length, 0, 'the guard saw traffic before the control ran');
+
+    const response = await send('/api/subscriber-count');
+    assert.equal(response.status, 200);
+
+    assert.ok(
+      attempts.includes(EGRESS_PROBE_HOST),
+      `expected the guard to see ${EGRESS_PROBE_HOST}, saw ${JSON.stringify(attempts)}`,
+    );
+  });
+
+  it('never contacted the provider during the suite', () => {
+    const providers = attempts.filter((host) => host !== EGRESS_PROBE_HOST);
+    assert.deepEqual(providers, [], 'the Worker reached a provider host');
+  });
 });
 
 describe('health', () => {
@@ -146,7 +145,7 @@ describe('subscribe', () => {
     const response = await send('/api/subscribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'runtime-large@example.com', padding: 'x'.repeat(4096) }),
+      body: JSON.stringify({ email: 'runtime-large@example.com', padding: 'x'.repeat(MAX_BODY * 4) }),
     });
     assert.equal(response.status, 413);
     assert.equal((await response.json()).error, 'Request too large');
@@ -242,23 +241,21 @@ describe('unsubscribe', () => {
 });
 
 describe('isolation', () => {
-  it('answers a preflight for the configured origin only', async () => {
+  it('uses the bindings the harness supplies, not the configuration file', async () => {
+    // wrangler.toml allows http://localhost:1313. Echoing the harness origin
+    // proves no configuration file, and therefore no `.dev.vars`, was read.
     const allowed = await send('/api/subscribe', {
       method: 'OPTIONS',
       headers: { Origin: ALLOWED_ORIGIN, 'Access-Control-Request-Method': 'POST' },
     });
     assert.equal(allowed.headers.get('access-control-allow-origin'), ALLOWED_ORIGIN);
+  });
 
+  it('does not answer a preflight for a foreign origin', async () => {
     const foreign = await send('/api/subscribe', {
       method: 'OPTIONS',
       headers: { Origin: 'https://attacker.example', 'Access-Control-Request-Method': 'POST' },
     });
     assert.notEqual(foreign.headers.get('access-control-allow-origin'), 'https://attacker.example');
-  });
-
-  it('never contacted the provider during the suite', () => {
-    // Belt and braces: networking is disabled outright, and the interceptor
-    // above would have recorded any attempt that somehow got through.
-    assert.equal(listmonkCalls, 0);
   });
 });
