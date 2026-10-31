@@ -162,12 +162,51 @@ subscriptions manually; this fallback is not a complete replacement.
 
 ## Testing
 
-Run the test suite:
+Run the full gate — typecheck, configuration guard, unit tests, and the
+runtime suite:
 ```bash
-npm test
+npm run verify
 ```
-These tests run in Node with mocked bindings and provider responses; they are
-not a Worker-runtime or live-provider integration test.
+
+Individually:
+
+| Command | What it runs |
+|---|---|
+| `npm test` | Unit tests for `src/`, in Node with mocked KV, R2 and provider responses |
+| `npm run test:runtime` | Integration tests against the Worker in the real workerd runtime |
+| `npm run test:config` | Deployment-configuration and deploy-wrapper tests |
+| `npm run typecheck` | `tsc --noEmit` |
+
+`npm run deploy:production` refuses to upload unless `npm run verify` passes.
+
+### Runtime suite
+
+The suite in `test/runtime.test.mjs` runs the Worker in workerd through Miniflare
+(the runtime `wrangler` drives itself) and exercises it over HTTP, so KV, R2,
+`Request`/`Response` and the streamed body parser behave as they do in
+production. It is not a live-provider test.
+
+Isolation is enforced rather than described:
+
+- `test/harness.mjs` supplies every binding, so `wrangler.toml`, `.dev.vars` and
+  `.env` are never read — Miniflare has no configuration-file awareness. A test
+  asserts the Worker echoes the harness origin rather than the configured one.
+- KV and R2 are in memory, so nothing is written to `.wrangler/state` or to a
+  namespace that exists in the account.
+- Outbound traffic is wired through Miniflare's `outboundService` to a guard
+  that records each requested host and answers 403. A positive control makes the
+  Worker perform a real outbound request and asserts the guard saw it, which is
+  what shows the guard is on the path at all. After all tests finish, a test-only
+  wrapper entry drains all `ctx.waitUntil` background work, and only then does
+  the suite assert that no provider host was contacted; a fixture test proves
+  the drain catches delayed egress. Production source is not modified.
+- The deploy-configuration guard runs before workerd starts, so an unsafe
+  `wrangler.toml` aborts the suite even when it is invoked on its own. `npm run
+  verify` also runs it first.
+
+The expected `Listmonk not configured` / `PLUNK_SECRET_KEY not configured`
+warnings appear in the runtime logs; they are the intended development
+behaviour and are not filtered.
 
 ## Scripts
 
