@@ -224,6 +224,8 @@ describe('the answer is only sent once provider state is known', () => {
         body: JSON.stringify({ email }),
       });
       assert.equal(seeded.status, 200);
+      // Consume the seed body before its drain, for the same reason as below.
+      await seeded.json();
       await failingRuntime.drain();
 
       const response = await failingRuntime.runtime.dispatchFetch('http://localhost/api/subscribe', {
@@ -231,8 +233,10 @@ describe('the answer is only sent once provider state is known', () => {
         headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.201' },
         body: JSON.stringify({ email }),
       });
-      await failingRuntime.drain();
+      // Read the body before any further runtime request: the response is a live
+      // stream and a drain request can invalidate it.
       const body = await response.json();
+      await failingRuntime.drain();
 
       // Unreadable is not confirmed: the subscriber must not be told they are on
       // the list when the lookup did not succeed.

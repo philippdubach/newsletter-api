@@ -115,6 +115,8 @@ describe('egress guard', () => {
 
     const response = await send('/api/subscriber-count');
     assert.equal(response.status, 200);
+    // Consume the body before any further runtime request.
+    await response.json();
 
     assert.ok(
       attempts.includes(EGRESS_PROBE_HOST),
@@ -129,6 +131,8 @@ describe('background work drain', () => {
     try {
       const response = await fixture.runtime.dispatchFetch('http://localhost/');
       assert.equal(response.status, 200);
+      // Consume the body before draining: the response is a live stream.
+      await response.text();
       assert.equal(await fixture.drain(), 1);
       assert.deepEqual(fixture.attempts, ['delayed-provider.runtime-suite.invalid']);
     } finally {
