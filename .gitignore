@@ -42,3 +42,7 @@ workers/newsletter-api/*.csv
 workers/newsletter-api/.dev.vars
 workers/newsletter-api/.dev.vars.*
 .DS_Store
+
+# Read-only inventory output (must never be committed)
+inventory-*.json
+inventory-reports/

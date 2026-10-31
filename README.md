@@ -210,6 +210,58 @@ behaviour and are not filtered.
 
 ## Scripts
 
+### Subscriber Drift Inventory
+
+`scripts/inventory-subscribers.mjs` compares subscriber records in KV with list
+membership in Listmonk and reports what differs. It is a **read-only inventory,
+not a migration**: no bucket implies an action, and a KV-only record must never
+be treated as a queued re-subscription.
+
+That distinction is deliberate. Listmonk's own unsubscribe links —
+`{{ UnsubscribeURL }}` and the `List-Unsubscribe` header, which targets
+`/subscription/<campaign>/<subscriber>` — change subscription state without the
+Worker being involved. A native unsubscribe is an expression of user intent, so
+converging Listmonk toward an older KV "subscribed" record would silently undo
+it. The inventory reports; a human decides.
+
+```bash
+LISTMONK_API_URL=... LISTMONK_API_USER=... LISTMONK_API_TOKEN=... \
+LISTMONK_LIST_ID=3 INVENTORY_HMAC_SECRET=... \
+node scripts/inventory-subscribers.mjs --kv kv-export.json --out /tmp/inventory.json
+```
+
+| Guarantee | How |
+|---|---|
+| Read-only | The client issues only `GET` and refuses any other method; no KV writes, no welcome mail, no unsubscribe requests |
+| No policy by accident | Recipients needing investigation are reported as such; nothing re-subscribes, re-adds or removes |
+| Membership is not status | Only the target list's own `subscription_status` is read as a status. Appearance in `?list_id=` is recorded as evidence of nothing, because that query returns every status for the list |
+| Absence is a claim | `kv_only_missing_upstream` is used only when the subscriber read proved full coverage. Otherwise the address needs investigation |
+| Unreadable is not absent | Presence and readability are tracked separately, so a malformed value cannot resurface as Listmonk-only |
+| Incomplete reads stay incomplete | A failed page, an early empty page, or a page-limit stop marks the report incomplete and exits `2` |
+| Pseudonymous identifiers | Keyed HMAC-SHA256 under `INVENTORY_HMAC_SECRET`; there is no unsalted fallback, and aggregate counts are the default |
+| No secrets in Git | The destination's real path is checked, symlinked destinations are refused, and reports are published from a private temporary file with mode `0600` |
+
+The KV export is a JSON file of `{ key, value }` objects, `[key, value]` pairs,
+or a key-to-value object. Keys are normalized and deduplicated, and
+`rate_limit:` / `cache:` keys are excluded, since they are Worker bookkeeping
+rather than membership.
+
+Buckets: `both_active`, `kv_only_missing_upstream`, `upstream_unsubscribed`,
+`blocklisted`, `listmonk_only`, `neither_active`, `needs_investigation`.
+
+`needs_investigation` is the honest bucket and the one to read first. It holds
+records where the tool will not state a fact: an unrecognised or absent status,
+membership in the list query without a status for the target list, a malformed KV
+value, and an absence that was never proven because a read fell short.
+
+A target-list unsubscribe is reported as `upstream_unsubscribed` even though the
+address still appears in the `?list_id=` query, and an `unsubscribed` marker
+recorded against a *different* list is ignored entirely.
+
+The two stores are read separately, so differences are candidates for
+investigation rather than a transactionally consistent snapshot. The report
+records its own observation window, per-phase coverage, and these caveats.
+
 ### Export Subscribers
 
 Export all subscriber emails to a CSV file:
