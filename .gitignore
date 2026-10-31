@@ -34,4 +34,11 @@ temp/
 
 # Local subscriber exports (personal data) - never commit
 workers/newsletter-api/*.csv
+
+# Local-only Worker variables and secrets. Development has no provider
+# configuration in wrangler.toml, so these belong here and stay uncommitted.
+.dev.vars
+.dev.vars.*
+workers/newsletter-api/.dev.vars
+workers/newsletter-api/.dev.vars.*
 .DS_Store
