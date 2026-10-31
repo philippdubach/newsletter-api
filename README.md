@@ -162,12 +162,37 @@ subscriptions manually; this fallback is not a complete replacement.
 
 ## Testing
 
-Run the test suite:
+Run the full gate — typecheck, configuration guard, unit tests, and the
+runtime suite:
 ```bash
-npm test
+npm run verify
 ```
-These tests run in Node with mocked bindings and provider responses; they are
-not a Worker-runtime or live-provider integration test.
+
+Individually:
+
+| Command | What it runs |
+|---|---|
+| `npm test` | Unit tests for `src/`, in Node with mocked KV, R2 and provider responses |
+| `npm run test:runtime` | Integration tests against the Worker in the real workerd runtime |
+| `npm run test:config` | Deployment-configuration and deploy-wrapper tests |
+| `npm run typecheck` | `tsc --noEmit` |
+
+`npm run deploy:production` refuses to upload unless `npm run verify` passes.
+
+### Runtime suite
+
+The suite in `test/runtime.test.mjs` starts the Worker with
+`unstable_startWorker` and drives it over HTTP, so KV, R2, `Request`/`Response`
+and the streamed body parser behave as they do in production. It is not a
+live-provider test: `dev.persist` is disabled, giving each run a throwaway
+namespace, and outbound networking is denied through `disableNetConnect()` with
+an interceptor that fails the suite if the Worker ever contacts the provider.
+It therefore proves the development Worker cannot send mail, rather than
+assuming it.
+
+The expected `Listmonk not configured` / `PLUNK_SECRET_KEY not configured`
+lines are filtered from the runtime logs, because they are the intended
+development behaviour. Anything else still prints.
 
 ## Scripts
 
