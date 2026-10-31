@@ -249,3 +249,8 @@ test('an unrecognised coordinator mode is rejected', () => {
 test('legacy mode is accepted', () => {
   assert.deepEqual(check(SAFE.replace(/COORDINATOR_MODE = "on"/g, 'COORDINATOR_MODE = "legacy"')), []);
 });
+
+test('an out-of-range provider budget is rejected', () => {
+  const errors = check(SAFE.replace('COORDINATOR_MODE = "on"', 'COORDINATOR_MODE = "on"\nPROVIDER_BUDGET_MS = "45000"'));
+  has(errors, /PROVIDER_BUDGET_MS must be an integer between 1000 and 25000/);
+});

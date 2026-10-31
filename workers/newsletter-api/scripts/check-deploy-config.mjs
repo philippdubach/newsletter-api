@@ -143,6 +143,17 @@ export function checkConfig(config) {
     }
   }
 
+  // If the provider budget is set it must stay well under the 30-second limit
+  // after which a Durable Object holding blockConcurrencyWhile is reset.
+  for (const [label, vars] of [['development', devVars], ['production', prodVars]]) {
+    const budget = vars.PROVIDER_BUDGET_MS;
+    if (budget === undefined) continue;
+    const value = Number(budget);
+    if (!Number.isInteger(value) || value < 1000 || value > 25000) {
+      errors.push(`${label} PROVIDER_BUDGET_MS must be an integer between 1000 and 25000, found ${JSON.stringify(budget)}`);
+    }
+  }
+
   const migrations = Array.isArray(dev.migrations) ? dev.migrations.filter(isObject) : [];
   const declaresClass = migrations.some((migration) => {
     for (const key of ['new_classes', 'new_sqlite_classes']) {

@@ -7,6 +7,9 @@ export interface Env {
   // inline path while keeping the binding and every pending operation intact,
   // which is what makes a rollback possible without crossing a class creation.
   COORDINATOR_MODE?: string;
+  // Overall budget for one provider phase, in milliseconds. Must stay well under
+  // the 30-second limit after which a Durable Object is reset.
+  PROVIDER_BUDGET_MS?: string;
   R2_BUCKET?: R2Bucket;
   ALLOWED_ORIGIN?: string;
   ENVIRONMENT?: string;
@@ -355,7 +358,7 @@ export async function reconcileSignup(
   // separate in-flight Listmonk ordering race described above.
 }
 
-async function sendFallbackWelcome(email: string, env: Env): Promise<void> {
+async function sendFallbackWelcome(email: string, env: Env, deadline?: AbortSignal): Promise<void> {
   const fallback = await sendPlunkWelcomeFallback(email, env);
   if (!fallback.success) {
     console.error(`Plunk fallback also failed for ${redactEmail(email)}: ${fallback.error}`);
@@ -402,6 +405,23 @@ async function checkRateLimit(ip: string, env: Env): Promise<boolean> {
  * Listmonk is the email-sending source of truth.
  * ========================================================================== */
 
+/**
+ * Combines an optional caller deadline with a per-call one. The shorter wins,
+ * which is what keeps a sequence of provider calls inside one overall budget.
+ */
+function combineSignals(own: AbortSignal, external?: AbortSignal | null): AbortSignal {
+  if (!external) return own;
+  const anySignal = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (typeof anySignal === 'function') return anySignal([own, external]);
+  // Fallback for runtimes without AbortSignal.any.
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (own.aborted || external.aborted) controller.abort();
+  own.addEventListener('abort', abort, { once: true });
+  external.addEventListener('abort', abort, { once: true });
+  return controller.signal;
+}
+
 function isListmonkConfigured(env: Env): boolean {
   return Boolean(env.LISTMONK_API_URL && env.LISTMONK_API_USER && env.LISTMONK_API_TOKEN && env.LISTMONK_LIST_ID);
 }
@@ -426,10 +446,12 @@ async function callListmonkJson(
   const auth = btoa(`${env.LISTMONK_API_USER}:${env.LISTMONK_API_TOKEN}`);
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
+  // Keep the deadline armed through body parsing, and honour a caller's budget.
+  const signal = combineSignals(controller.signal, init.signal);
   try {
     const resp = await fetch(`${env.LISTMONK_API_URL}${path}`, {
       ...init,
-      signal: controller.signal,
+      signal,
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json',
@@ -465,8 +487,9 @@ async function callListmonkJson(
 async function lookupListmonkSubscriber(
   email: string,
   env: Env,
+  deadline?: AbortSignal,
 ): Promise<{ state: UpstreamState; reason: string }> {
-  const answered = await lookupListmonkSubscriberRaw(email, env);
+  const answered = await lookupListmonkSubscriberRaw(email, env, deadline);
   if (answered.state === 'unverified') {
     // Deliberately a warning: this is the only signal that the check failed,
     // and it must be visible in tail rather than silently returning 200.
@@ -478,13 +501,14 @@ async function lookupListmonkSubscriber(
 async function lookupListmonkSubscriberRaw(
   email: string,
   env: Env,
+  deadline?: AbortSignal,
 ): Promise<{ state: UpstreamState; reason: string }> {
   if (!isListmonkConfigured(env)) return { state: 'unverified', reason: 'not_configured' };
   try {
     const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
     const safeEmail = email.replace(/'/g, "''");
     const query = encodeURIComponent(`subscribers.email = '${safeEmail}'`);
-    const resp = await callListmonkJson(env, `/api/subscribers?query=${query}&per_page=1`, { method: 'GET' });
+    const resp = await callListmonkJson(env, `/api/subscribers?query=${query}&per_page=1`, { method: 'GET', signal: deadline });
     if (!resp.ok) return { state: 'unverified', reason: `http_${resp.status}` };
 
     const data = (resp.body as { data?: { results?: unknown; total?: unknown } })?.data;
@@ -527,11 +551,12 @@ async function callListmonk(env: Env, path: string, init: RequestInit = {}): Pro
   const url = `${env.LISTMONK_API_URL}${path}`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
+  const signal = combineSignals(controller.signal, init.signal);
 
   try {
     const resp = await fetch(url, {
       ...init,
-      signal: controller.signal,
+      signal,
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json',
@@ -546,7 +571,7 @@ async function callListmonk(env: Env, path: string, init: RequestInit = {}): Pro
   }
 }
 
-async function createListmonkSubscriber(email: string, clientIP: string, env: Env): Promise<{ success: boolean; duplicate?: boolean; error?: string }> {
+async function createListmonkSubscriber(email: string, clientIP: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; duplicate?: boolean; error?: string }> {
   if (!isListmonkConfigured(env)) {
     return { success: false, error: 'Listmonk not configured' };
   }
@@ -554,6 +579,7 @@ async function createListmonkSubscriber(email: string, clientIP: string, env: En
     const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
     const resp = await callListmonk(env, '/api/subscribers', {
       method: 'POST',
+      signal: deadline,
       body: JSON.stringify({
         email,
         name: '',
@@ -579,7 +605,7 @@ async function createListmonkSubscriber(email: string, clientIP: string, env: En
   }
 }
 
-async function unsubscribeFromListmonk(email: string, env: Env): Promise<{ success: boolean; error?: string }> {
+async function unsubscribeFromListmonk(email: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; error?: string }> {
   // Missing configuration does not prove that Listmonk has no existing
   // subscription. Fail closed rather than falsely acknowledging removal.
   if (!isListmonkConfigured(env)) {
@@ -592,6 +618,7 @@ async function unsubscribeFromListmonk(email: string, env: Env): Promise<{ succe
     // the singular path used earlier is not a registered alias.
     const resp = await callListmonk(env, '/api/subscribers/query/lists', {
       method: 'PUT',
+      signal: deadline,
       body: JSON.stringify({
         query: `subscribers.email = '${safeEmail}'`,
         action: 'unsubscribe',
@@ -625,7 +652,7 @@ async function getLatestNewsletterUrl(env: Env): Promise<string | null> {
   return null;
 }
 
-async function sendListmonkWelcome(email: string, env: Env): Promise<{ success: boolean; error?: string }> {
+async function sendListmonkWelcome(email: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; error?: string }> {
   if (!isListmonkConfigured(env) || !env.LISTMONK_WELCOME_TEMPLATE_ID) {
     return { success: false, error: 'Listmonk welcome template not configured' };
   }
@@ -737,6 +764,51 @@ interface IntentResult {
   attempts?: number;
   error?: string;
   reason?: string;
+}
+
+function isLegacyMode(env: Env): boolean {
+  return (env.COORDINATOR_MODE ?? 'on') === 'legacy';
+}
+
+/** The stub regardless of mode, so legacy requests can still publish intent. */
+function coordinatorStubFor(env: Env, email: string): DurableObjectStub | null {
+  const namespace = env.SUBSCRIPTION_COORDINATOR;
+  if (!namespace) return null;
+  try {
+    return namespace.get(namespace.idFromName(email.trim().toLowerCase()));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tells the coordinator what a legacy request did, so older durable work is
+ * fenced by the newer intent. Best effort: the legacy path must keep working when
+ * the object is unavailable, which is the situation it exists for.
+ */
+async function publishIntent(
+  stub: DurableObjectStub | null,
+  desired: 'subscribed' | 'unsubscribed',
+  email: string,
+  clientIP: string,
+  request: Request,
+): Promise<void> {
+  if (!stub) return;
+  try {
+    await stub.fetch('https://coordinator/intent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        desired,
+        email,
+        ip: clientIP,
+        userAgent: request.headers.get('User-Agent') || 'unknown',
+        recordOnly: true,
+      }),
+    });
+  } catch {
+    // Recorded in the shadow instead; nothing else to do here.
+  }
 }
 
 function coordinatorFor(env: Env, email: string): DurableObjectStub | null {
@@ -868,6 +940,8 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       return subscribeResponse(result, request, env);
     }
 
+    if (isLegacyMode(env)) await publishIntent(coordinatorStubFor(env, email), 'subscribed', email, clientIP, request);
+
     // Fallback for environments without the binding (unit tests, local runs
     // without migrations). Behaviour matches the pre-coordinator code, including
     // its inability to serialize concurrent requests; the runtime suite covers
@@ -930,6 +1004,8 @@ async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionConte
       const result = await submitIntent(coordinator, 'unsubscribed', email, getClientIP(request), request);
       return unsubscribeResponse(result, request, env);
     }
+
+    if (isLegacyMode(env)) await publishIntent(coordinatorStubFor(env, email), 'unsubscribed', email, getClientIP(request), request);
 
     if (!isListmonkConfigured(env)) {
       return jsonResponse({ success: false, error: 'Unsubscribe unavailable; please try again later' }, 502, request, env);
@@ -1157,6 +1233,18 @@ const INTENT_KEY = 'intent';
 const PENDING_KEY = 'pending';
 const WELCOME_KEY = 'welcome-seq';
 const MAX_SYNC_ATTEMPTS = 8;
+// The whole provider phase must finish well inside the 30-second limit after which
+// a Durable Object is reset for holding blockConcurrencyWhile too long. Individual
+// 10-second fetch timers do not bound the sequence, so one budget covers it all.
+const DEFAULT_PROVIDER_BUDGET_MS = 20000;
+const MIN_PROVIDER_BUDGET_MS = 1000;
+const MAX_PROVIDER_BUDGET_MS = 25000;
+
+function providerBudgetMs(env: Env): number {
+  const configured = Number(env.PROVIDER_BUDGET_MS);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_PROVIDER_BUDGET_MS;
+  return Math.min(Math.max(configured, MIN_PROVIDER_BUDGET_MS), MAX_PROVIDER_BUDGET_MS);
+}
 
 // One minute, backing off to an hour, bounded so a permanently broken provider
 // does not spin.
@@ -1218,6 +1306,7 @@ export class SubscriptionCoordinator {
       if (url.pathname === '/intent' && request.method === 'POST') {
         const body = await request.json() as {
           desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
+          recordOnly?: boolean;
         };
         return Response.json(await this.runExclusive(() => this.setIntent(body)));
       }
@@ -1281,7 +1370,7 @@ export class SubscriptionCoordinator {
    * thing and nothing is scheduled to act on it.
    */
   private async setIntent(input: {
-    desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
+    desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string; recordOnly?: boolean;
   }): Promise<SyncResult & { seq: number; desired: string }> {
     const email = input.email.trim().toLowerCase();
     const previous = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
@@ -1298,8 +1387,16 @@ export class SubscriptionCoordinator {
     });
     await this.state.storage.setAlarm(Date.now());
 
+    if (input.recordOnly) {
+      // A legacy request publishes its intent so older durable work can be fenced,
+      // but performs the provider work itself. Nothing is left pending here.
+      await this.state.storage.delete(PENDING_KEY);
+      await this.state.storage.deleteAlarm();
+      return { outcome: 'completed', seq, desired: intent.desired };
+    }
+
     this.pendingInput = { ip: input.ip, userAgent: input.userAgent };
-    const result = await this.sync();
+    const result = await this.sync({ fresh: true });
     return { ...result, seq, desired: intent.desired };
   }
 
@@ -1307,18 +1404,62 @@ export class SubscriptionCoordinator {
   // written without threading it through every sync call.
   private pendingInput: { ip?: string; userAgent?: string } = {};
 
-  /** Converges the KV shadow and the provider toward the stored intent. */
-  private async sync(): Promise<SyncResult> {
+  /**
+   * True when the KV shadow says the address asked for something other than the
+   * stored intent. Used to fence stale durable work against a newer request that
+   * was served by the legacy path and therefore never reached this object.
+   *
+   * KV is not strongly consistent, so this is a best-effort fence; it is paired
+   * with the intent write that legacy requests make when the object is reachable.
+   */
+  private async shadowDisagrees(intent: CoordinatorIntent): Promise<boolean> {
+    try {
+      const shadow = await this.env.NEWSLETTER_SUBSCRIBERS.get(intent.email);
+      if (intent.desired === 'subscribed') return shadow === null;
+      return shadow !== null;
+    } catch {
+      // If the shadow cannot be read, do not act on stale intent.
+      return true;
+    }
+  }
+
+  /**
+   * Converges the KV shadow and the provider toward the stored intent.
+   *
+   * `fresh` means this object has just recorded the intent itself, so the shadow
+   * is ours to write. Otherwise the work is a retry of older intent, and the
+   * shadow may have been updated by a request that never reached this object —
+   * in which case the shadow wins and the work is discarded.
+   */
+  private async sync({ fresh = false }: { fresh?: boolean } = {}): Promise<SyncResult> {
     const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
     if (!intent) return { outcome: 'failed', error: 'no intent recorded', retryable: false };
 
-    // KV shadow first: it is local, cheap, and reads depend on it.
-    const shadow = await this.applyShadow(intent);
-    if (!shadow.ok) return await this.scheduleRetry(intent, { outcome: 'failed', error: shadow.error, retryable: true }, 'shadow');
+    if (fresh) {
+      const shadow = await this.applyShadow(intent);
+      if (!shadow.ok) return await this.scheduleRetry(intent, { outcome: 'failed', error: shadow.error, retryable: true }, 'shadow');
+    } else if (await this.shadowDisagrees(intent)) {
+      // A newer intent may have been served outside this object (legacy mode, or a
+      // shadow write from a request whose coordinator call failed). Work that
+      // would contradict it must not run, however old it is.
+      await this.state.storage.delete(PENDING_KEY);
+      await this.state.storage.deleteAlarm();
+      console.warn(`coordinator discarded stale ${intent.desired} work for ${redactEmail(intent.email)}: the shadow disagrees`);
+      return { outcome: 'superseded', retryable: false };
+    }
 
-    const result = intent.desired === 'subscribed'
-      ? await this.syncSubscribed(intent)
-      : await this.syncUnsubscribed(intent);
+    // One deadline covers lookup, create, welcome and fallback, so the exclusive
+    // section cannot outlive the runtime's patience.
+    const controller = new AbortController();
+    const budget = setTimeout(() => controller.abort(), providerBudgetMs(this.env));
+    let result: SyncResult;
+    try {
+      result = intent.desired === 'subscribed'
+        ? await this.syncSubscribed(intent, controller.signal)
+        : await this.syncUnsubscribed(intent, controller.signal);
+    } finally {
+      clearTimeout(budget);
+    }
 
     // Fence after the provider call, for the case where an intent somehow changed
     // beneath us. Under `runExclusive` this should not happen, which is why the
@@ -1365,8 +1506,8 @@ export class SubscriptionCoordinator {
     }
   }
 
-  private async syncSubscribed(intent: CoordinatorIntent): Promise<SyncResult> {
-    const { state: upstream, reason } = await lookupListmonkSubscriber(intent.email, this.env);
+  private async syncSubscribed(intent: CoordinatorIntent, deadline: AbortSignal): Promise<SyncResult> {
+    const { state: upstream, reason } = await lookupListmonkSubscriber(intent.email, this.env, deadline);
 
     if (upstream === 'confirmed') return { outcome: 'completed', created: false };
     // Both are the recipient's decision, taken elsewhere. Never overwrite them.
@@ -1378,7 +1519,7 @@ export class SubscriptionCoordinator {
       return { outcome: 'unverified', reason, retryable: isRetryableLookupReason(reason) };
     }
 
-    const created = await createListmonkSubscriber(intent.email, 'coordinator', this.env);
+    const created = await createListmonkSubscriber(intent.email, 'coordinator', this.env, deadline);
     if (!created.success) return { outcome: 'failed', error: created.error ?? 'create failed', retryable: true };
 
     // Fence before any mail is sent: a welcome for an intent that has already been
@@ -1392,21 +1533,21 @@ export class SubscriptionCoordinator {
       const welcomed = await this.state.storage.get<number>(WELCOME_KEY);
       if (welcomed !== intent.seq) {
         await this.state.storage.put(WELCOME_KEY, intent.seq);
-        const sent = await sendListmonkWelcome(intent.email, this.env);
+        const sent = await sendListmonkWelcome(intent.email, this.env, deadline);
         if (!sent.success) {
           console.error(`Listmonk welcome send failed for ${redactEmail(intent.email)}: ${sent.error} — using Plunk fallback`);
-          await sendFallbackWelcome(intent.email, this.env);
+          await sendFallbackWelcome(intent.email, this.env, deadline);
         }
       }
     }
     return { outcome: 'completed', created: !created.duplicate };
   }
 
-  private async syncUnsubscribed(intent: CoordinatorIntent): Promise<SyncResult> {
+  private async syncUnsubscribed(intent: CoordinatorIntent, deadline: AbortSignal): Promise<SyncResult> {
     if (!isListmonkConfigured(this.env)) {
       return { outcome: 'failed', error: 'Listmonk not configured', retryable: false };
     }
-    const result = await unsubscribeFromListmonk(intent.email, this.env);
+    const result = await unsubscribeFromListmonk(intent.email, this.env, deadline);
     if (!result.success) return { outcome: 'failed', error: result.error ?? 'unsubscribe failed', retryable: true };
     return { outcome: 'completed' };
   }

@@ -65,6 +65,9 @@ ENVIRONMENT = "production"
 # Rollback lever: deploying this same code with "legacy" keeps the Durable Object
 # class and its pending operations, and returns writes to the inline path.
 COORDINATOR_MODE = "on"
+# Overall budget for one provider phase, well under the 30-second Durable Object
+# reset threshold that applies while blockConcurrencyWhile is held.
+PROVIDER_BUDGET_MS = "20000"
 LINKEDIN_NEWSLETTER_URLS = "https://www.linkedin.com/pulse/ai-lab-60b-cursor-25b-anthropic-chinese-open-weight-triple-dubach-ltbae"
 LISTMONK_API_URL = "https://mail.philippdubach.com"
 LISTMONK_LIST_ID = "3"

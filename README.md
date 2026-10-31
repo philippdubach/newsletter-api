@@ -192,11 +192,17 @@ npm run deploy:production
 ```
 
 `COORDINATOR_MODE = "legacy"` keeps the binding, the class and every pending
-operation, and returns writes to the unserialized inline path. Alarms still fire
-and continue converging any pending work, because the class is never removed.
-Switch back to `"on"` with another deploy. The configuration guard rejects any
-value other than `on` or `legacy`, so the lever cannot be set to something the
-Worker does not understand.
+operation, and returns writes to the unserialized inline path. Switch back to
+`"on"` with another deploy. The configuration guard rejects any value other than
+`on` or `legacy`, so the lever cannot be set to something the Worker does not
+understand.
+
+Stale work cannot override a newer intent. A legacy request publishes its intent
+to the coordinator when the object is reachable, and any pending job is fenced
+against the KV shadow before it runs: if the shadow disagrees with the stored
+intent, the job is discarded rather than acting on superseded intent. That means
+an unsubscribe served inline while an older create is still pending cannot be
+undone by that create when it retries.
 
 ### Runtime suite
 

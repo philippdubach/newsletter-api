@@ -750,3 +750,178 @@ describe('durable state is recoverable', () => {
     }
   });
 });
+
+describe('legacy work cannot undo a newer intent', () => {
+  it('does not let a stale durable create override an unsubscribe served inline', async () => {
+    const email = 'invariant-legacy-undo@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    let creating = false;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/subscribers' && request.method === 'POST') {
+        if (creating) return new Response('{"error":"boom"}', { status: 500 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      creating = true;
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.250' },
+        body: JSON.stringify({ email }),
+      });
+      await signup.json();
+      await local.drain();
+
+      const stub = await local.coordinator(email);
+      let state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.ok(state.pending, 'the failed create must be pending');
+
+      // The coordinator is now unavailable for provider work (legacy rollback). An
+      // unsubscribe is served inline: the provider is changed directly and the
+      // intent is published to the object without doing provider work.
+      creating = false;
+      await base(new Request(`https://mail.philippdubach.com/api/subscribers/query/lists`, {
+        method: 'PUT',
+        body: JSON.stringify({ query: `subscribers.email = '${email}'`, action: 'unsubscribe', target_list_ids: [3] }),
+      }));
+      assert.equal(store.membership.get(email), false);
+      await stub.fetch('https://coordinator/intent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ desired: 'unsubscribed', email, recordOnly: true }),
+      });
+
+      // The old pending job must not resurrect the subscription.
+      await stub.fetch('https://coordinator/sync', { method: 'POST' });
+      await local.drain();
+
+      state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(store.membership.get(email), false, 'stale work must not re-subscribe');
+      assert.equal(state.intent.desired, 'unsubscribed');
+      assert.equal(state.pending, null);
+      assert.ok(!store.events.slice(store.events.indexOf('remove-commit')).includes('create-commit'),
+        `unexpected events ${store.events.join(' > ')}`);
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('the provider phase is bounded as a whole', () => {
+  it('gives up on a slow sequence inside the budget, not at the 30-second reset', async () => {
+    const email = 'invariant-stall@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    const slow = () => new Promise((resolve) => setTimeout(resolve, 6000));
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      // Each call is inside its own 10-second timer, so only a combined budget
+      // bounds the sequence: lookup, create and welcome together.
+      if (url.pathname === '/api/subscribers' || url.pathname === '/api/tx') await slow();
+      return base(request);
+    };
+
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, PROVIDER_BUDGET_MS: '2000' },
+      outboundService: store.handler,
+    });
+    try {
+      const started = Date.now();
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.251' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json();
+      await local.drain();
+      const elapsed = Date.now() - started;
+
+      assert.ok(elapsed < 8000, `took ${elapsed}ms, which means the sequence outlived the budget`);
+      assert.equal(body.status, 'accepted');
+
+      const stub = await local.coordinator(email);
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+      // The boundary the reset made observable: durable state survives and agrees.
+      assert.equal(state.intent.desired, 'subscribed');
+      assert.ok(state.pending, 'an over-budget sequence must leave recoverable work');
+      assert.ok(state.alarm, 'the recovery must remain scheduled');
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it('bounds a provider body that never finishes', async () => {
+    const email = 'invariant-stall-body@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/subscribers' && request.method === 'GET') {
+        // Headers arrive, the body never completes. This is the read the lookup
+        // actually performs, unlike the create path which never reads a 200 body.
+        return new Response(new ReadableStream({ start() {} }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, PROVIDER_BUDGET_MS: '1500' },
+      outboundService: store.handler,
+    });
+    try {
+      const started = Date.now();
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.252' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json();
+      await local.drain();
+      const elapsed = Date.now() - started;
+
+      // The budget, not the 10-second per-call timer, has to bound this.
+      assert.ok(elapsed < 6000, `took ${elapsed}ms`);
+      assert.equal(body.status, 'accepted');
+      const stub = await local.coordinator(email);
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.ok(state.pending);
+      assert.ok(state.alarm);
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('the shadow fences work that contradicts it', () => {
+  it('refuses to act on stored intent the shadow contradicts', async () => {
+    const email = 'invariant-shadow-fence@example.com';
+    const store = createProviderStub();
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const stub = await local.coordinator(email);
+      // Publishes intent without writing the shadow, which is what a legacy request
+      // whose coordinator call failed leaves behind.
+      await stub.fetch('https://coordinator/intent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ desired: 'subscribed', email, recordOnly: true }),
+      });
+
+      const sync = await (await stub.fetch('https://coordinator/sync', { method: 'POST' })).json();
+
+      // The shadow says this address is not subscribed, so recreating it would
+      // undo whatever removed it.
+      assert.equal(sync.outcome, 'superseded');
+      assert.equal(store.membership.get(email), undefined, 'the provider must not be touched');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
