@@ -38,6 +38,8 @@ const PROVIDER_BINDINGS = {
 function createProviderStub() {
   const calls = [];
   const subscribers = new Map();
+  // Lets a case answer the lookup with a deliberately contradictory payload.
+  let rawLookup = null;
 
   const json = (body, status = 200) =>
     new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -56,6 +58,7 @@ function createProviderStub() {
     calls.push({ method, path: url.pathname, search: url.search, body });
 
     if (url.pathname === '/api/subscribers' && method === 'GET') {
+      if (rawLookup) return rawLookup(request);
       const query = url.searchParams.get('query') ?? '';
       const match = /subscribers\.email\s*=\s*'([^']*)'/i.exec(query);
       const email = match?.[1]?.trim().toLowerCase();
@@ -73,6 +76,8 @@ function createProviderStub() {
     calls,
     subscribers,
     handler,
+    setRawLookup: (fn) => { rawLookup = fn; },
+    clearRawLookup: () => { rawLookup = null; },
     /** Requests that would create or re-enable a subscriber. */
     mutations: () => calls.filter((call) => call.method === 'POST' && call.path === '/api/subscribers'),
     reset: () => { calls.length = 0; },
@@ -226,6 +231,138 @@ describe('the answer is only sent once provider state is known', () => {
       assert.notEqual(body.message, 'Already subscribed');
     } finally {
       await failingRuntime.dispose();
+    }
+  });
+});
+
+describe('a contradictory lookup response establishes nothing', () => {
+  const cases = [
+    ['a missing global status', { global: undefined, listStatus: 'confirmed' }],
+    ['a disabled global status', { global: 'disabled', listStatus: 'confirmed' }],
+    ['an unrecognised global status', { global: 'archived', listStatus: 'confirmed' }],
+  ];
+
+  for (const [name, shape] of cases) {
+    it(`does not claim confirmation with ${name}`, async () => {
+      const email = `invariant-status-${String(shape.global)}@example.com`;
+      await seedSubscriber(email);
+      provider.setRawLookup(() => new Response(JSON.stringify({
+        data: {
+          results: [{ email, status: shape.global, lists: [{ id: LIST_ID, subscription_status: shape.listStatus }] }],
+          total: 1,
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+      try {
+        const response = await subscribe(email);
+        await drain();
+        const body = await response.json();
+        assert.notEqual(body.message, 'Already subscribed');
+        assert.equal(body.status, 'unverified');
+        assert.equal(provider.mutations().length, 0);
+      } finally {
+        provider.clearRawLookup();
+      }
+    });
+  }
+
+  it('does not treat an empty result with a non-zero total as absence', async () => {
+    const email = 'invariant-count-mismatch@example.com';
+    await seedSubscriber(email);
+    // The rows and the count disagree, so neither can be used to conclude that
+    // the address is gone - and concluding that would issue a create.
+    provider.setRawLookup(() => new Response(
+      JSON.stringify({ data: { results: [], total: 1 } }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ));
+
+    try {
+      const response = await subscribe(email);
+      await drain();
+      const body = await response.json();
+      assert.equal(body.status, 'unverified');
+      assert.equal(provider.mutations().length, 0, 'a contradictory count must not trigger a create');
+    } finally {
+      provider.clearRawLookup();
+    }
+  });
+
+  it('treats more than one match for an exact address as ambiguous', async () => {
+    const email = 'invariant-multi-match@example.com';
+    await seedSubscriber(email);
+    // One matching row, but the count says there are two. Which one is the
+    // subscriber is not something the response can answer.
+    provider.setRawLookup(() => new Response(JSON.stringify({
+      data: {
+        results: [{ email, status: 'enabled', lists: [{ id: LIST_ID, subscription_status: 'confirmed' }] }],
+        total: 2,
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    try {
+      const response = await subscribe(email);
+      await drain();
+      const body = await response.json();
+      assert.notEqual(body.message, 'Already subscribed');
+      assert.equal(body.status, 'unverified');
+    } finally {
+      provider.clearRawLookup();
+    }
+  });
+
+  it('does not accept a result for a different address', async () => {
+    const email = 'invariant-wrong-identity@example.com';
+    await seedSubscriber(email);
+    provider.setRawLookup(() => new Response(JSON.stringify({
+      data: {
+        results: [{ email: 'someone-else@example.com', status: 'enabled', lists: [{ id: LIST_ID, subscription_status: 'confirmed' }] }],
+        total: 1,
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    try {
+      const response = await subscribe(email);
+      await drain();
+      const body = await response.json();
+      assert.notEqual(body.message, 'Already subscribed');
+      assert.equal(body.status, 'unverified');
+    } finally {
+      provider.clearRawLookup();
+    }
+  });
+});
+
+describe('the browser can show the explanation', () => {
+  it('returns an error string alongside the status for every non-confirmed state', async () => {
+    const email = 'invariant-wording@example.com';
+    await seedSubscriber(email);
+    setProviderStatus(email, { listStatus: 'unsubscribed' });
+
+    const response = await subscribe(email);
+    await drain();
+    const body = await response.json();
+
+    // site.js reads data.error on failure, so message alone is invisible.
+    assert.equal(typeof body.error, 'string');
+    assert.ok(body.error.length > 0);
+    assert.equal(body.status, 'unsubscribed');
+    assert.equal(body.message, body.error);
+  });
+
+  it('does not assert the subscription state when the provider is unreadable', async () => {
+    const email = 'invariant-unreadable-wording@example.com';
+    await seedSubscriber(email);
+    provider.setRawLookup(() => new Response('{"error":"boom"}', { status: 500 }));
+
+    try {
+      const response = await subscribe(email);
+      await drain();
+      const body = await response.json();
+      assert.equal(body.status, 'unverified');
+      assert.doesNotMatch(body.error, /is not currently subscribed/i);
+      assert.match(body.error, /verify/i);
+    } finally {
+      provider.clearRawLookup();
     }
   });
 });

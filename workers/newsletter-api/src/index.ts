@@ -405,17 +405,52 @@ function isListmonkConfigured(env: Env): boolean {
 type UpstreamState = 'confirmed' | 'unsubscribed' | 'blocklisted' | 'pending' | 'absent' | 'unverified';
 
 /**
+ * Calls Listmonk and parses the body while the request deadline is still armed.
+ *
+ * `callListmonk` clears its timeout when the headers arrive, so a provider that
+ * sends headers promptly and then stalls the body would never be aborted. Any
+ * caller that needs the body should use this instead.
+ */
+async function callListmonkJson(
+  env: Env,
+  path: string,
+  init: RequestInit = {},
+): Promise<{ ok: boolean; status: number; body: unknown }> {
+  const auth = btoa(`${env.LISTMONK_API_USER}:${env.LISTMONK_API_TOKEN}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  try {
+    const resp = await fetch(`${env.LISTMONK_API_URL}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json',
+        ...(init.headers || {}),
+      },
+    });
+    // Body parsing happens before the deadline is cleared, so an abort during the
+    // body also aborts the read.
+    const body = await resp.json().catch(() => null);
+    return { ok: resp.ok, status: resp.status, body };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
  * Reads the provider's current state for one address.
  *
  * A KV record is not evidence that the provider still holds a subscription:
  * Listmonk's own unsubscribe links change that state without this Worker being
- * involved, and the read-only inventory found a live case where the two stores
+ * involved, and the read-only inventory found live cases where the two stores
  * disagreed. So the existing-record path asks before it answers.
  *
- * Anything that prevents a clear answer - unconfigured, non-200, unexpected
- * shape, or a status this Worker does not recognise - returns 'unverified'
- * rather than 'absent', because guessing absence here would re-create a
- * subscriber who deliberately left.
+ * The answer is only trusted when it is internally consistent: the reported
+ * count must agree with the rows, and the row must carry the exact address that
+ * was asked for. A response that contradicts itself is 'unverified', never
+ * 'absent', because treating it as absence re-creates a subscriber who
+ * deliberately left.
  */
 async function lookupListmonkSubscriber(email: string, env: Env): Promise<UpstreamState> {
   if (!isListmonkConfigured(env)) return 'unverified';
@@ -423,16 +458,31 @@ async function lookupListmonkSubscriber(email: string, env: Env): Promise<Upstre
     const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
     const safeEmail = email.replace(/'/g, "''");
     const query = encodeURIComponent(`subscribers.email = '${safeEmail}'`);
-    const resp = await callListmonk(env, `/api/subscribers?query=${query}&per_page=1`, { method: 'GET' });
+    const resp = await callListmonkJson(env, `/api/subscribers?query=${query}&per_page=1`, { method: 'GET' });
     if (!resp.ok) return 'unverified';
 
-    const body = await resp.json() as { data?: { results?: unknown } };
-    const results = body?.data?.results;
+    const data = (resp.body as { data?: { results?: unknown; total?: unknown } })?.data;
+    const results = data?.results;
+    const total = data?.total;
     if (!Array.isArray(results)) return 'unverified';
-    if (results.length === 0) return 'absent';
+    // The count and the rows have to agree before either is used. `per_page=1`
+    // caps the rows, so anything above one match is ambiguous for an exact-email
+    // query rather than a page of results.
+    if (typeof total !== 'number' || !Number.isFinite(total)) return 'unverified';
+    if (total > 1) return 'unverified';
+    if (total === 1 && results.length !== 1) return 'unverified';
+    if (total === 0 && results.length !== 0) return 'unverified';
+    if (total === 0) return 'absent';
 
-    const subscriber = results[0] as { status?: unknown; lists?: unknown };
+    const subscriber = results[0] as { email?: unknown; status?: unknown; lists?: unknown };
+    const returnedEmail = typeof subscriber?.email === 'string' ? subscriber.email.trim().toLowerCase() : null;
+    if (returnedEmail !== email.trim().toLowerCase()) return 'unverified';
+
     if (subscriber?.status === 'blocklisted') return 'blocklisted';
+    // Confirmation requires an explicitly enabled global subscriber. A missing,
+    // disabled or unrecognised global status cannot support "Already subscribed",
+    // even when a list entry says confirmed.
+    if (subscriber?.status !== 'enabled') return 'unverified';
 
     if (!Array.isArray(subscriber?.lists)) return 'unverified';
     const entry = subscriber.lists.find((candidate) => Number((candidate as { id?: unknown })?.id) === listId) as
@@ -697,13 +747,16 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       // is not permission to try either.
       if (upstream === 'blocklisted' || upstream === 'unsubscribed' || upstream === 'unverified' || upstream === 'pending') {
         const status = upstream === 'pending' ? 'unverified' : upstream;
-        return jsonResponse({
-          success: false,
-          status,
-          message: upstream === 'blocklisted'
-            ? 'This address cannot be subscribed. Please contact us.'
-            : 'This address is not currently subscribed. Please contact us to resubscribe.',
-        }, 200, request, env);
+        // The browser reads `error`, not `message`, so both carry the wording.
+        // `message` is kept for anything that already reads it.
+        const text = upstream === 'blocklisted'
+          ? 'This address cannot be subscribed. Please contact us.'
+          : upstream === 'unsubscribed'
+            ? 'This address is unsubscribed. Please contact us to resubscribe.'
+            // An unreadable provider establishes nothing about the subscription,
+            // so say only that the check failed.
+            : "We couldn't verify your subscription. Please try again later or contact us.";
+        return jsonResponse({ success: false, status, error: text, message: text }, 200, request, env);
       }
 
       // Absent upstream: the address exists only in KV, which is exactly the
