@@ -64,6 +64,15 @@ function send(path, init = {}) {
   return runtime.dispatchFetch(`http://localhost${path}`, { ...init, headers });
 }
 
+// With no provider configured the Worker declines to claim a subscription for
+// an address it already holds, so `status: 'unverified'` is the signal that the
+// KV record survived. It is a stronger presence proof than the old message,
+// which asserted provider state the Worker had never checked.
+function assertRecordPresent(body) {
+  assert.equal(body.success, false);
+  assert.equal(body.status, 'unverified');
+}
+
 function subscribe(email, extra = {}) {
   return send('/api/subscribe', {
     method: 'POST',
@@ -154,7 +163,7 @@ describe('subscribe', () => {
     // A second request reads the record back through the real KV binding.
     const duplicate = await subscribe('runtime-first@example.com');
     assert.equal(duplicate.status, 200);
-    assert.equal((await duplicate.json()).message, 'Already subscribed');
+    assertRecordPresent(await duplicate.json());
   });
 
   it('rejects a malformed JSON body as a client error', async () => {
@@ -204,7 +213,7 @@ describe('unsubscribe', () => {
 
     // The record still exists, which the duplicate path can only answer.
     const again = await subscribe(email);
-    assert.equal((await again.json()).message, 'Already subscribed');
+    assertRecordPresent(await again.json());
   });
 
   it('fails closed when the provider is not configured', async () => {
@@ -231,7 +240,7 @@ describe('unsubscribe', () => {
     assert.match(response.headers.get('content-security-policy') ?? '', /form-action 'self'/);
 
     const again = await subscribe(email);
-    assert.equal((await again.json()).message, 'Already subscribed');
+    assertRecordPresent(await again.json());
   });
 
   it('renders a confirmation form for a signed GET without removing anything', async () => {
@@ -247,7 +256,7 @@ describe('unsubscribe', () => {
     assert.match(html, /method="post"/);
 
     const again = await subscribe(email);
-    assert.equal((await again.json()).message, 'Already subscribed');
+    assertRecordPresent(await again.json());
   });
 
   it('accepts the form post that the confirmation page sends', async () => {
