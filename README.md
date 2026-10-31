@@ -196,15 +196,17 @@ Isolation is enforced rather than described:
 - Outbound traffic is wired through Miniflare's `outboundService` to a guard
   that records each requested host and answers 403. A positive control makes the
   Worker perform a real outbound request and asserts the guard saw it, which is
-  what shows the guard is on the path at all; a second test asserts the provider
-  was never contacted.
+  what shows the guard is on the path at all. After all tests finish, a test-only
+  wrapper entry drains all `ctx.waitUntil` background work, and only then does
+  the suite assert that no provider host was contacted; a fixture test proves
+  the drain catches delayed egress. Production source is not modified.
 - The deploy-configuration guard runs before workerd starts, so an unsafe
   `wrangler.toml` aborts the suite even when it is invoked on its own. `npm run
   verify` also runs it first.
 
 The expected `Listmonk not configured` / `PLUNK_SECRET_KEY not configured`
-lines are filtered from the runtime logs, because they are the intended
-development behaviour. Anything else still prints.
+warnings appear in the runtime logs; they are the intended development
+behaviour and are not filtered.
 
 ## Scripts
 

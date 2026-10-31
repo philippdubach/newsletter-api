@@ -13,7 +13,10 @@
 //     read — asserted behaviourally by the CORS test below;
 //   * outbound traffic is wired through `outboundService`, and a positive
 //     control makes the Worker fetch a URL and asserts the guard saw it, which
-//     is what shows the guard is on the path at all.
+//     is what shows the guard is on the path at all;
+//   * the provider-attempt assertion runs in the file-level `after` hook, once
+//     every test has finished and ctx.waitUntil work has been drained through
+//     a harness-only wrapper entry (see harness.mjs); dispose always runs.
 //
 // The Worker is started once per file; each test uses its own client IP so the
 // per-IP rate limit cannot couple unrelated cases.
@@ -42,6 +45,7 @@ const MAX_BODY = 1024;
 let runtime;
 let attempts;
 let dispose;
+let drain;
 let ipCounter = 0;
 
 function nextIP() {
@@ -76,11 +80,20 @@ before(async () => {
     throw new Error(`refusing to start workerd against an unsafe configuration:\n- ${errors.join('\n- ')}`);
   }
 
-  ({ runtime, attempts, dispose } = await startRuntime());
+  ({ runtime, attempts, dispose, drain } = await startRuntime());
 });
 
 after(async () => {
-  if (dispose) await dispose();
+  if (!dispose) return;
+  try {
+    // Background work (ctx.waitUntil) may still be running when the last test
+    // returns, so settle it before judging what left the Worker.
+    await drain();
+    const providers = attempts.filter((host) => host !== EGRESS_PROBE_HOST);
+    assert.deepEqual(providers, [], 'the Worker reached a provider host during the suite');
+  } finally {
+    await dispose();
+  }
 });
 
 describe('egress guard', () => {
@@ -99,10 +112,23 @@ describe('egress guard', () => {
       `expected the guard to see ${EGRESS_PROBE_HOST}, saw ${JSON.stringify(attempts)}`,
     );
   });
+});
 
-  it('never contacted the provider during the suite', () => {
-    const providers = attempts.filter((host) => host !== EGRESS_PROBE_HOST);
-    assert.deepEqual(providers, [], 'the Worker reached a provider host');
+describe('background work drain', () => {
+  it('catches delayed egress that happens after the response', async () => {
+    const fixture = await startRuntime({ entry: join(workerDir, 'test/fixtures/delayed-egress-worker.mjs') });
+    try {
+      const response = await fixture.runtime.dispatchFetch('http://localhost/');
+      assert.equal(response.status, 200);
+      assert.equal(await fixture.drain(), 1);
+      assert.deepEqual(fixture.attempts, ['delayed-provider.runtime-suite.invalid']);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it('settles with nothing to drain', async () => {
+    assert.equal(typeof (await drain()), 'number');
   });
 });
 

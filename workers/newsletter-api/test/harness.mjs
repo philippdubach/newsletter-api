@@ -52,9 +52,52 @@ export function createEgressGuard() {
   return { guard, attempts };
 }
 
-async function bundleWorker() {
+export const DRAIN_PATH = '/__harness__/drain-background-work';
+
+// Test-only entry. It imports the real Worker and forwards every call to it,
+// but hands it a ctx whose waitUntil also records the promise. A private route
+// then awaits everything recorded, including work scheduled while draining.
+// Miniflare exposes no response.waitUntil, so this is how background work is
+// made observable. Production source is not touched.
+function wrapperSource(entry) {
+  return `
+import worker from ${JSON.stringify(entry)};
+const pending = new Set();
+const DRAIN_PATH = ${JSON.stringify(DRAIN_PATH)};
+export default {
+  async fetch(request, env, ctx) {
+    if (new URL(request.url).pathname === DRAIN_PATH) {
+      let settled = 0;
+      while (pending.size > 0) {
+        const batch = [...pending];
+        await Promise.allSettled(batch);
+        for (const p of batch) pending.delete(p);
+        settled += batch.length;
+      }
+      return Response.json({ drained: settled });
+    }
+    const tracked = new Proxy(ctx, {
+      get(target, prop) {
+        if (prop === 'waitUntil') {
+          return (promise) => {
+            const p = Promise.resolve(promise);
+            pending.add(p);
+            return target.waitUntil(p);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    return worker.fetch(request, env, tracked);
+  },
+};
+`;
+}
+
+async function bundleWorker(entry) {
   const result = await build({
-    entryPoints: [join(workerDir, 'src/index.ts')],
+    stdin: { contents: wrapperSource(entry), resolveDir: workerDir, sourcefile: 'harness-entry.mjs', loader: 'js' },
     bundle: true,
     format: 'esm',
     platform: 'neutral',
@@ -67,11 +110,11 @@ async function bundleWorker() {
 }
 
 /**
- * Starts the Worker in workerd. Returns the runtime, the egress record, and a
- * dispose function.
+ * Starts the Worker in workerd. Returns the runtime, the egress record, a drain
+ * function for background work, and a dispose function.
  */
-export async function startRuntime() {
-  const script = await bundleWorker();
+export async function startRuntime({ entry = join(workerDir, 'src/index.ts') } = {}) {
+  const script = await bundleWorker(entry);
   const { guard, attempts } = createEgressGuard();
 
   const runtime = new Miniflare(
@@ -90,6 +133,11 @@ export async function startRuntime() {
   return {
     runtime,
     attempts,
+    /** Waits until every ctx.waitUntil promise the Worker registered has settled. */
+    drain: async () => {
+      const response = await runtime.dispatchFetch(`http://localhost${DRAIN_PATH}`);
+      return (await response.json()).drained;
+    },
     dispose: () => runtime.dispose(),
   };
 }
