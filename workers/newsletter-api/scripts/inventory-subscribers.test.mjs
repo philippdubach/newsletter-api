@@ -10,7 +10,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -261,7 +261,7 @@ describe('pagination and coverage', () => {
     const result = await readUpstream(reader, { listId: 3, perPage: 100 });
     assert.equal(result.complete, true);
     assert.equal(result.pages.length, 2);
-    assert.equal(result.coverage.subscribersRead, 2);
+    assert.equal(result.coverage.subscribersDistinct, 2);
     assert.ok(paths.some((path) => path.includes('list_id=3')));
   });
 
@@ -329,9 +329,114 @@ describe('pagination and coverage', () => {
 
     const upstream = await readUpstream(reader, { listId: 3 });
     assert.equal(upstream.pages.length, 1);
+    // Valid status observations survive the failed phase.
     assert.equal(upstream.coverage.subscribersComplete, true);
     assert.equal(upstream.coverage.listQueryComplete, false);
+    // Both phases are required, so the run is not complete and must exit 2.
+    assert.equal(upstream.complete, false);
     assert.ok(upstream.failures.some((failure) => failure.phase === 'list'));
+  });
+});
+
+describe('coverage counted in usable identities', () => {
+  it('treats repeated identities as unreconciled rather than complete', async () => {
+    // Two pages repeat A while the reported total is 2: rows reach the total but
+    // only one distinct address was observed.
+    const { reader } = recordingReader((path) => {
+      if (path.includes('list_id')) return page([]);
+      return page([subscriber('a@example.com', { listStatus: 'confirmed' })], { total: 2 });
+    });
+
+    const result = await readUpstream(reader, { listId: 3, maxPages: 3 });
+    assert.equal(result.coverage.subscribersDistinct, 1);
+    assert.equal(result.complete, false);
+  });
+
+  it('treats a row without a usable identity as unreconciled', async () => {
+    // One row, email null, reported total 1: zero usable identities.
+    const { reader } = recordingReader((path) => {
+      if (path.includes('list_id')) return page([]);
+      if (path.endsWith('page=1')) return page([{ email: null, status: 'enabled' }], { total: 1 });
+      return page([], { total: 1 });
+    });
+
+    const result = await readUpstream(reader, { listId: 3 });
+    assert.equal(result.coverage.subscribersDistinct, 0);
+    assert.equal(result.coverage.subscribersInvalidRows, 1);
+    assert.equal(result.complete, false);
+  });
+
+  it('treats a row without a usable identity as unreconciled even with no reported total', async () => {
+    // Without a reported total there is nothing to reconcile against, so the
+    // unusable row is the only signal that the space was not fully read.
+    const { reader } = recordingReader((path) => {
+      if (path.includes('list_id')) return { data: { results: [] } };
+      if (path.endsWith('page=1')) return { data: { results: [{ email: null, status: 'enabled' }] } };
+      return { data: { results: [] } };
+    });
+
+    const result = await readUpstream(reader, { listId: 3 });
+    assert.equal(result.coverage.subscribersInvalidRows, 1);
+    assert.equal(result.complete, false);
+  });
+
+  it('still completes when distinct identities reconcile with the total', async () => {
+    const { reader } = recordingReader((path) => {
+      if (path.includes('list_id')) return page([]);
+      return page([
+        subscriber('a@example.com', { listStatus: 'confirmed' }),
+        subscriber('b@example.com', { listStatus: 'confirmed' }),
+      ], { total: 2 });
+    });
+
+    const result = await readUpstream(reader, { listId: 3 });
+    assert.equal(result.coverage.subscribersDistinct, 2);
+    assert.equal(result.complete, true);
+  });
+});
+
+describe('observations from the list query', () => {
+  it('does not report an address seen only by the list query as missing', () => {
+    // A appears in the subscriber pages, B only in the later list walk — the
+    // shape of a subscriber added between the two reads. KV holds B.
+    const collected = collectUpstream({
+      pages: [page([subscriber('a@example.com', { listStatus: 'confirmed' })])],
+      queriedEmails: new Set(['a@example.com', 'b@example.com']),
+      complete: true,
+      failures: [],
+      listId: 3,
+    });
+
+    const b = collected.upstreamByEmail.get('b@example.com');
+    assert.equal(b.found, true);
+    assert.equal(b.globalStatus, 'unknown');
+    assert.equal(b.listStatus, 'unknown');
+    assert.equal(b.listEvidence, 'list-query-only');
+
+    const inventory = buildInventory({
+      kv: readKvExport([{ key: 'b@example.com', value: '{}' }]),
+      upstreamByEmail: collected.upstreamByEmail,
+      coverage: COMPLETE,
+    });
+    assert.equal(inventory.counts.kv_only_missing_upstream, 0);
+    assert.equal(inventory.counts.needs_investigation, 1);
+  });
+
+  it('marks conflicting observations as needing investigation', () => {
+    const collected = collectUpstream({
+      pages: [
+        page([subscriber('a@example.com', { listStatus: 'confirmed' })]),
+        page([subscriber('a@example.com', { listStatus: 'unsubscribed' })]),
+      ],
+      queriedEmails: new Set(['a@example.com']),
+      complete: true,
+      failures: [],
+      listId: 3,
+    });
+    const entry = collected.upstreamByEmail.get('a@example.com');
+    assert.equal(entry.conflicting, true);
+    assert.equal(collected.conflicts.length, 1);
+    assert.equal(classifyAddress(entry, { inKv: true, readable: true }, COMPLETE), 'needs_investigation');
   });
 });
 
@@ -482,6 +587,59 @@ describe('report destination', () => {
       () => assertOutsideRepository(join(link, 'inventory.json')),
       /refusing to write a report inside the Git working tree/,
     );
+  });
+
+  it('refuses when Git cannot be consulted, instead of assuming no repository', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'inventory-'));
+    const bin = mkdtempSync(join(tmpdir(), 'fakegit-'));
+    const fakeGit = join(bin, 'git');
+    writeFileSync(fakeGit, '#!/bin/sh\necho "fatal: something else went wrong" >&2\nexit 1\n', { mode: 0o755 });
+
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${bin}:${previousPath ?? ''}`;
+    try {
+      assert.throws(
+        () => assertOutsideRepository(join(dir, 'report.json')),
+        /could not determine whether .* is inside a Git working tree/,
+      );
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  });
+
+  it('refuses when Git is not installed at all', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'inventory-'));
+    const empty = mkdtempSync(join(tmpdir(), 'nogit-'));
+    const previousPath = process.env.PATH;
+    process.env.PATH = empty;
+    try {
+      assert.throws(
+        () => assertOutsideRepository(join(dir, 'report.json')),
+        /could not determine whether .* is inside a Git working tree/,
+      );
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  });
+
+  it('accepts only when Git definitively reports no working tree', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'inventory-'));
+    const bin = mkdtempSync(join(tmpdir(), 'fakegit-'));
+    const fakeGit = join(bin, 'git');
+    writeFileSync(
+      fakeGit,
+      '#!/bin/sh\necho "fatal: not a git repository (or any of the parent directories): .git" >&2\nexit 128\n',
+      { mode: 0o755 },
+    );
+
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${bin}:${previousPath ?? ''}`;
+    try {
+      // realpath resolves macOS /var to /private/var, so compare against it.
+      assert.equal(assertOutsideRepository(join(dir, 'report.json')), join(realpathSync(dir), 'report.json'));
+    } finally {
+      process.env.PATH = previousPath;
+    }
   });
 
   it('publishes with private permissions and refuses to follow a symlink', () => {

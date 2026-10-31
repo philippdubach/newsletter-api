@@ -172,6 +172,10 @@ export function classifyAddress(upstream, presence, coverage = { subscribersComp
   // and it must not be resolved by looking at the other store.
   if (presence.inKv && !presence.readable) return 'needs_investigation';
 
+  // An observation conflict means the two reads disagree, so neither status can
+  // be asserted.
+  if (upstream.conflicting) return 'needs_investigation';
+
   if (upstream?.found) {
     const globalStatus = upstream.globalStatus ?? 'unknown';
     const listStatus = upstream.listStatus ?? 'unknown';
@@ -212,6 +216,7 @@ export function collectUpstream({ pages, queriedEmails, complete, failures, list
   const upstreamByEmail = new Map();
   const queried = queriedEmails instanceof Set ? queriedEmails : new Set(queriedEmails ?? []);
   const targetListId = Number(listId);
+  const conflicts = [];
 
   for (const page of pages) {
     const results = page?.data?.results;
@@ -242,17 +247,41 @@ export function collectUpstream({ pages, queriedEmails, complete, failures, list
       // Appearance in the list query is recorded but never promoted to a status.
       if (listStatus === 'unknown' && queried.has(email)) listEvidence = 'list-query-only';
 
+      const previous = upstreamByEmail.get(email);
+      // The same address observed twice with different statuses cannot be
+      // resolved by picking one.
+      const conflicting = Boolean(previous) &&
+        (previous.globalStatus !== globalStatus || previous.listStatus !== listStatus);
+      if (conflicting) conflicts.push(email);
+
       upstreamByEmail.set(email, {
         found: true,
         readable: true,
-        globalStatus,
-        listStatus,
+        globalStatus: previous && !conflicting ? previous.globalStatus : globalStatus,
+        listStatus: previous && !conflicting ? previous.listStatus : listStatus,
         listEvidence,
+        conflicting: conflicting || Boolean(previous?.conflicting),
       });
     }
   }
 
-  return { upstreamByEmail, complete, failures };
+  // An address can be observed upstream only by the list query — for instance
+  // when it is added between the two reads. Reporting it as absent because the
+  // subscriber pages predate it would turn a positive observation into a
+  // missing-subscriber claim.
+  for (const email of queried) {
+    if (upstreamByEmail.has(email)) continue;
+    upstreamByEmail.set(email, {
+      found: true,
+      readable: true,
+      globalStatus: 'unknown',
+      listStatus: 'unknown',
+      listEvidence: 'list-query-only',
+      conflicting: false,
+    });
+  }
+
+  return { upstreamByEmail, complete, failures, conflicts };
 }
 
 /** Buckets every address. Coverage gates the one bucket that asserts absence. */
@@ -372,10 +401,23 @@ export function createListmonkReader({ apiUrl, user, token, fetchImpl = fetch, r
  * because the missing rows are exactly the ones the report would otherwise call
  * absent.
  */
-async function walkPages(fetchPage, { perPage, maxPages }) {
+async function walkPages(fetchPage, { perPage, maxPages, identify }) {
   const pages = [];
-  let read = 0;
+  const distinct = new Set();
+  let rows = 0;
+  let invalidRows = 0;
   let total = null;
+
+  const finish = (complete, reason) => ({
+    pages,
+    rows,
+    validRows: rows - invalidRows,
+    invalidRows,
+    distinct: distinct.size,
+    total,
+    complete,
+    reason,
+  });
 
   for (let page = 1; page <= maxPages; page += 1) {
     let payload;
@@ -385,28 +427,48 @@ async function walkPages(fetchPage, { perPage, maxPages }) {
       // Pages already read stay in the result: a failure on page 3 does not
       // make pages 1 and 2 unread, and discarding them would throw away the
       // only evidence the run produced.
-      return { pages, read, total, complete: false, reason: String(error?.message ?? error) };
+      return finish(false, String(error?.message ?? error));
     }
     const results = payload?.data?.results;
     if (!Array.isArray(results)) {
-      return { pages, read, total, complete: false, reason: 'response has no results array' };
+      return finish(false, 'response has no results array');
     }
     pages.push(payload);
     const reported = Number(payload?.data?.total ?? 0);
     if (Number.isFinite(reported) && reported > 0) total = reported;
 
-    if (results.length === 0) {
-      if (total !== null && read < total) {
-        return { pages, read, total, complete: false, reason: `empty page after ${read} of ${total} reported records` };
-      }
-      return { pages, read, total, complete: true };
+    for (const row of results) {
+      rows += 1;
+      const identity = identify(row);
+      if (identity) distinct.add(identity);
+      else invalidRows += 1;
     }
 
-    read += results.length;
-    if (total !== null && read >= total) return { pages, read, total, complete: true };
+    // Every early return below is a judgement about coverage, and coverage is
+    // counted in distinct usable identities. A row with no identity, or a
+    // repeated identity, means the reported total cannot be reconciled with
+    // what was actually observed, so completeness is not established.
+    const unreconciled = invalidRows > 0 || (total !== null && distinct.size < total);
+
+    if (results.length === 0) {
+      if (total !== null && distinct.size < total) {
+        return finish(false, `empty page after ${distinct.size} distinct of ${total} reported records`);
+      }
+      if (invalidRows > 0) {
+        return finish(false, `${invalidRows} rows had no usable identity`);
+      }
+      return finish(true);
+    }
+
+    if (!unreconciled && total !== null && distinct.size >= total) return finish(true);
   }
 
-  return { pages, read, total, complete: false, reason: `stopped after the ${maxPages}-page limit with ${read} of ${total ?? '?'} records` };
+  return finish(false, `stopped after the ${maxPages}-page limit with ${distinct.size} of ${total ?? '?'} distinct records`);
+}
+
+function subscriberIdentity(row) {
+  const email = normalizeEmail(row?.email);
+  return email && EXPECTED_EMAIL.test(email) ? email : null;
 }
 
 /** Reads every subscriber page and the list membership pages, with coverage. */
@@ -417,10 +479,10 @@ export async function readUpstream(reader, { listId, perPage = 100, maxPages = 5
   try {
     subscribers = await walkPages(
       (page) => reader.get(`/api/subscribers?per_page=${perPage}&page=${page}`),
-      { perPage, maxPages },
+      { perPage, maxPages, identify: subscriberIdentity },
     );
   } catch (error) {
-    subscribers = { pages: [], read: 0, total: null, complete: false, reason: String(error?.message ?? error) };
+    subscribers = { pages: [], distinct: 0, total: null, complete: false, reason: String(error?.message ?? error), invalidRows: 0, rows: 0 };
   }
   if (!subscribers.complete) failures.push({ phase: 'subscribers', error: subscribers.reason });
 
@@ -429,51 +491,76 @@ export async function readUpstream(reader, { listId, perPage = 100, maxPages = 5
   try {
     listWalk = await walkPages(
       (page) => reader.get(`/api/subscribers?list_id=${listId}&per_page=${perPage}&page=${page}`),
-      { perPage, maxPages },
+      { perPage, maxPages, identify: subscriberIdentity },
     );
     for (const payload of listWalk.pages) {
       const results = payload?.data?.results;
       if (!Array.isArray(results)) continue;
-      for (const subscriber of results) {
-        const email = normalizeEmail(subscriber?.email);
+      for (const row of results) {
+        const email = subscriberIdentity(row);
         if (email) queriedEmails.add(email);
       }
     }
   } catch (error) {
-    listWalk = { complete: false, reason: String(error?.message ?? error) };
+    listWalk = { complete: false, reason: String(error?.message ?? error), distinct: 0, invalidRows: 0 };
   }
   if (!listWalk.complete) failures.push({ phase: 'list', error: listWalk.reason });
+
+  // Both phases are required. Status observations from the subscriber pages stay
+  // valid on their own, but the run is not complete and must not exit 0.
+  const complete = Boolean(subscribers.complete && listWalk.complete);
 
   return {
     pages: subscribers.pages,
     queriedEmails,
-    // The list query only supplies appearance evidence, so an incomplete list
-    // walk cannot invalidate a status read from the subscriber pages. It is
-    // still reported, because coverage of the query itself is weaker.
-    complete: subscribers.complete,
+    complete,
     failures,
     coverage: {
-      subscribersComplete: subscribers.complete,
-      subscribersRead: subscribers.read,
-      subscribersReportedTotal: subscribers.total,
-      listQueryComplete: listWalk.complete,
-      listQueryRead: listWalk.pages?.length ? queriedEmails.size : 0,
+      subscribersComplete: Boolean(subscribers.complete),
+      subscribersDistinct: subscribers.distinct ?? 0,
+      subscribersReportedTotal: subscribers.total ?? null,
+      subscribersInvalidRows: subscribers.invalidRows ?? 0,
+      listQueryComplete: Boolean(listWalk.complete),
+      listQueryDistinct: listWalk.distinct ?? 0,
+      listQueryInvalidRows: listWalk.invalidRows ?? 0,
     },
   };
 }
 
+/**
+ * Determines whether `target` is inside a Git working tree.
+ *
+ * Returns `true`/`false` only when Git answered definitively. Anything else — a
+ * missing binary, a permission error, an unreadable configuration, an
+ * unexpected exit status — throws, because treating "could not check" as "not a
+ * repository" is exactly how a report ends up committed.
+ */
 function insideRepository(target) {
+  let stdout;
   try {
-    const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+    stdout = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       cwd: dirname(target),
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf8',
-    }).trim();
-    return root ? target === root || target.startsWith(`${root}/`) : false;
-  } catch {
-    // Not a Git working tree, which is the expected case for a report path.
-    return false;
+    });
+  } catch (error) {
+    const stderr = String(error?.stderr ?? '');
+    const status = error?.status;
+    // Git's own refusal: this directory is definitively not in a work tree.
+    if (status === 128 && /not a git repository|not a git work tree/i.test(stderr)) {
+      return false;
+    }
+    throw new Error(
+      `could not determine whether ${dirname(target)} is inside a Git working tree` +
+      ` (${String(error?.code ?? error?.message ?? 'unknown failure').split('\n')[0]}); refusing to write a report`,
+    );
   }
+
+  const root = stdout.trim();
+  if (!root) {
+    throw new Error(`git reported no working-tree root for ${dirname(target)}; refusing to write a report`);
+  }
+  return target === root || target.startsWith(`${root}/`);
 }
 
 /**
