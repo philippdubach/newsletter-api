@@ -1391,16 +1391,11 @@ export class SubscriptionCoordinator {
       authenticated: input.authenticated,
     };
 
-    // An accepted-but-unfinished removal is durable proof of the recipient's
-    // intent. An anonymous request must not cancel it; only a caller who proved
-    // control of the address may resubscribe while it is in flight.
-    const pendingBefore = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
-    // The intent is what protects the removal, not the operation that happens to
-    // be queued next: a pending shadow repair is still an accepted unsubscribe.
-    const removalInFlight = previous?.desired === 'unsubscribed'
-      && pendingBefore != null
-      && pendingBefore.seq === previous.seq;
-    if (input.desired === 'subscribed' && removalInFlight && !input.authenticated) {
+    // The unsubscribe intent is a durable recipient tombstone, independent of
+    // pending work: exhaustion or completion must not permit anonymous signup
+    // to restore mail. Proof of control only clears this guard; provider lookup
+    // policy still governs whether an authenticated signup may proceed.
+    if (input.desired === 'subscribed' && previous?.desired === 'unsubscribed' && !input.authenticated) {
       return { outcome: 'unsubscribed', seq: previous!.seq, desired: 'unsubscribed' };
     }
 

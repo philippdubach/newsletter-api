@@ -17,7 +17,7 @@ function seed(email, seq = 1) {
   return { intent: { email, desired: 'subscribed', seq: 1, updatedAt: new Date().toISOString() }, pending: { kind: 'create', seq, attempts: 0, nextAt: 0, lastError: null } };
 }
 
-describe('workerd scheduler delivered alarms (no direct alarm or sync calls)', () => {
+describe('workerd scheduler delivers retries; /sync is used only to assert the paused guard', () => {
   for (const converge of [true, false]) it(converge ? 'retries converge' : 'eight total attempts and exact capped backoffs', async () => {
     let calls = 0;
     const local = await startRuntime({ scheduler: true, extraBindings: bindings, outboundService: () => {
@@ -39,6 +39,52 @@ describe('workerd scheduler delivered alarms (no direct alarm or sync calls)', (
       metrics.delays.forEach((delay, i) => assert.ok(Math.abs(delay - expected[i]) < 100, `${delay} != ${expected[i]}`));
       await sleep(100);
       assert.equal((await json(stub, '/metrics')).callbacks, calls, 'terminal work must not spin');
+    } finally { await local.dispose(); }
+  });
+
+  for (const exhausted of [true, false]) it(`protects an unsubscribe tombstone after ${exhausted ? 'scheduler exhaustion' : 'scheduler completion'}`, async () => {
+    const calls = [];
+    const local = await startRuntime({ scheduler: true, extraBindings: bindings, outboundService: request => {
+      calls.push({ method: request.method, path: new URL(request.url).pathname });
+      return new Response('{}', { status: exhausted ? 503 : 200 });
+    } });
+    try {
+      const email = exhausted ? 'exhausted-removal@example.com' : 'completed-removal@example.com';
+      const stub = await local.coordinator(email);
+      const removal = seed(email);
+      removal.intent.desired = 'unsubscribed';
+      removal.intent.authenticated = true;
+      removal.pending.kind = 'remove';
+      await fixture(stub, { seed: removal });
+      // Only workerd's scheduler drives removal; no direct alarm or /sync call.
+      await until(async () => (await json(stub, '/state')).pending === null);
+      const before = await json(stub, '/state');
+      assert.equal(before.alarm, null);
+      assert.equal(before.intent.desired, 'unsubscribed');
+      assert.equal(before.intent.authenticated, true);
+      assert.equal(calls.length, exhausted ? 8 : 1);
+      assert.ok(calls.every(call => call.method === 'PUT' && call.path === '/api/subscribers/query/lists'));
+      const metrics = await json(stub, '/metrics');
+      assert.equal(metrics.callbacks, exhausted ? 8 : 1);
+
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.90' },
+        body: JSON.stringify({ email }),
+      });
+      assert.equal(signup.status, 200);
+      const body = await signup.json();
+      assert.equal(body.success, false);
+      assert.equal(body.status, 'unsubscribed');
+      await local.drain();
+      await sleep(100);
+      const after = await json(stub, '/state');
+      assert.deepEqual(after.intent, before.intent, 'anonymous signup must not change the tombstone or sequence');
+      assert.equal(after.pending, null);
+      assert.equal(after.alarm, null);
+      assert.equal(calls.length, exhausted ? 8 : 1, 'no lookup, create, or other provider call after refusal');
+      assert.equal((await json(stub, '/metrics')).callbacks, metrics.callbacks);
+      assert.equal(await local.kv.get(email), null);
     } finally { await local.dispose(); }
   });
 

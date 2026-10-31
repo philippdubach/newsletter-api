@@ -221,9 +221,11 @@ Cloudflare migration/control-plane behavior. A disposable remote migration and
 rollback-forward canary still requires separate upload authorization; neither
 local tests nor the production dry run establish that proof.
 
-An unsubscribe accepted but not yet finished is durable proof of the recipient's
-intent: an unauthenticated signup cannot cancel it, and keeps reporting the
-address as unsubscribed until the removal completes or the caller proves control.
+An accepted unsubscribe is a durable recipient tombstone: an unauthenticated
+signup cannot cancel it, even after retry exhaustion or completed removal. The
+address keeps reporting as unsubscribed until the caller proves control through
+the supported authenticated path; provider lookup policy still governs whether
+that signup may proceed.
 
 ### Runtime suite
 
