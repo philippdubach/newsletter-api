@@ -1,28 +1,30 @@
-# Default (dev) worker has a distinct name so a bare `wrangler deploy` cannot
-# overwrite the production Worker (which must be deployed via --env production).
+# The development Worker is deliberately inert. It has its own name, placeholder
+# bindings that exist only in local simulation, and no provider URL or list
+# configuration, so a development deploy cannot read or write production KV, R2
+# or Listmonk. Local-only values belong in `.dev.vars`, which is ignored.
 name = "newsletter-api-dev"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
-# KV namespace binding (rate-limit + caches; subscriber storage now lives in Listmonk)
+# Placeholder namespace for the local `wrangler dev` simulation. It does not
+# exist in the account, so deploying this environment fails instead of writing
+# to production data. Create a dedicated namespace first if a development deploy
+# is ever needed.
 [[kv_namespaces]]
 binding = "NEWSLETTER_SUBSCRIBERS"
-id = "f98d1bbfe9924cbaa277fa8da10ba2ea"
+id = "dev-local-only-placeholder"
 
-# R2 bucket binding for newsletter files (now in EU jurisdiction)
+# Placeholder bucket, simulated locally and absent from the account.
 [[r2_buckets]]
 binding = "R2_BUCKET"
-bucket_name = "static-eu"
-jurisdiction = "eu"
+bucket_name = "newsletter-dev-local"
 
-# Development environment variables
+# Development has no Listmonk or Plunk configuration on purpose: a development
+# Worker must not email real subscribers. Supply local values through
+# `.dev.vars` when testing that path.
 [vars]
 ENVIRONMENT = "development"
 ALLOWED_ORIGIN = "http://localhost:1313,http://localhost:3000"
-LINKEDIN_NEWSLETTER_URLS = "https://www.linkedin.com/pulse/ai-lab-60b-cursor-25b-anthropic-chinese-open-weight-triple-dubach-ltbae"
-LISTMONK_API_URL = "https://mail.philippdubach.com"
-LISTMONK_LIST_ID = "3"
-LISTMONK_WELCOME_TEMPLATE_ID = "5"
 
 # Production environment
 [env.production]

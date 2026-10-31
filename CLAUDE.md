@@ -48,19 +48,18 @@ To bypass Listmonk: delete `LISTMONK_API_USER` and `LISTMONK_API_TOKEN` secrets 
 
 ## Testing
 
-Tests are in `src/index.test.ts` using Vitest with Miniflare environment (configured in `vitest.config.ts`). Tests mock KV and R2 bindings with `vi.fn()` and invoke the worker's `fetch` handler directly. Local dev secrets go in `.dev.vars` (not committed). Note: the suite currently has a config issue (`vitest-environment-miniflare` not installed) — fix before relying on CI.
+Worker tests in `src/**/*.test.ts` run under Node with mocked KV, R2 and fetch, not workerd. Configuration and deploy-wrapper tests run through `node:test` in `scripts/`. `npm run verify` runs typechecking, both suites and the config guard. Local dev secrets go in ignored `.dev.vars`; use only non-production provider credentials and dummy addresses.
 
 ## Deployment
 
-Two environments in `wrangler.toml`: top-level (development) and `[env.production]`. Both define the same Worker name (`newsletter-api`), which makes `wrangler deploy` without an env flag dangerous — see warning below.
+The top-level development Worker is `newsletter-api-dev`, with local placeholder KV/R2 bindings and no provider vars. `[env.production]` retains `newsletter-api` and its production bindings. The config guard rejects shared resources, provider vars in development and unknown named environments. Development defaults do not prevent explicit `.dev.vars` overrides from reaching real providers.
 
 ```bash
 npm run deploy:production
-# or equivalently:
-npx wrangler deploy --env production
+npm run deploy:production -- --dry-run  # verify and bundle only
 ```
 
-**⚠️ Do not run `wrangler deploy` (no env flag) or `npm run deploy`.** Because both the top-level and `[env.production]` blocks point at the same Worker name, a bare deploy uploads the **top-level dev env vars** (`ENVIRONMENT="development"`, `ALLOWED_ORIGIN="http://localhost:1313,..."`) to the production Worker. Result: prod CORS instantly breaks for `philippdubach.com`. Wrangler warns about the missing `--env` flag; do not ignore it. Secrets (`LISTMONK_*`, `PLUNK_SECRET_KEY`) are not per-env so they survive, but env vars get clobbered.
+The deployment wrapper runs `npm run verify`, then `npx --no-install wrangler deploy` with a fixed absolute config path and `--env production`. It accepts only the optional `--dry-run`; target overrides are refused. Do not bypass the wrapper with raw deployment commands. `npm run deploy` refuses outright. Secrets are environment-specific; never copy production secrets into development.
 
 Operational reads (always pass `--env production`):
 
