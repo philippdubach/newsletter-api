@@ -57,10 +57,10 @@ LISTMONK_LIST_ID=0
 PLUNK_SECRET_KEY=your_dev_plunk_key
 ```
 
-Development deliberately has no Listmonk or Plunk configuration in
-`wrangler.toml`, so a development Worker cannot email real subscribers. Without
-`.dev.vars`, a signup is still recorded locally and the welcome email fails
-closed.
+The checked-in development configuration has no Listmonk or Plunk settings.
+Without provider credentials or `.dev.vars` overrides, a signup is recorded
+locally and the welcome email fails closed. Overrides can enable real network
+calls and email: use only dummy addresses and non-production providers.
 
 4. Optional: replace the placeholder development bindings in `wrangler.toml`
 only if you create dedicated KV and R2 resources for development.
@@ -75,7 +75,8 @@ npm run dev
 The API will be available at `http://localhost:8787`. Local KV and R2 are
 simulated under `.wrangler/state`; the placeholder bindings in `wrangler.toml`
 are not account resources, so development cannot read or write production
-storage and cannot send mail. Two read-only endpoints still fetch public pages:
+storage. With no local provider overrides or secrets, it cannot send mail.
+Two read-only endpoints still fetch public pages:
 the newsletter list falls back to `static.philippdubach.com`, and the subscriber
 count scrapes public LinkedIn follower counts.
 
@@ -84,14 +85,16 @@ count scrapes public LinkedIn follower counts.
 The default environment is a development Worker named `newsletter-api-dev`. It
 uses placeholder KV and R2 bindings that exist only in local simulation, and it
 has no Listmonk or Plunk configuration. A development deploy therefore fails
-against real bindings instead of writing to production storage, and it cannot
-send mail.
+against real bindings instead of writing to production storage. Mail remains
+disabled unless local overrides or separately configured secrets enable it.
 
 `npm run check:config` enforces this. It fails when the development and
 production environments share a Worker name, KV namespace or R2 bucket, when
 development sets a provider URL or key, or when either environment carries the
-wrong `ENVIRONMENT` value. `npm run verify` runs it together with the typecheck
-and the unit tests.
+wrong `ENVIRONMENT` value. It parses TOML with `smol-toml`, checks binding names
+and preview resources, rejects remote development bindings and routes, and
+refuses unknown named environments. `npm run verify` runs it together with the
+typecheck and unit tests.
 
 ## Deployment
 
@@ -100,9 +103,13 @@ Deploy to production:
 npm run deploy:production
 ```
 
-That command runs `npm run verify` first and only then calls
-`wrangler deploy --env production`, so a failing typecheck, configuration guard
-or unit test stops the deployment.
+That command runs `npm run verify` first, then invokes
+`npx --no-install wrangler deploy --config <absolute-wrangler.toml> --env production`.
+A failing typecheck, configuration guard or unit test stops deployment. The
+wrapper accepts only an optional `--dry-run`; overrides such as `--env`,
+`--config`, `--name` and `--var` are rejected before any process starts.
+Use `npm run deploy:production -- --dry-run` to run the gate and bundle without
+uploading. `--no-install` uses the project-installed Wrangler.
 
 > ⚠️ **Do not use a bare `wrangler deploy`.** It uploads the development Worker.
 > `npm run deploy` refuses on purpose; production always goes through
@@ -122,8 +129,8 @@ Environment variables are configured in `wrangler.toml`:
 | `LISTMONK_WELCOME_TEMPLATE_ID` | Numeric Listmonk transactional template ID for the welcome email |
 
 `LINKEDIN_NEWSLETTER_URLS` and the `LISTMONK_*` variables are set only in the
-production environment. Development leaves them unset so it cannot reach a real
-provider; supply local values through `.dev.vars`.
+production environment. Development leaves them unset by default; any local
+`.dev.vars` overrides must use non-production providers.
 
 Secrets (set via `wrangler secret put ... --env production`):
 

@@ -2,11 +2,12 @@
 // Guard the Wrangler configuration so a development Worker cannot reach
 // production data or email real subscribers.
 //
-// The check is deliberately dependency-free: it parses the small, hand-written
-// TOML file directly instead of pulling a parser into the deployment path.
+// The check uses smol-toml (a dev dependency) so the file is parsed with real
+// TOML semantics. Unknown environments fail closed.
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { parse as parseToml } from 'smol-toml';
 import { fileURLToPath } from 'node:url';
 
 const PROVIDER_KEYS = [
@@ -18,97 +19,120 @@ const PROVIDER_KEYS = [
   'PLUNK_SECRET_KEY',
 ];
 
-function stripComment(line) {
-  let quoted = false;
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index];
-    if (character === '"') quoted = !quoted;
-    if (character === '#' && !quoted) return line.slice(0, index);
-  }
-  return line;
-}
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const asArray = (value) => (Array.isArray(value) ? value : []);
+const REQUIRED_KV = 'NEWSLETTER_SUBSCRIBERS';
+const REQUIRED_R2 = 'R2_BUCKET';
+const PROD_NAME = 'newsletter-api';
 
-function unquote(value) {
-  const trimmed = value.trim();
-  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
-}
-
-// Returns { root, vars, tables } where tables maps a section path to an array of
-// key/value maps, so repeated [[kv_namespaces]] entries stay separate.
+// Parses with a real TOML parser so single-quoted values, quoted keys and
+// inline tables cannot be read differently here than by Wrangler. Throws on
+// malformed TOML. Returns the plain parsed object.
 export function parseConfig(text) {
-  const tables = new Map();
-  let current = '';
-  const push = () => {
-    if (!tables.has(current)) tables.set(current, []);
-    if (tables.get(current).length === 0) tables.get(current).push(new Map());
-    return tables.get(current).at(-1);
-  };
-  tables.set('', [new Map()]);
-
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = stripComment(rawLine).trim();
-    if (!line) continue;
-    if (line.startsWith('[[') && line.endsWith(']]')) {
-      current = line.slice(2, -2).trim();
-      tables.set(current, [...(tables.get(current) ?? []), new Map()]);
-      continue;
-    }
-    if (line.startsWith('[') && line.endsWith(']')) {
-      current = line.slice(1, -1).trim();
-      push();
-      continue;
-    }
-    const separator = line.indexOf('=');
-    if (separator < 0) continue;
-    const key = line.slice(0, separator).trim();
-    push().set(key, unquote(line.slice(separator + 1)));
-  }
-  return tables;
+  return parseToml(text);
 }
 
-const section = (tables, name) => tables.get(name)?.[0] ?? new Map();
-const values = (tables, name, key) => (tables.get(name) ?? []).map((entry) => entry.get(key)).filter(Boolean);
+function bindings(owner, key) {
+  const raw = owner?.[key];
+  if (raw === undefined) return [];
+  return Array.isArray(raw) ? raw.filter(isObject) : [];
+}
 
-export function checkConfig(tables) {
+function strings(entries, ...keys) {
+  return entries.flatMap((entry) => keys.map((key) => entry[key]).filter((v) => typeof v === 'string' && v));
+}
+
+function checkBindingNames(errors, label, entries, required, kind) {
+  if (entries.length === 0) errors.push(`${label} has no ${kind}`);
+  for (const entry of entries) {
+    if (entry.binding !== required) {
+      errors.push(`${label} ${kind} binding must be named ${required}, found ${JSON.stringify(entry.binding)}`);
+    }
+  }
+  if (entries.length > 0 && !entries.some((entry) => entry.binding === required)) {
+    errors.push(`${label} is missing the ${required} binding`);
+  }
+}
+
+function findRemote(node, path, found) {
+  if (Array.isArray(node)) node.forEach((item, i) => findRemote(item, `${path}[${i}]`, found));
+  else if (isObject(node)) {
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'remote' && value === true) found.push(path || 'top level');
+      else findRemote(value, path ? `${path}.${key}` : key, found);
+    }
+  }
+}
+
+export function checkConfig(config) {
   const errors = [];
-  const dev = section(tables, '');
-  const devVars = section(tables, 'vars');
-  const prod = section(tables, 'env.production');
-  const prodVars = section(tables, 'env.production.vars');
+  if (!isObject(config)) return ['the configuration is not a TOML table'];
+  const dev = config;
+  const devVars = isObject(dev.vars) ? dev.vars : {};
+  const envs = isObject(dev.env) ? dev.env : {};
+  const prod = isObject(envs.production) ? envs.production : {};
+  const prodVars = isObject(prod.vars) ? prod.vars : {};
 
-  if (!dev.get('name')) errors.push('the development Worker has no name');
-  if (dev.get('name') && dev.get('name') === prod.get('name')) {
+  for (const name of Object.keys(envs)) {
+    if (name !== 'production') errors.push(`unknown environment "${name}" is not supported`);
+  }
+  if (!isObject(envs.production)) errors.push('the production environment is missing');
+
+  if (typeof dev.name !== 'string' || !dev.name) errors.push('the development Worker has no name');
+  if (prod.name !== PROD_NAME) errors.push(`the production Worker name must be "${PROD_NAME}"`);
+  if (dev.name && dev.name === prod.name) {
     errors.push('the development and production Workers share a name');
   }
 
-  const devKv = values(tables, 'kv_namespaces', 'id');
-  const prodKv = values(tables, 'env.production.kv_namespaces', 'id');
-  if (prodKv.length === 0) errors.push('production has no KV namespace');
-  for (const id of devKv) {
+  const devKvEntries = bindings(dev, 'kv_namespaces');
+  const prodKvEntries = bindings(prod, 'kv_namespaces');
+  checkBindingNames(errors, 'development', devKvEntries, REQUIRED_KV, 'KV namespace');
+  checkBindingNames(errors, 'production', prodKvEntries, REQUIRED_KV, 'KV namespace');
+  for (const [label, entries] of [['development', devKvEntries], ['production', prodKvEntries]]) {
+    for (const entry of entries) {
+      if (typeof entry.id !== 'string' || !entry.id.trim()) errors.push(`${label} KV namespace has no id`);
+    }
+  }
+  const prodKv = strings(prodKvEntries, 'id', 'preview_id');
+  for (const id of strings(devKvEntries, 'id', 'preview_id')) {
     if (prodKv.includes(id)) errors.push(`development KV namespace ${id} is a production namespace`);
   }
 
-  const devR2 = values(tables, 'r2_buckets', 'bucket_name');
-  const prodR2 = values(tables, 'env.production.r2_buckets', 'bucket_name');
-  if (prodR2.length === 0) errors.push('production has no R2 bucket');
-  for (const bucket of devR2) {
+  const devR2Entries = bindings(dev, 'r2_buckets');
+  const prodR2Entries = bindings(prod, 'r2_buckets');
+  checkBindingNames(errors, 'development', devR2Entries, REQUIRED_R2, 'R2 bucket');
+  checkBindingNames(errors, 'production', prodR2Entries, REQUIRED_R2, 'R2 bucket');
+  for (const [label, entries] of [['development', devR2Entries], ['production', prodR2Entries]]) {
+    for (const entry of entries) {
+      if (typeof entry.bucket_name !== 'string' || !entry.bucket_name.trim()) errors.push(`${label} R2 bucket has no bucket_name`);
+    }
+  }
+  const prodR2 = strings(prodR2Entries, 'bucket_name', 'preview_bucket_name');
+  for (const bucket of strings(devR2Entries, 'bucket_name', 'preview_bucket_name')) {
     if (prodR2.includes(bucket)) errors.push(`development R2 bucket ${bucket} is a production bucket`);
   }
 
+  const remote = [];
+  const { env: _env, ...devOnly } = dev;
+  findRemote(devOnly, '', remote);
+  for (const path of remote) errors.push(`development sets remote = true (${path}), which reaches real resources`);
+
+  const routes = [];
+  if (typeof dev.route === 'string' ? dev.route : isObject(dev.route)) routes.push('route');
+  if (asArray(dev.routes).length > 0) routes.push('routes');
+  for (const name of routes) errors.push(`development sets ${name}, which is a production route`);
+
   for (const key of PROVIDER_KEYS) {
-    if (devVars.has(key)) errors.push(`development sets ${key}, which reaches a real provider`);
+    if (key in devVars) errors.push(`development sets ${key}, which reaches a real provider`);
   }
 
-  if (devVars.get('ENVIRONMENT') !== 'development') {
+  if (devVars.ENVIRONMENT !== 'development') {
     errors.push('development ENVIRONMENT must be "development"');
   }
-  if (prodVars.get('ENVIRONMENT') !== 'production') {
+  if (prodVars.ENVIRONMENT !== 'production') {
     errors.push('production ENVIRONMENT must be "production"');
   }
-  if (prodVars.get('LISTMONK_API_URL') && devVars.get('LISTMONK_API_URL') === prodVars.get('LISTMONK_API_URL')) {
+  if (prodVars.LISTMONK_API_URL && devVars.LISTMONK_API_URL === prodVars.LISTMONK_API_URL) {
     errors.push('development and production share a Listmonk URL');
   }
 
@@ -132,7 +156,14 @@ function main(argv) {
     return 1;
   }
 
-  const errors = checkConfig(loadConfig(configPath));
+  let errors;
+  try {
+    errors = checkConfig(loadConfig(configPath));
+  } catch (error) {
+    console.error(`Deploy configuration could not be read (${configPath}):`);
+    console.error(`  - ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`);
+    return 1;
+  }
   if (errors.length > 0) {
     console.error(`Deploy configuration is unsafe (${configPath}):`);
     for (const error of errors) console.error(`  - ${error}`);
