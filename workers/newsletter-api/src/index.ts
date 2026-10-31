@@ -399,6 +399,107 @@ function isListmonkConfigured(env: Env): boolean {
   return Boolean(env.LISTMONK_API_URL && env.LISTMONK_API_USER && env.LISTMONK_API_TOKEN && env.LISTMONK_LIST_ID);
 }
 
+// What the provider says about an address, as far as this Worker can establish.
+// 'unverified' means the question could not be answered, which is not the same
+// as the address being absent.
+type UpstreamState = 'confirmed' | 'unsubscribed' | 'blocklisted' | 'pending' | 'absent' | 'unverified';
+
+/**
+ * Calls Listmonk and parses the body while the request deadline is still armed.
+ *
+ * `callListmonk` clears its timeout when the headers arrive, so a provider that
+ * sends headers promptly and then stalls the body would never be aborted. Any
+ * caller that needs the body should use this instead.
+ */
+async function callListmonkJson(
+  env: Env,
+  path: string,
+  init: RequestInit = {},
+): Promise<{ ok: boolean; status: number; body: unknown }> {
+  const auth = btoa(`${env.LISTMONK_API_USER}:${env.LISTMONK_API_TOKEN}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  try {
+    const resp = await fetch(`${env.LISTMONK_API_URL}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json',
+        ...(init.headers || {}),
+      },
+    });
+    // Body parsing happens before the deadline is cleared, so an abort during the
+    // body also aborts the read.
+    const body = await resp.json().catch(() => null);
+    return { ok: resp.ok, status: resp.status, body };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Reads the provider's current state for one address.
+ *
+ * A KV record is not evidence that the provider still holds a subscription:
+ * Listmonk's own unsubscribe links change that state without this Worker being
+ * involved, and the read-only inventory found live cases where the two stores
+ * disagreed. So the existing-record path asks before it answers.
+ *
+ * The answer is only trusted when it is internally consistent: the reported
+ * count must agree with the rows, and the row must carry the exact address that
+ * was asked for. A response that contradicts itself is 'unverified', never
+ * 'absent', because treating it as absence re-creates a subscriber who
+ * deliberately left.
+ */
+async function lookupListmonkSubscriber(email: string, env: Env): Promise<UpstreamState> {
+  if (!isListmonkConfigured(env)) return 'unverified';
+  try {
+    const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
+    const safeEmail = email.replace(/'/g, "''");
+    const query = encodeURIComponent(`subscribers.email = '${safeEmail}'`);
+    const resp = await callListmonkJson(env, `/api/subscribers?query=${query}&per_page=1`, { method: 'GET' });
+    if (!resp.ok) return 'unverified';
+
+    const data = (resp.body as { data?: { results?: unknown; total?: unknown } })?.data;
+    const results = data?.results;
+    const total = data?.total;
+    if (!Array.isArray(results)) return 'unverified';
+    // The count and the rows have to agree before either is used. `per_page=1`
+    // caps the rows, so anything above one match is ambiguous for an exact-email
+    // query rather than a page of results.
+    //
+    // A strict comparison against {0, 1} rather than a `> 1` bound: negative and
+    // fractional values are equally uninterpretable, and a range check would let
+    // them through to the length tests below.
+    if (total !== 0 && total !== 1) return 'unverified';
+    if (total === 1 && results.length !== 1) return 'unverified';
+    if (total === 0 && results.length !== 0) return 'unverified';
+    if (total === 0) return 'absent';
+
+    const subscriber = results[0] as { email?: unknown; status?: unknown; lists?: unknown };
+    const returnedEmail = typeof subscriber?.email === 'string' ? subscriber.email.trim().toLowerCase() : null;
+    if (returnedEmail !== email.trim().toLowerCase()) return 'unverified';
+
+    if (subscriber?.status === 'blocklisted') return 'blocklisted';
+    // Confirmation requires an explicitly enabled global subscriber. A missing,
+    // disabled or unrecognised global status cannot support "Already subscribed",
+    // even when a list entry says confirmed.
+    if (subscriber?.status !== 'enabled') return 'unverified';
+
+    if (!Array.isArray(subscriber?.lists)) return 'unverified';
+    const entry = subscriber.lists.find((candidate) => Number((candidate as { id?: unknown })?.id) === listId) as
+      { subscription_status?: unknown } | undefined;
+    if (!entry) return 'unverified';
+    if (entry.subscription_status === 'confirmed') return 'confirmed';
+    if (entry.subscription_status === 'unsubscribed') return 'unsubscribed';
+    if (entry.subscription_status === 'unconfirmed') return 'pending';
+    return 'unverified';
+  } catch {
+    return 'unverified';
+  }
+}
+
 async function callListmonk(env: Env, path: string, init: RequestInit = {}): Promise<Response> {
   const auth = btoa(`${env.LISTMONK_API_USER}:${env.LISTMONK_API_TOKEN}`);
   const url = `${env.LISTMONK_API_URL}${path}`;
@@ -634,15 +735,40 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       return jsonResponse({ success: false, error: 'Invalid email address' }, 400, request, env);
     }
 
-    // Idempotency: check KV first for fast path on duplicates
+    // Idempotency and honesty: a KV record proves this Worker accepted the
+    // address, not that the provider still has it. Ask first, then answer.
     const existing = await env.NEWSLETTER_SUBSCRIBERS.get(email);
     if (existing) {
-      // Reconcile on interaction: make sure Listmonk still has this subscription
-      // in case a prior background write failed (durable retry channel).
+      const upstream = await lookupListmonkSubscriber(email, env);
+
+      if (upstream === 'confirmed') {
+        return jsonResponse({ success: true, message: 'Already subscribed' }, 200, request, env);
+      }
+
+      // A blocklisted or unsubscribed address expresses the recipient's own
+      // decision, which this Worker must not overwrite; and an unverified read
+      // is not permission to try either.
+      if (upstream === 'blocklisted' || upstream === 'unsubscribed' || upstream === 'unverified' || upstream === 'pending') {
+        const status = upstream === 'pending' ? 'unverified' : upstream;
+        // The browser reads `error`, not `message`, so both carry the wording.
+        // `message` is kept for anything that already reads it.
+        const text = upstream === 'blocklisted'
+          ? 'This address cannot be subscribed. Please contact us.'
+          : upstream === 'unsubscribed'
+            ? 'This address is unsubscribed. Please contact us to resubscribe.'
+            // An unreadable provider establishes nothing about the subscription,
+            // so say only that the check failed.
+            : "We couldn't verify your subscription. Please try again later or contact us.";
+        return jsonResponse({ success: false, status, error: text, message: text }, 200, request, env);
+      }
+
+      // Absent upstream: the address exists only in KV, which is exactly the
+      // state a failed background write leaves behind. Re-adding it is the
+      // recovery channel, so keep it.
       const record = await readRecord(email, env);
       const seq = record?.seq ?? 0;
       ctx.waitUntil(reconcileSignup(email, seq, clientIP, env, { welcome: false }));
-      return jsonResponse({ success: true, message: 'Already subscribed' }, 200, request, env);
+      return jsonResponse({ success: true, message: 'Subscribed successfully' }, 200, request, env);
     }
 
     // KV is written first; background Listmonk registration remains subject to

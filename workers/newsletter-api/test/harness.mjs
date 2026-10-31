@@ -113,9 +113,12 @@ async function bundleWorker(entry) {
  * Starts the Worker in workerd. Returns the runtime, the egress record, a drain
  * function for background work, and a dispose function.
  */
-export async function startRuntime({ entry = join(workerDir, 'src/index.ts') } = {}) {
+export async function startRuntime({ entry = join(workerDir, 'src/index.ts'), extraBindings = {}, outboundService } = {}) {
   const script = await bundleWorker(entry);
   const { guard, attempts } = createEgressGuard();
+  // An explicit handler lets a suite stand in for the provider; the default is
+  // the deny-everything guard, so no suite silently inherits permissive egress.
+  const handler = outboundService ?? guard;
 
   const runtime = new Miniflare(
     convertV4MiniflareOptions({
@@ -123,10 +126,10 @@ export async function startRuntime({ entry = join(workerDir, 'src/index.ts') } =
       script,
       // Matches wrangler.toml, so request and response semantics are the same.
       compatibilityDate: '2024-01-01',
-      bindings: { ...TEST_BINDINGS },
+      bindings: { ...TEST_BINDINGS, ...extraBindings },
       kvNamespaces: ['NEWSLETTER_SUBSCRIBERS'],
       r2Buckets: ['R2_BUCKET'],
-      outboundService: guard,
+      outboundService: (request) => handler(request),
     }),
   );
 
@@ -134,6 +137,9 @@ export async function startRuntime({ entry = join(workerDir, 'src/index.ts') } =
     runtime,
     attempts,
     /** Waits until every ctx.waitUntil promise the Worker registered has settled. */
+    // Consume any response body before calling this. `dispatchFetch` returns a
+    // live stream, and issuing the drain request first can leave the body
+    // already read, which surfaces intermittently as "Body is unusable".
     drain: async () => {
       const response = await runtime.dispatchFetch(`http://localhost${DRAIN_PATH}`);
       return (await response.json()).drained;

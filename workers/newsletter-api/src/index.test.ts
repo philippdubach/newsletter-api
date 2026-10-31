@@ -52,6 +52,19 @@ function listmonkOk(): Response {
   return new Response('{}', { status: 200 });
 }
 
+// Payload for the single-address lookup the existing-record path performs.
+function listmonkLookup({ status = 'enabled', listStatus = 'confirmed' }: { status?: string; listStatus?: string } = {}): Response {
+  return new Response(
+    JSON.stringify({
+      data: {
+        results: [{ email: 'existing@example.com', status, lists: [{ id: 3, subscription_status: listStatus }] }],
+        total: 1,
+      },
+    }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  );
+}
+
 describe('Newsletter API', () => {
   let mockEnv: MockEnv & Env;
   let mockCtx: ExecutionContext;
@@ -152,7 +165,8 @@ describe('Newsletter API', () => {
       expect(body.error).toBe('Invalid email address');
     });
 
-    it('should handle already subscribed email', async () => {
+    it('should handle already subscribed email when the provider confirms it', async () => {
+      global.fetch = vi.fn().mockResolvedValue(listmonkLookup());
       mockEnv.NEWSLETTER_SUBSCRIBERS.get
         .mockResolvedValueOnce(null) // rate limit check
         .mockResolvedValueOnce(JSON.stringify({ timestamp: '2025-01-01' })); // existing subscription
@@ -172,6 +186,49 @@ describe('Newsletter API', () => {
       expect(response.status).toBe(200);
       expect(body.success).toBe(true);
       expect(body.message).toBe('Already subscribed');
+    });
+
+    it('should not claim an existing record is subscribed when the provider cannot be read', async () => {
+      // An unreachable provider is not evidence that the address is subscribed.
+      global.fetch = vi.fn().mockRejectedValue(new Error('provider unreachable'));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get
+        .mockResolvedValueOnce(null) // rate limit check
+        .mockResolvedValueOnce(JSON.stringify({ timestamp: '2025-01-01' })); // existing subscription
+
+      const request = new Request('https://api.example.com/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+        body: JSON.stringify({ email: 'existing@example.com' }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      const body = await response.json() as { success: boolean; message: string; status?: string };
+
+      expect(body.success).toBe(false);
+      expect(body.message).not.toBe('Already subscribed');
+      expect(body.status).toBe('unverified');
+    });
+
+    it('should not reactivate a blocklisted address', async () => {
+      global.fetch = vi.fn().mockResolvedValue(listmonkLookup({ status: 'blocklisted', listStatus: 'unsubscribed' }));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(JSON.stringify({ timestamp: '2025-01-01' }));
+
+      const request = new Request('https://api.example.com/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+        body: JSON.stringify({ email: 'existing@example.com' }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+      const body = await response.json() as { success: boolean; status?: string };
+
+      expect(body.success).toBe(false);
+      expect(body.status).toBe('blocklisted');
+      // A blocklist entry must not be re-created or re-enabled.
+      const methods = (global.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map(([, init]) => (init as RequestInit)?.method);
+      expect(methods).not.toContain('POST');
     });
 
     it('should accept a native URL-encoded form submission (no-JavaScript)', async () => {

@@ -17,7 +17,7 @@ A Cloudflare Workers API for managing newsletter subscriptions. Handles email su
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/subscribe` | Subscribe an email address |
+| POST | `/api/subscribe` | Subscribe an email address. An address already in KV is answered from the provider's current state, not from KV alone |
 | GET | `/api/unsubscribe` | Display the signed unsubscribe form without changing the subscription |
 | POST | `/api/unsubscribe` | Request removal with a signed token or operator authorization; completion is unverified |
 | POST | `/api/unsubscribe/confirm` | Submit the signed browser form and display the result |
@@ -27,7 +27,6 @@ A Cloudflare Workers API for managing newsletter subscriptions. Handles email su
 | POST | `/api/test-email` | Send a test email (operator authorization required in every environment) |
 
 ## Requirements
-
 - Node.js 18+
 - Cloudflare account with Workers, KV, and R2 enabled
 - Plunk project (secret key) for the fallback welcome email (optional)
@@ -162,8 +161,8 @@ subscriptions manually; this fallback is not a complete replacement.
 
 ## Testing
 
-Run the full gate — typecheck, configuration guard, unit tests, and the
-runtime suite:
+Run the full gate — typecheck, configuration guard, unit tests, inventory, and
+both runtime suites:
 ```bash
 npm run verify
 ```
@@ -174,6 +173,8 @@ Individually:
 |---|---|
 | `npm test` | Unit tests for `src/`, in Node with mocked KV, R2 and provider responses |
 | `npm run test:runtime` | Integration tests against the Worker in the real workerd runtime |
+| `npm run test:invariants` | Subscription invariants: provider state is consulted before an answer, blocklisted addresses are never reactivated, native unsubscribes are preserved |
+| `npm run test:inventory` | Read-only subscriber drift inventory |
 | `npm run test:config` | Deployment-configuration and deploy-wrapper tests |
 | `npm run typecheck` | `tsc --noEmit` |
 
