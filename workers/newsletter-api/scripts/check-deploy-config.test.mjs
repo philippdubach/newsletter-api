@@ -21,11 +21,20 @@ id = "dev-placeholder"
 [[r2_buckets]]
 binding = "R2_BUCKET"
 bucket_name = "newsletter-dev-local"
+[durable_objects]
+bindings = [{ name = "SUBSCRIPTION_COORDINATOR", class_name = "SubscriptionCoordinator" }]
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SubscriptionCoordinator"]
 [vars]
 ENVIRONMENT = "development"
+COORDINATOR_MODE = "on"
 ALLOWED_ORIGIN = "http://localhost:1313"
 [env.production]
 name = "newsletter-api"
+[[env.production.durable_objects.bindings]]
+name = "SUBSCRIPTION_COORDINATOR"
+class_name = "SubscriptionCoordinator"
 [[env.production.kv_namespaces]]
 binding = "NEWSLETTER_SUBSCRIBERS"
 id = "prod-kv-id"
@@ -34,6 +43,7 @@ binding = "R2_BUCKET"
 bucket_name = "static-eu"
 [env.production.vars]
 ENVIRONMENT = "production"
+COORDINATOR_MODE = "on"
 `;
 
 const check = (text) => checkConfig(parseConfig(text));
@@ -68,7 +78,10 @@ test('provider configuration in development is rejected', () => {
 });
 
 test('a development environment labelled production is rejected', () => {
-  const errors = check(SAFE.replace('ENVIRONMENT = "development"', 'ENVIRONMENT = "production"'));
+  const errors = check(SAFE.replace(
+    'ENVIRONMENT = "development"\nCOORDINATOR_MODE = "on"',
+    'ENVIRONMENT = "production"\nCOORDINATOR_MODE = "on"',
+  ));
   assert.equal(errors.length, 1);
   assert.match(errors[0], /must be "development"/);
 });
@@ -87,8 +100,14 @@ id = "dev-placeholder"
 [[r2_buckets]]
 binding = "R2_BUCKET"
 bucket_name = "dev-bucket"
+[durable_objects]
+bindings = [{ name = "SUBSCRIPTION_COORDINATOR", class_name = "SubscriptionCoordinator" }]
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SubscriptionCoordinator"]
 [vars]
 ENVIRONMENT = "development"
+COORDINATOR_MODE = "on"
 ALLOWED_ORIGIN = "https://example.invalid/#fragment"
 [env.production]
 name = "newsletter-api"
@@ -98,8 +117,12 @@ id = "prod-kv-id"
 [[env.production.r2_buckets]]
 binding = "R2_BUCKET"
 bucket_name = "static-eu"
+[[env.production.durable_objects.bindings]]
+name = "SUBSCRIPTION_COORDINATOR"
+class_name = "SubscriptionCoordinator"
 [env.production.vars]
 ENVIRONMENT = "production"
+COORDINATOR_MODE = "on"
 `);
   assert.equal(config.vars.ALLOWED_ORIGIN, 'https://example.invalid/#fragment');
   assert.deepEqual(checkConfig(config), []);
@@ -133,7 +156,9 @@ test('quoted keys cannot hide provider variables', () => {
 });
 
 test('inline tables cannot bypass the checks', () => {
-  const inlineVars = SAFE.replace(/\[vars\][\s\S]*?\[env\.production\]/, '[env.production]').replace('name = "newsletter-api-dev"\n', 'name = "newsletter-api-dev"\nvars = { ENVIRONMENT = "development", LISTMONK_LIST_ID = "3" }\n');
+  const inlineVars = SAFE.replace(/\[vars\][\s\S]*?\[env\.production\]/, '[env.production]')
+    .replace('name = "newsletter-api-dev"\n',
+      'name = "newsletter-api-dev"\nvars = { ENVIRONMENT = "development", COORDINATOR_MODE = "on", LISTMONK_LIST_ID = "3" }\n');
   has(check(inlineVars), /real provider/);
   const inlineKv = SAFE.replace(/\[\[kv_namespaces\]\][^\[]*/, 'kv_namespaces = [{ binding = "NEWSLETTER_SUBSCRIBERS", id = "prod-kv-id" }]\n');
   has(check(inlineKv.replace('name = "newsletter-api-dev"\n', 'name = "newsletter-api-dev"\n')), /production namespace/);
@@ -156,7 +181,10 @@ test('resource identifiers cannot be missing or empty', () => {
 
 test('the production Worker name and environment labels are required', () => {
   has(check(SAFE.replace('name = "newsletter-api"\n', 'name = "other"\n')), /production Worker name/);
-  has(check(SAFE.replace('ENVIRONMENT = "production"', 'ENVIRONMENT = "development"')), /production ENVIRONMENT/);
+  has(check(SAFE.replace(
+    'ENVIRONMENT = "production"\nCOORDINATOR_MODE = "on"',
+    'ENVIRONMENT = "development"\nCOORDINATOR_MODE = "on"',
+  )), /production ENVIRONMENT/);
 });
 
 test('preview references to production resources are rejected', () => {
@@ -184,4 +212,45 @@ test('malformed TOML throws from the parser and gives a clean CLI failure', () =
   assert.equal(result.status, 1);
   assert.match(result.stderr, /could not be read/);
   assert.doesNotMatch(result.stderr, /\n\s+at /);
+});
+
+test('a missing coordinator binding is rejected', () => {
+  const withoutDo = SAFE.replace(/\[durable_objects\]\nbindings = .*\n/, '');
+  const errors = check(withoutDo);
+  has(errors, /has no Durable Object/);
+});
+
+test('a wrongly named coordinator binding is rejected', () => {
+  const errors = check(SAFE.replaceAll('name = "SUBSCRIPTION_COORDINATOR"', 'name = "COORDINATOR"'));
+  has(errors, /must be named SUBSCRIPTION_COORDINATOR/);
+});
+
+test('a wrong coordinator class is rejected', () => {
+  const errors = check(SAFE.replaceAll('class_name = "SubscriptionCoordinator"', 'class_name = "Other"'));
+  has(errors, /class must be SubscriptionCoordinator/);
+});
+
+test('a missing migration is rejected', () => {
+  const withoutMigration = SAFE.replace(/\[\[migrations\]\]\ntag = "v1"\nnew_sqlite_classes = .*\n/, '');
+  const errors = check(withoutMigration);
+  has(errors, /no migration declares the SubscriptionCoordinator class/);
+});
+
+test('a missing coordinator mode is rejected', () => {
+  const errors = check(SAFE.replace(/COORDINATOR_MODE = "on"\n/g, ''));
+  has(errors, /must set COORDINATOR_MODE/);
+});
+
+test('an unrecognised coordinator mode is rejected', () => {
+  const errors = check(SAFE.replace(/COORDINATOR_MODE = "on"/g, 'COORDINATOR_MODE = "off"'));
+  has(errors, /must be "on" or "legacy"/);
+});
+
+test('legacy mode is accepted', () => {
+  assert.deepEqual(check(SAFE.replace(/COORDINATOR_MODE = "on"/g, 'COORDINATOR_MODE = "legacy"')), []);
+});
+
+test('an out-of-range provider budget is rejected', () => {
+  const errors = check(SAFE.replace('COORDINATOR_MODE = "on"', 'COORDINATOR_MODE = "on"\nPROVIDER_BUDGET_MS = "45000"'));
+  has(errors, /PROVIDER_BUDGET_MS must be an integer between 1000 and 25000/);
 });

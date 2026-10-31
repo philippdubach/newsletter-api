@@ -23,6 +23,8 @@ const isObject = (value) => value !== null && typeof value === 'object' && !Arra
 const asArray = (value) => (Array.isArray(value) ? value : []);
 const REQUIRED_KV = 'NEWSLETTER_SUBSCRIBERS';
 const REQUIRED_R2 = 'R2_BUCKET';
+const REQUIRED_DO = 'SUBSCRIPTION_COORDINATOR';
+const REQUIRED_DO_CLASS = 'SubscriptionCoordinator';
 const PROD_NAME = 'newsletter-api';
 
 // Parses with a real TOML parser so single-quoted values, quoted keys and
@@ -111,6 +113,56 @@ export function checkConfig(config) {
   for (const bucket of strings(devR2Entries, 'bucket_name', 'preview_bucket_name')) {
     if (prodR2.includes(bucket)) errors.push(`development R2 bucket ${bucket} is a production bucket`);
   }
+
+  // The coordinator is what serializes writes per address. A missing binding
+  // silently downgrades to the unserialized inline path, so its absence is an
+  // error rather than something to discover in production. Unlike KV and R2 the
+  // binding carries `name` and `class_name` rather than `binding`.
+  for (const [label, owner] of [['development', dev], ['production', prod]]) {
+    const table = owner?.durable_objects;
+    const entries = isObject(table) && Array.isArray(table.bindings) ? table.bindings.filter(isObject) : [];
+    if (entries.length === 0) errors.push(`${label} has no Durable Object`);
+    const named = entries.filter((entry) => entry.name === REQUIRED_DO);
+    if (entries.length > 0 && named.length === 0) {
+      errors.push(`${label} Durable Object binding must be named ${REQUIRED_DO}`);
+    }
+    for (const entry of named) {
+      if (entry.class_name !== REQUIRED_DO_CLASS) {
+        errors.push(`${label} Durable Object class must be ${REQUIRED_DO_CLASS}, found ${JSON.stringify(entry.class_name)}`);
+      }
+    }
+  }
+
+  // The rollback lever has to exist in production, and has to hold a value the
+  // Worker understands, or a rollback becomes an unplanned code change.
+  for (const [label, vars] of [['development', devVars], ['production', prodVars]]) {
+    const mode = vars.COORDINATOR_MODE;
+    if (mode === undefined) errors.push(`${label} must set COORDINATOR_MODE`);
+    else if (mode !== 'on' && mode !== 'legacy') {
+      errors.push(`${label} COORDINATOR_MODE must be "on" or "legacy", found ${JSON.stringify(mode)}`);
+    }
+  }
+
+  // If the provider budget is set it must stay well under the 30-second limit
+  // after which a Durable Object holding blockConcurrencyWhile is reset.
+  for (const [label, vars] of [['development', devVars], ['production', prodVars]]) {
+    const budget = vars.PROVIDER_BUDGET_MS;
+    if (budget === undefined) continue;
+    const value = Number(budget);
+    if (!Number.isInteger(value) || value < 1000 || value > 25000) {
+      errors.push(`${label} PROVIDER_BUDGET_MS must be an integer between 1000 and 25000, found ${JSON.stringify(budget)}`);
+    }
+  }
+
+  const migrations = Array.isArray(dev.migrations) ? dev.migrations.filter(isObject) : [];
+  const declaresClass = migrations.some((migration) => {
+    for (const key of ['new_classes', 'new_sqlite_classes']) {
+      const list = migration[key];
+      if (Array.isArray(list) && list.includes(REQUIRED_DO_CLASS)) return true;
+    }
+    return false;
+  });
+  if (!declaresClass) errors.push(`no migration declares the ${REQUIRED_DO_CLASS} class`);
 
   const remote = [];
   const { env: _env, ...devOnly } = dev;

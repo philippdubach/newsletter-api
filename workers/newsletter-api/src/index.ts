@@ -1,5 +1,14 @@
 export interface Env {
   NEWSLETTER_SUBSCRIBERS: KVNamespace; // dual-write target + rate limit + caches
+  // Optional only for nonproduction unit fixtures; production fails closed.
+  SUBSCRIPTION_COORDINATOR?: DurableObjectNamespace;
+  // 'on' routes writes through the coordinator. 'legacy' pauses writes; never an inline writer.
+  // Historical mode name retained for configuration compatibility. Keep the
+  // class, binding and migrations on rollback-forward deployments.
+  COORDINATOR_MODE?: string;
+  // Overall budget for one provider phase, in milliseconds. Must stay well under
+  // the 30-second limit after which a Durable Object is reset.
+  PROVIDER_BUDGET_MS?: string;
   R2_BUCKET?: R2Bucket;
   ALLOWED_ORIGIN?: string;
   ENVIRONMENT?: string;
@@ -348,8 +357,8 @@ export async function reconcileSignup(
   // separate in-flight Listmonk ordering race described above.
 }
 
-async function sendFallbackWelcome(email: string, env: Env): Promise<void> {
-  const fallback = await sendPlunkWelcomeFallback(email, env);
+async function sendFallbackWelcome(email: string, env: Env, deadline?: AbortSignal): Promise<void> {
+  const fallback = await sendPlunkWelcomeFallback(email, env, deadline);
   if (!fallback.success) {
     console.error(`Plunk fallback also failed for ${redactEmail(email)}: ${fallback.error}`);
   }
@@ -395,6 +404,41 @@ async function checkRateLimit(ip: string, env: Env): Promise<boolean> {
  * Listmonk is the email-sending source of truth.
  * ========================================================================== */
 
+/**
+ * Combines an optional caller deadline with a per-call one. The shorter wins,
+ * which is what keeps a sequence of provider calls inside one overall budget.
+ */
+function combineSignals(own: AbortSignal, external?: AbortSignal | null): AbortSignal {
+  if (!external) return own;
+  const anySignal = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (typeof anySignal === 'function') return anySignal([own, external]);
+  // Fallback for runtimes without AbortSignal.any.
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (own.aborted || external.aborted) controller.abort();
+  own.addEventListener('abort', abort, { once: true });
+  external.addEventListener('abort', abort, { once: true });
+  return controller.signal;
+}
+
+/**
+ * Resolves with `fallback` if the deadline fires first. Used for work that cannot
+ * take an AbortSignal itself, so it cannot extend a budgeted phase.
+ */
+function raceDeadline<T>(work: Promise<T>, deadline: AbortSignal | undefined, fallback: T): Promise<T> {
+  if (!deadline) return work;
+  if (deadline.aborted) return Promise.resolve(fallback);
+  return new Promise<T>((resolve) => {
+    const finish = (value: T) => {
+      deadline.removeEventListener('abort', onAbort);
+      resolve(value);
+    };
+    const onAbort = () => resolve(fallback);
+    deadline.addEventListener('abort', onAbort, { once: true });
+    work.then(finish).catch(() => finish(fallback));
+  });
+}
+
 function isListmonkConfigured(env: Env): boolean {
   return Boolean(env.LISTMONK_API_URL && env.LISTMONK_API_USER && env.LISTMONK_API_TOKEN && env.LISTMONK_LIST_ID);
 }
@@ -419,10 +463,12 @@ async function callListmonkJson(
   const auth = btoa(`${env.LISTMONK_API_USER}:${env.LISTMONK_API_TOKEN}`);
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
+  // Keep the deadline armed through body parsing, and honour a caller's budget.
+  const signal = combineSignals(controller.signal, init.signal);
   try {
     const resp = await fetch(`${env.LISTMONK_API_URL}${path}`, {
       ...init,
-      signal: controller.signal,
+      signal,
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json',
@@ -444,59 +490,76 @@ async function callListmonkJson(
  * A KV record is not evidence that the provider still holds a subscription:
  * Listmonk's own unsubscribe links change that state without this Worker being
  * involved, and the read-only inventory found live cases where the two stores
- * disagreed. So the existing-record path asks before it answers.
+ * disagreed. So the write path asks before it answers.
  *
  * The answer is only trusted when it is internally consistent: the reported
- * count must agree with the rows, and the row must carry the exact address that
- * was asked for. A response that contradicts itself is 'unverified', never
- * 'absent', because treating it as absence re-creates a subscriber who
- * deliberately left.
+ * count must be exactly zero or one and must agree with the rows, and the row
+ * must carry the exact address that was asked for. A response that contradicts
+ * itself is 'unverified', never 'absent', because treating it as absence
+ * re-creates a subscriber who deliberately left.
+ *
+ * `reason` names the cause so an unexplained 'unverified' in production can be
+ * diagnosed from the response plus one log line, instead of being invisible.
  */
-async function lookupListmonkSubscriber(email: string, env: Env): Promise<UpstreamState> {
-  if (!isListmonkConfigured(env)) return 'unverified';
+async function lookupListmonkSubscriber(
+  email: string,
+  env: Env,
+  deadline?: AbortSignal,
+): Promise<{ state: UpstreamState; reason: string }> {
+  const answered = await lookupListmonkSubscriberRaw(email, env, deadline);
+  if (answered.state === 'unverified') {
+    // Deliberately a warning: this is the only signal that the check failed,
+    // and it must be visible in tail rather than silently returning 200.
+    console.warn(`listmonk lookup unverified for ${redactEmail(email)}: ${answered.reason}`);
+  }
+  return answered;
+}
+
+async function lookupListmonkSubscriberRaw(
+  email: string,
+  env: Env,
+  deadline?: AbortSignal,
+): Promise<{ state: UpstreamState; reason: string }> {
+  if (!isListmonkConfigured(env)) return { state: 'unverified', reason: 'not_configured' };
   try {
     const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
     const safeEmail = email.replace(/'/g, "''");
     const query = encodeURIComponent(`subscribers.email = '${safeEmail}'`);
-    const resp = await callListmonkJson(env, `/api/subscribers?query=${query}&per_page=1`, { method: 'GET' });
-    if (!resp.ok) return 'unverified';
+    const resp = await callListmonkJson(env, `/api/subscribers?query=${query}&per_page=1`, { method: 'GET', signal: deadline });
+    if (!resp.ok) return { state: 'unverified', reason: `http_${resp.status}` };
 
     const data = (resp.body as { data?: { results?: unknown; total?: unknown } })?.data;
     const results = data?.results;
     const total = data?.total;
-    if (!Array.isArray(results)) return 'unverified';
-    // The count and the rows have to agree before either is used. `per_page=1`
-    // caps the rows, so anything above one match is ambiguous for an exact-email
-    // query rather than a page of results.
-    //
+    if (!Array.isArray(results)) return { state: 'unverified', reason: 'no_results_array' };
     // A strict comparison against {0, 1} rather than a `> 1` bound: negative and
     // fractional values are equally uninterpretable, and a range check would let
     // them through to the length tests below.
-    if (total !== 0 && total !== 1) return 'unverified';
-    if (total === 1 && results.length !== 1) return 'unverified';
-    if (total === 0 && results.length !== 0) return 'unverified';
-    if (total === 0) return 'absent';
+    if (total !== 0 && total !== 1) return { state: 'unverified', reason: `total_not_zero_or_one:${String(total)}` };
+    if (total === 1 && results.length !== 1) return { state: 'unverified', reason: 'count_exceeds_rows' };
+    if (total === 0 && results.length !== 0) return { state: 'unverified', reason: 'rows_exceed_count' };
+    if (total === 0) return { state: 'absent', reason: 'no_match' };
 
     const subscriber = results[0] as { email?: unknown; status?: unknown; lists?: unknown };
     const returnedEmail = typeof subscriber?.email === 'string' ? subscriber.email.trim().toLowerCase() : null;
-    if (returnedEmail !== email.trim().toLowerCase()) return 'unverified';
+    if (returnedEmail !== email.trim().toLowerCase()) return { state: 'unverified', reason: 'identity_mismatch' };
 
-    if (subscriber?.status === 'blocklisted') return 'blocklisted';
+    if (subscriber?.status === 'blocklisted') return { state: 'blocklisted', reason: 'global_blocklisted' };
     // Confirmation requires an explicitly enabled global subscriber. A missing,
     // disabled or unrecognised global status cannot support "Already subscribed",
     // even when a list entry says confirmed.
-    if (subscriber?.status !== 'enabled') return 'unverified';
+    if (subscriber?.status !== 'enabled') return { state: 'unverified', reason: `global_status_${String(subscriber?.status)}` };
 
-    if (!Array.isArray(subscriber?.lists)) return 'unverified';
+    if (!Array.isArray(subscriber?.lists)) return { state: 'unverified', reason: 'no_lists_array' };
     const entry = subscriber.lists.find((candidate) => Number((candidate as { id?: unknown })?.id) === listId) as
       { subscription_status?: unknown } | undefined;
-    if (!entry) return 'unverified';
-    if (entry.subscription_status === 'confirmed') return 'confirmed';
-    if (entry.subscription_status === 'unsubscribed') return 'unsubscribed';
-    if (entry.subscription_status === 'unconfirmed') return 'pending';
-    return 'unverified';
-  } catch {
-    return 'unverified';
+    if (!entry) return { state: 'unverified', reason: 'no_entry_for_target_list' };
+    if (entry.subscription_status === 'confirmed') return { state: 'confirmed', reason: 'list_confirmed' };
+    if (entry.subscription_status === 'unsubscribed') return { state: 'unsubscribed', reason: 'list_unsubscribed' };
+    if (entry.subscription_status === 'unconfirmed') return { state: 'pending', reason: 'list_unconfirmed' };
+    return { state: 'unverified', reason: `list_status_${String(entry.subscription_status)}` };
+  } catch (error) {
+    return { state: 'unverified', reason: `exception:${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -505,11 +568,12 @@ async function callListmonk(env: Env, path: string, init: RequestInit = {}): Pro
   const url = `${env.LISTMONK_API_URL}${path}`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
+  const signal = combineSignals(controller.signal, init.signal);
 
   try {
     const resp = await fetch(url, {
       ...init,
-      signal: controller.signal,
+      signal,
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json',
@@ -524,7 +588,7 @@ async function callListmonk(env: Env, path: string, init: RequestInit = {}): Pro
   }
 }
 
-async function createListmonkSubscriber(email: string, clientIP: string, env: Env): Promise<{ success: boolean; duplicate?: boolean; error?: string }> {
+async function createListmonkSubscriber(email: string, clientIP: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; duplicate?: boolean; error?: string }> {
   if (!isListmonkConfigured(env)) {
     return { success: false, error: 'Listmonk not configured' };
   }
@@ -532,6 +596,7 @@ async function createListmonkSubscriber(email: string, clientIP: string, env: En
     const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
     const resp = await callListmonk(env, '/api/subscribers', {
       method: 'POST',
+      signal: deadline,
       body: JSON.stringify({
         email,
         name: '',
@@ -557,7 +622,7 @@ async function createListmonkSubscriber(email: string, clientIP: string, env: En
   }
 }
 
-async function unsubscribeFromListmonk(email: string, env: Env): Promise<{ success: boolean; error?: string }> {
+async function unsubscribeFromListmonk(email: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; error?: string }> {
   // Missing configuration does not prove that Listmonk has no existing
   // subscription. Fail closed rather than falsely acknowledging removal.
   if (!isListmonkConfigured(env)) {
@@ -570,6 +635,7 @@ async function unsubscribeFromListmonk(email: string, env: Env): Promise<{ succe
     // the singular path used earlier is not a registered alias.
     const resp = await callListmonk(env, '/api/subscribers/query/lists', {
       method: 'PUT',
+      signal: deadline,
       body: JSON.stringify({
         query: `subscribers.email = '${safeEmail}'`,
         action: 'unsubscribe',
@@ -603,18 +669,21 @@ async function getLatestNewsletterUrl(env: Env): Promise<string | null> {
   return null;
 }
 
-async function sendListmonkWelcome(email: string, env: Env): Promise<{ success: boolean; error?: string }> {
+async function sendListmonkWelcome(email: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; error?: string }> {
   if (!isListmonkConfigured(env) || !env.LISTMONK_WELCOME_TEMPLATE_ID) {
     return { success: false, error: 'Listmonk welcome template not configured' };
   }
   try {
     const templateId = parseInt(env.LISTMONK_WELCOME_TEMPLATE_ID, 10);
-    const latestUrl = await getLatestNewsletterUrl(env);
+    // The R2 listing has no abort signal of its own, so it races the deadline and
+    // degrades to "no link" rather than extending the phase.
+    const latestUrl = await raceDeadline(getLatestNewsletterUrl(env), deadline, null);
     const data: Record<string, string> = {};
     if (latestUrl) data.latest_newsletter_url = latestUrl;
 
     const resp = await callListmonk(env, '/api/tx', {
       method: 'POST',
+      signal: deadline,
       body: JSON.stringify({
         subscriber_email: email,
         template_id: templateId,
@@ -654,7 +723,7 @@ function requireAuth(request: Request, env: Env): boolean {
   return timingSafeEqual(token, expectedToken);
 }
 
-async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Promise<{ success: boolean; error?: string }> {
+async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; error?: string }> {
   if (!env.PLUNK_SECRET_KEY) {
     return { success: false, error: 'PLUNK_SECRET_KEY not configured' };
   }
@@ -683,6 +752,8 @@ async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Prom
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
+  // The caller's budget must apply here too, and stay armed through the body.
+  const signal = combineSignals(controller.signal, deadline);
 
   try {
     const response = await fetch('https://next-api.useplunk.com/v1/send', {
@@ -692,21 +763,135 @@ async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Prom
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(emailPayload),
-      signal: controller.signal,
+      signal,
     });
-    clearTimeout(timeoutId);
     const responseText = await response.text();
     if (!response.ok) return { success: false, error: `Plunk HTTP ${response.status}: ${responseText.slice(0, 200)}` };
     return { success: true };
   } catch (error) {
-    clearTimeout(timeoutId);
     return { success: false, error: `Plunk exception: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
 /* ========================================================================== */
 
+/* Coordinator plumbing ----------------------------------------------------- */
+
+interface IntentResult {
+  outcome: SyncOutcome;
+  created?: boolean;
+  seq?: number;
+  attempts?: number;
+  error?: string;
+  reason?: string;
+}
+
+function isLegacyMode(env: Env): boolean {
+  return (env.COORDINATOR_MODE ?? 'on') === 'legacy';
+}
+
+/** Missing production bindings must never enable an independent writer. */
+function coordinatorFor(env: Env, email: string): DurableObjectStub | null {
+  try {
+    const namespace = env.SUBSCRIPTION_COORDINATOR;
+    if (!namespace) return null;
+    const stub = namespace.get(namespace.idFromName(email.trim().toLowerCase()));
+    return stub && typeof stub.fetch === 'function' ? stub : null;
+  } catch {
+    return null;
+  }
+}
+
+function writesUnavailable(env: Env): boolean {
+  return isLegacyMode(env) || (env.ENVIRONMENT === 'production' && !coordinatorFor(env, 'binding-check'));
+}
+
+function maintenanceResponse(request: Request, env: Env): Response {
+  return jsonResponse({ success: false, error: 'Subscriber writes are temporarily unavailable. Please try again later.' }, 503, request, env);
+}
+
+async function submitIntent(
+  coordinator: DurableObjectStub,
+  desired: 'subscribed' | 'unsubscribed',
+  email: string,
+  clientIP: string,
+  request: Request,
+  authenticated = false,
+): Promise<IntentResult> {
+  try {
+    const response = await coordinator.fetch('https://coordinator/intent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        desired,
+        email,
+        ip: clientIP,
+        userAgent: request.headers.get('User-Agent') || 'unknown',
+        authenticated,
+      }),
+    });
+    if (!response.ok) return { outcome: 'failed', error: `coordinator HTTP ${response.status}` };
+    return await response.json() as IntentResult;
+  } catch (error) {
+    return { outcome: 'failed', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+const TEXT_BLOCKLISTED = 'This address cannot be subscribed. Please contact us.';
+const TEXT_UNSUBSCRIBED = 'This address is unsubscribed. Please contact us to resubscribe.';
+// An unreadable provider establishes nothing about the subscription, so the
+// wording must not claim the address is or is not on the list.
+const TEXT_UNVERIFIED = "We couldn't verify your subscription. Please try again later or contact us.";
+// Accepted but not finished: the intent is durable and retried by an alarm.
+const TEXT_ACCEPTED_SUBSCRIBE = 'We received your request and will finish adding you shortly.';
+const TEXT_ACCEPTED_UNSUBSCRIBE = 'We received your request and will finish removing you shortly. If you keep receiving newsletters, please contact us.';
+
+function subscribeResponse(result: IntentResult, request: Request, env: Env): Response {
+  switch (result.outcome) {
+    case 'completed':
+      return jsonResponse(
+        { success: true, message: result.created ? 'Subscribed successfully' : 'Already subscribed' },
+        200, request, env,
+      );
+    case 'blocklisted':
+      return jsonResponse({ success: false, status: 'blocklisted', error: TEXT_BLOCKLISTED, message: TEXT_BLOCKLISTED }, 200, request, env);
+    case 'unsubscribed':
+      return jsonResponse({ success: false, status: 'unsubscribed', error: TEXT_UNSUBSCRIBED, message: TEXT_UNSUBSCRIBED }, 200, request, env);
+    case 'unverified':
+      return jsonResponse({ success: false, status: 'unverified', error: TEXT_UNVERIFIED, message: TEXT_UNVERIFIED }, 200, request, env);
+    case 'pending':
+    case 'superseded':
+      return jsonResponse({ success: true, status: 'accepted', message: TEXT_ACCEPTED_SUBSCRIBE }, 202, request, env);
+    default:
+      return jsonResponse(
+        { success: false, error: 'We could not complete your request. Please try again later.' },
+        503, request, env,
+      );
+  }
+}
+
+function unsubscribeResponse(result: IntentResult, request: Request, env: Env): Response {
+  switch (result.outcome) {
+    case 'completed':
+      // A provider 2xx is still not proof of final removal, so this keeps the
+      // existing unverified contract rather than claiming success.
+      return jsonResponse({
+        success: false,
+        status: 'unverified',
+        message: 'A response was received, but removal could not be verified. If you receive another newsletter, please contact us.',
+      }, 202, request, env);
+    case 'pending':
+    case 'superseded':
+      return jsonResponse({ success: false, status: 'accepted', message: TEXT_ACCEPTED_UNSUBSCRIBE }, 202, request, env);
+    default:
+      return jsonResponse({ success: false, error: 'Unsubscribe failed; please try again later' }, 502, request, env);
+  }
+}
+
 async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (writesUnavailable(env)) return maintenanceResponse(request, env);
   try {
     // Cheap declared-length rejection before spending rate-limit budget; the
     // streamed body itself is bounded later in readBody.
@@ -735,44 +920,42 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       return jsonResponse({ success: false, error: 'Invalid email address' }, 400, request, env);
     }
 
-    // Idempotency and honesty: a KV record proves this Worker accepted the
-    // address, not that the provider still has it. Ask first, then answer.
-    const existing = await env.NEWSLETTER_SUBSCRIBERS.get(email);
-    if (existing) {
-      const upstream = await lookupListmonkSubscriber(email, env);
-
-      if (upstream === 'confirmed') {
-        return jsonResponse({ success: true, message: 'Already subscribed' }, 200, request, env);
-      }
-
-      // A blocklisted or unsubscribed address expresses the recipient's own
-      // decision, which this Worker must not overwrite; and an unverified read
-      // is not permission to try either.
-      if (upstream === 'blocklisted' || upstream === 'unsubscribed' || upstream === 'unverified' || upstream === 'pending') {
-        const status = upstream === 'pending' ? 'unverified' : upstream;
-        // The browser reads `error`, not `message`, so both carry the wording.
-        // `message` is kept for anything that already reads it.
-        const text = upstream === 'blocklisted'
-          ? 'This address cannot be subscribed. Please contact us.'
-          : upstream === 'unsubscribed'
-            ? 'This address is unsubscribed. Please contact us to resubscribe.'
-            // An unreadable provider establishes nothing about the subscription,
-            // so say only that the check failed.
-            : "We couldn't verify your subscription. Please try again later or contact us.";
-        return jsonResponse({ success: false, status, error: text, message: text }, 200, request, env);
-      }
-
-      // Absent upstream: the address exists only in KV, which is exactly the
-      // state a failed background write leaves behind. Re-adding it is the
-      // recovery channel, so keep it.
-      const record = await readRecord(email, env);
-      const seq = record?.seq ?? 0;
-      ctx.waitUntil(reconcileSignup(email, seq, clientIP, env, { welcome: false }));
-      return jsonResponse({ success: true, message: 'Subscribed successfully' }, 200, request, env);
+    // The coordinator is the production path: one serialized object per address,
+    // so this request cannot interleave with a concurrent unsubscribe.
+    const coordinator = coordinatorFor(env, email);
+    if (!coordinator && env.ENVIRONMENT === 'production') return maintenanceResponse(request, env);
+    if (coordinator) {
+      const result = await submitIntent(coordinator, 'subscribed', email, clientIP, request, requireAuth(request, env));
+      return subscribeResponse(result, request, env);
     }
 
-    // KV is written first; background Listmonk registration remains subject to
-    // an ordering race with unsubscribe (audit item 35).
+    // Fallback for environments without the binding (unit tests, local runs
+    // without migrations). Behaviour matches the pre-coordinator code, including
+    // its inability to serialize concurrent requests; the runtime suite covers
+    // the bound path.
+    const existing = await env.NEWSLETTER_SUBSCRIBERS.get(email);
+    if (existing) {
+      const { state: upstream } = await lookupListmonkSubscriber(email, env);
+      // Map the lookup's vocabulary onto the coordinator's outcome vocabulary.
+      const outcome: SyncOutcome = upstream === 'confirmed'
+        ? 'completed'
+        : upstream === 'pending'
+          ? 'unverified'
+          : upstream === 'absent'
+            ? 'pending'
+            : upstream;
+
+      // Absent upstream is the state a failed background write leaves behind. This
+      // path must schedule its own recovery: the coordinator may be unreachable,
+      // which is the reason it is being used.
+      if (upstream === 'absent') {
+        const record = await readRecord(email, env);
+        ctx.waitUntil(reconcileSignup(email, record?.seq ?? 0, clientIP, env, { welcome: false }));
+        return subscribeResponse({ outcome: 'pending', created: false }, request, env);
+      }
+      return subscribeResponse({ outcome, created: false }, request, env);
+    }
+
     const record: SubscriptionRecord = {
       timestamp: new Date().toISOString(),
       ip: clientIP,
@@ -780,16 +963,15 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       seq: Date.now(),
     };
     await env.NEWSLETTER_SUBSCRIBERS.put(email, JSON.stringify(record));
-
     ctx.waitUntil(reconcileSignup(email, record.seq, clientIP, env, { welcome: true }));
-
-    return jsonResponse({ success: true, message: 'Subscribed successfully' }, 200, request, env);
+    return subscribeResponse({ outcome: 'completed', created: true }, request, env);
   } catch {
     return jsonResponse({ success: false, error: 'Internal server error' }, 500, request, env);
   }
 }
 
 async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (writesUnavailable(env)) return maintenanceResponse(request, env);
   try {
     const parsed = await readBody(request, MAX_UNSUBSCRIBE_REQUEST_SIZE);
     if (!parsed.ok) {
@@ -809,27 +991,25 @@ async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionConte
     if (!operatorAuthed && !tokenValid) {
       return jsonResponse({ success: false, error: 'Invalid or missing unsubscribe token' }, 403, request, env);
     }
+    // The coordinator records the unsubscribe as a durable intent, so a signup
+    // already in flight cannot quietly restore the subscription afterwards.
+    const coordinator = coordinatorFor(env, email);
+    if (!coordinator && env.ENVIRONMENT === 'production') return maintenanceResponse(request, env);
+    if (coordinator) {
+      const result = await submitIntent(coordinator, 'unsubscribed', email, getClientIP(request), request, true);
+      return unsubscribeResponse(result, request, env);
+    }
+
     if (!isListmonkConfigured(env)) {
       return jsonResponse({ success: false, error: 'Unsubscribe unavailable; please try again later' }, 502, request, env);
     }
 
-    // Remove the KV entry first. This is not a durable intent tombstone and
-    // cannot resolve the in-flight signup ordering race.
     await env.NEWSLETTER_SUBSCRIBERS.delete(email);
-
-    // Await the provider response, but do not treat a 2xx as proof of final
-    // removal: the provider contract and concurrent signup ordering are not
-    // verified. A failed/ambiguous request is not durably retried here.
     const result = await unsubscribeFromListmonk(email, env);
     if (!result.success) {
       return jsonResponse({ success: false, error: 'Unsubscribe failed; please try again later' }, 502, request, env);
     }
-
-    return jsonResponse({
-      success: false,
-      status: 'unverified',
-      message: 'A response was received, but removal could not be verified. If you receive another newsletter, please contact us.',
-    }, 202, request, env);
+    return unsubscribeResponse({ outcome: 'completed' }, request, env);
   } catch {
     return jsonResponse({ success: false, error: 'Internal server error' }, 500, request, env);
   }
@@ -1023,6 +1203,386 @@ async function fetchLinkedInFollowers(env: Env, ctx: ExecutionContext): Promise<
   return counts.reduce((sum, n) => sum + n, 0);
 }
 
+/* ========================================================================== */
+// Durable subscription coordinator
+//
+// Ties a subscribe and a later unsubscribe for the same address to one serialized
+// object, so the two cannot interleave. The object holds the address's intent,
+// the pending provider operation and its retry state; KV stays a read shadow but
+// is no longer the authority on what was asked for.
+//
+// What this does and does not guarantee:
+//   * It serializes this Worker's own writes per address. Two requests can no
+//     longer race each other, which is what let both report success while the
+//     stores disagreed.
+//   * It cannot recall a provider request already in flight. That is why intent
+//     is re-read after each provider call: if it changed, the result is reported
+//     as superseded and the newer intent has its own handler.
+//   * It cannot stop a native Listmonk unsubscribe, which is an independent
+//     writer. Those are observed through the lookup and never overwritten.
+//   * Retries survive eviction because they live in storage plus an alarm.
+
+const INTENT_KEY = 'intent';
+const PENDING_KEY = 'pending';
+const WELCOME_KEY = 'welcome-seq';
+// Total attempts, including the initial request; at most seven scheduled retries.
+const MAX_SYNC_ATTEMPTS = 8;
+// The whole provider phase must finish well inside the 30-second limit after which
+// a Durable Object is reset for holding blockConcurrencyWhile too long. Individual
+// 10-second fetch timers do not bound the sequence, so one budget covers it all.
+const DEFAULT_PROVIDER_BUDGET_MS = 20000;
+const MIN_PROVIDER_BUDGET_MS = 1000;
+const MAX_PROVIDER_BUDGET_MS = 25000;
+
+function providerBudgetMs(env: Env): number {
+  const configured = Number(env.PROVIDER_BUDGET_MS);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_PROVIDER_BUDGET_MS;
+  return Math.min(Math.max(configured, MIN_PROVIDER_BUDGET_MS), MAX_PROVIDER_BUDGET_MS);
+}
+
+// One minute, backing off to an hour, bounded so a permanently broken provider
+// does not spin.
+function retryDelayMs(attempts: number): number {
+  return Math.min(60_000 * Math.pow(4, Math.max(0, attempts - 1)), 60 * 60_000);
+}
+
+interface CoordinatorIntent {
+  email: string;
+  desired: 'subscribed' | 'unsubscribed';
+  seq: number;
+  updatedAt: string;
+  /** Caller metadata, kept here so a retry can repair the shadow correctly. */
+  ip?: string;
+  userAgent?: string;
+  /** Whether the caller proved control of the address. */
+  authenticated?: boolean;
+}
+
+interface CoordinatorPending {
+  kind: 'create' | 'remove' | 'shadow';
+  seq: number;
+  attempts: number;
+  lastError: string | null;
+  nextAt: number;
+}
+
+type SyncOutcome = 'completed' | 'unverified' | 'unsubscribed' | 'blocklisted' | 'pending' | 'failed' | 'superseded';
+
+interface SyncResult {
+  outcome: SyncOutcome;
+  created?: boolean;
+  error?: string;
+  reason?: string;
+  attempts?: number;
+  /** False when retrying cannot help: configuration, credentials, a decision. */
+  retryable?: boolean;
+}
+
+/**
+ * A lookup failure that retrying could plausibly fix. Shape and contract
+ * mismatches count, because provider replication lag looks exactly like an
+ * inconsistent payload; they are bounded by the attempt budget either way.
+ * Definitive answers (blocklisted, unsubscribed, confirmed) never reach here.
+ */
+function isRetryableLookupReason(reason: string): boolean {
+  if (reason === 'not_configured') return false;
+  if (/^http_4(0[1-3]|04)$/.test(reason)) return false;
+  return true;
+}
+
+export class SubscriptionCoordinator {
+  private state: DurableObjectState;
+  private env: Env;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    try {
+      if (url.pathname === '/intent' && request.method === 'POST') {
+        if (isLegacyMode(this.env)) return new Response('maintenance', { status: 503 });
+        const body = await request.json() as {
+          desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
+          authenticated?: boolean;
+        };
+        return Response.json(await this.runExclusive(() => this.setIntent(body)));
+      }
+      if (url.pathname === '/sync' && request.method === 'POST') {
+        return Response.json(await this.runExclusive(() => this.sync()));
+      }
+      if (url.pathname === '/state') {
+        return Response.json({
+          intent: (await this.state.storage.get(INTENT_KEY)) ?? null,
+          pending: (await this.state.storage.get(PENDING_KEY)) ?? null,
+          alarm: await this.state.storage.getAlarm(),
+        });
+      }
+      return new Response('not found', { status: 404 });
+    } catch (error) {
+      return Response.json(
+        { outcome: 'failed', error: error instanceof Error ? error.message : String(error) },
+        { status: 500 },
+      );
+    }
+  }
+
+  /** Retries whatever the last intent left unfinished. */
+  async alarm(): Promise<void> {
+    await this.runExclusive(async () => {
+      const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
+      if (!pending) return;
+      if (isLegacyMode(this.env)) {
+        await this.state.storage.setAlarm(Date.now() + 60_000);
+        return;
+      }
+      const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
+      if (!intent || intent.seq !== pending.seq) {
+        await this.state.storage.delete(PENDING_KEY);
+        return;
+      }
+      await this.sync();
+    });
+  }
+
+  /**
+   * Runs `work` with no other event delivered concurrently.
+   *
+   * A Durable Object is single-threaded but NOT serialized across `await`s: two
+   * requests interleave freely while one is waiting on an external fetch. Without
+   * this, a create and a later remove can be in flight at the same time and the
+   * provider commits them in either order — which is the exact failure this
+   * coordinator exists to prevent. `blockConcurrencyWhile` holds other events
+   * until the promise settles, so provider effects are ordered per address.
+   */
+  private async runExclusive<T>(work: () => Promise<T>): Promise<T> {
+    let result!: T;
+    await this.state.blockConcurrencyWhile(async () => {
+      result = await work();
+    });
+    return result;
+  }
+
+  /**
+   * Records what the caller asked for, then converges the provider.
+   *
+   * The intent and a pending operation are written *before* any external I/O, and
+   * the alarm is armed then too. That ordering is what makes a crash or a failed
+   * KV write recoverable: there is never a moment where durable state says one
+   * thing and nothing is scheduled to act on it.
+   */
+  private async setIntent(input: {
+    desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
+    authenticated?: boolean;
+  }): Promise<SyncResult & { seq: number; desired: string }> {
+    const email = input.email.trim().toLowerCase();
+    const previous = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
+    const seq = (previous?.seq ?? 0) + 1;
+    const recordedAtMs = Date.now();
+    const intent: CoordinatorIntent = {
+      email,
+      desired: input.desired,
+      seq,
+      updatedAt: new Date(recordedAtMs).toISOString(),
+      ip: input.ip,
+      userAgent: input.userAgent,
+      authenticated: input.authenticated,
+    };
+
+    // The unsubscribe intent is a durable recipient tombstone, independent of
+    // pending work: exhaustion or completion must not permit anonymous signup
+    // to restore mail. Proof of control only clears this guard; provider lookup
+    // policy still governs whether an authenticated signup may proceed.
+    if (input.desired === 'subscribed' && previous?.desired === 'unsubscribed' && !input.authenticated) {
+      return { outcome: 'unsubscribed', seq: previous!.seq, desired: 'unsubscribed' };
+    }
+
+    await this.state.storage.put(INTENT_KEY, intent);
+    await this.state.storage.put<CoordinatorPending>(PENDING_KEY, {
+      kind: input.desired === 'subscribed' ? 'create' : 'remove',
+      seq,
+      attempts: 0,
+      lastError: null,
+      nextAt: Date.now(),
+    });
+    await this.state.storage.setAlarm(Date.now());
+    const result = await this.sync();
+    return { ...result, seq, desired: intent.desired };
+  }
+
+  /** Converges only this object's authoritative intent; maintenance pauses it. */
+  private async sync(): Promise<SyncResult> {
+    if (isLegacyMode(this.env)) {
+      const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
+      if (pending) await this.state.storage.setAlarm(Date.now() + 60_000);
+      return { outcome: 'pending' };
+    }
+    const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
+    if (!intent) return { outcome: 'failed', error: 'no intent recorded', retryable: false };
+
+    // A removal must not mutate the shadow before it is known to be performable:
+    // otherwise a missing provider configuration leaves KV without the record and
+    // Listmonk still mailing them.
+    if (intent.desired === 'unsubscribed' && !isListmonkConfigured(this.env)) {
+      // Including the first attempt: deleting the shadow first would leave KV
+      // without the record while Listmonk still mails them.
+      return await this.scheduleRetry(intent, { outcome: 'failed', error: 'Listmonk not configured', retryable: false }, 'remove');
+    }
+
+    // The shadow is repaired on every attempt, not only the first. Otherwise a
+    // failed shadow write is never retried and the two stores drift permanently.
+    const shadow = await this.applyShadow(intent);
+    if (!shadow.ok) {
+      return await this.scheduleRetry(intent, { outcome: 'failed', error: shadow.error, retryable: true }, 'shadow');
+    }
+
+    // One deadline covers lookup, create, welcome and fallback, so the exclusive
+    // section cannot outlive the runtime's patience.
+    const controller = new AbortController();
+    const budget = setTimeout(() => controller.abort(), providerBudgetMs(this.env));
+    let result: SyncResult;
+    try {
+      result = intent.desired === 'subscribed'
+        ? await this.syncSubscribed(intent, controller.signal)
+        : await this.syncUnsubscribed(intent, controller.signal);
+    } finally {
+      clearTimeout(budget);
+    }
+
+    // Fence after the provider call, for the case where an intent somehow changed
+    // beneath us. Under `runExclusive` this should not happen, which is why the
+    // compensation below is defensive rather than the primary mechanism.
+    const current = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
+    if (!current || current.seq !== intent.seq) {
+      if (result.outcome === 'completed' && result.created && intent.desired === 'subscribed') {
+        // A create committed for an address that has since asked to leave: undo it.
+        const removed = await unsubscribeFromListmonk(intent.email, this.env);
+        console.warn(`coordinator compensated a stale create for ${redactEmail(intent.email)}: ${removed.success ? 'removed' : 'removal failed'}`);
+      }
+      return { ...result, outcome: 'superseded', retryable: false };
+    }
+
+    if (result.outcome === 'completed') {
+      await this.state.storage.delete(PENDING_KEY);
+      await this.state.storage.deleteAlarm();
+      return result;
+    }
+    if (result.outcome === 'unsubscribed' || result.outcome === 'blocklisted') {
+      // A decision by the recipient, not a failure.
+      await this.state.storage.delete(PENDING_KEY);
+      await this.state.storage.deleteAlarm();
+      return result;
+    }
+    return await this.scheduleRetry(intent, result, intent.desired === 'subscribed' ? 'create' : 'remove');
+  }
+
+  private async applyShadow(intent: CoordinatorIntent): Promise<{ ok: boolean; error?: string }> {
+    try {
+      if (intent.desired === 'subscribed') {
+        await this.env.NEWSLETTER_SUBSCRIBERS.put(intent.email, JSON.stringify({
+          timestamp: intent.updatedAt,
+          ip: intent.ip ?? 'unknown',
+          userAgent: intent.userAgent ?? 'unknown',
+          seq: Date.now(),
+        }));
+      } else {
+        await this.env.NEWSLETTER_SUBSCRIBERS.delete(intent.email);
+      }
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  private async syncSubscribed(intent: CoordinatorIntent, deadline: AbortSignal): Promise<SyncResult> {
+    const { state: upstream, reason } = await lookupListmonkSubscriber(intent.email, this.env, deadline);
+
+    if (upstream === 'confirmed') return { outcome: 'completed', created: false };
+    // Both are the recipient's decision, taken elsewhere. Never overwrite them.
+    if (upstream === 'blocklisted') return { outcome: 'blocklisted' };
+    if (upstream === 'unsubscribed') return { outcome: 'unsubscribed' };
+    if (upstream === 'pending') return { outcome: 'unverified', reason, retryable: false };
+    if (upstream === 'unverified') {
+      // A transient failure keeps its retry budget; a definitive one does not.
+      return { outcome: 'unverified', reason, retryable: isRetryableLookupReason(reason) };
+    }
+
+    const created = await createListmonkSubscriber(intent.email, 'coordinator', this.env, deadline);
+    if (!created.success) return { outcome: 'failed', error: created.error ?? 'create failed', retryable: true };
+
+    // Fence before any mail is sent: a welcome for an intent that has already been
+    // superseded is a message the recipient did not ask for.
+    const current = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
+    if (!current || current.seq !== intent.seq || current.desired !== 'subscribed') {
+      return { outcome: 'superseded', retryable: false };
+    }
+
+    if (!created.duplicate) {
+      const welcomed = await this.state.storage.get<number>(WELCOME_KEY);
+      if (welcomed !== intent.seq) {
+        await this.state.storage.put(WELCOME_KEY, intent.seq);
+        const sent = await sendListmonkWelcome(intent.email, this.env, deadline);
+        if (!sent.success) {
+          console.error(`Listmonk welcome send failed for ${redactEmail(intent.email)}: ${sent.error} — using Plunk fallback`);
+          await sendFallbackWelcome(intent.email, this.env, deadline);
+        }
+      }
+    }
+    return { outcome: 'completed', created: !created.duplicate };
+  }
+
+  private async syncUnsubscribed(intent: CoordinatorIntent, deadline: AbortSignal): Promise<SyncResult> {
+    if (!isListmonkConfigured(this.env)) {
+      return { outcome: 'failed', error: 'Listmonk not configured', retryable: false };
+    }
+    const result = await unsubscribeFromListmonk(intent.email, this.env, deadline);
+    if (!result.success) return { outcome: 'failed', error: result.error ?? 'unsubscribe failed', retryable: true };
+    return { outcome: 'completed' };
+  }
+
+  /** Persists the failure and arms an alarm. Retries survive eviction. */
+  private async scheduleRetry(
+    intent: CoordinatorIntent,
+    result: SyncResult,
+    kind: 'create' | 'remove' | 'shadow',
+  ): Promise<SyncResult> {
+    if (result.retryable === false) {
+      // Terminal: keep the reason, drop the work, do not wake up again.
+      await this.state.storage.delete(PENDING_KEY);
+      await this.state.storage.deleteAlarm();
+      return result;
+    }
+
+    const existing = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
+    const attempts = (existing?.attempts ?? 0) + 1;
+
+    if (attempts >= MAX_SYNC_ATTEMPTS) {
+      console.error(`coordinator gave up after ${MAX_SYNC_ATTEMPTS} attempts for ${redactEmail(intent.email)}: ${result.error ?? result.reason ?? 'unknown'}`);
+      await this.state.storage.delete(PENDING_KEY);
+      await this.state.storage.deleteAlarm();
+      return { outcome: 'failed', error: result.error ?? result.reason ?? 'retries exhausted', attempts, retryable: false };
+    }
+
+    const nextAt = Date.now() + retryDelayMs(attempts);
+    const pending: CoordinatorPending = {
+      kind,
+      seq: intent.seq,
+      attempts,
+      lastError: result.error ?? result.reason ?? null,
+      nextAt,
+    };
+    await this.state.storage.put(PENDING_KEY, pending);
+    await this.state.storage.setAlarm(nextAt);
+
+    console.warn(`coordinator scheduled retry ${attempts}/${MAX_SYNC_ATTEMPTS} (${kind}) for ${redactEmail(intent.email)}: ${pending.lastError}`);
+    return { outcome: 'pending', attempts, error: pending.lastError ?? undefined };
+  }
+}
+
+/* ========================================================================== */
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -1090,6 +1650,7 @@ export default {
             const result = await env.NEWSLETTER_SUBSCRIBERS.list({ cursor, limit: 1000 });
             count += result.keys.filter(key =>
               !key.name.startsWith('rate_limit:') && !key.name.startsWith('cache:')
+              && !key.name.startsWith('intent:')
             ).length;
             cursor = result.list_complete ? undefined : result.cursor;
           } while (cursor);

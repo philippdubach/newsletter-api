@@ -19,16 +19,33 @@ id = "dev-local-only-placeholder"
 binding = "R2_BUCKET"
 bucket_name = "newsletter-dev-local"
 
+# The coordinator is one serialized object per address, so a subscribe and a
+# later unsubscribe cannot interleave. Local simulation only; the production
+# binding is declared under [env.production] below.
+[durable_objects]
+bindings = [
+  { name = "SUBSCRIPTION_COORDINATOR", class_name = "SubscriptionCoordinator" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SubscriptionCoordinator"]
+
 # Development has no Listmonk or Plunk configuration on purpose: a development
 # Worker must not email real subscribers. Supply local values through
 # `.dev.vars` when testing that path.
 [vars]
 ENVIRONMENT = "development"
+COORDINATOR_MODE = "on"
 ALLOWED_ORIGIN = "http://localhost:1313,http://localhost:3000"
 
 # Production environment
 [env.production]
 name = "newsletter-api"
+
+[[env.production.durable_objects.bindings]]
+name = "SUBSCRIPTION_COORDINATOR"
+class_name = "SubscriptionCoordinator"
 
 # Production KV namespace binding
 [[env.production.kv_namespaces]]
@@ -45,6 +62,12 @@ jurisdiction = "eu"
 [env.production.vars]
 ALLOWED_ORIGIN = "https://philippdubach.com,https://www.philippdubach.com,https://phil-dubach.com"
 ENVIRONMENT = "production"
+# Rollback lever: deploying this same code with "legacy" keeps the Durable Object
+# class and pending operations, but pauses subscriber writes and retries.
+COORDINATOR_MODE = "on"
+# Overall budget for one provider phase, well under the 30-second Durable Object
+# reset threshold that applies while blockConcurrencyWhile is held.
+PROVIDER_BUDGET_MS = "20000"
 LINKEDIN_NEWSLETTER_URLS = "https://www.linkedin.com/pulse/ai-lab-60b-cursor-25b-anthropic-chinese-open-weight-triple-dubach-ltbae"
 LISTMONK_API_URL = "https://mail.philippdubach.com"
 LISTMONK_LIST_ID = "3"
