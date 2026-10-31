@@ -20,6 +20,7 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 
 import { TEST_BINDINGS, startRuntime } from './harness.mjs';
+import { supersessionDecision } from '../src/index.ts';
 
 const LIST_URL = 'https://listmonk.runtime-suite.invalid';
 const HMAC_SECRET = TEST_BINDINGS.UNSUBSCRIBE_HMAC_SECRET;
@@ -899,27 +900,280 @@ describe('the provider phase is bounded as a whole', () => {
   });
 });
 
-describe('the shadow fences work that contradicts it', () => {
-  it('refuses to act on stored intent the shadow contradicts', async () => {
-    const email = 'invariant-shadow-fence@example.com';
+describe('an unfinished shadow write does not discard work', () => {
+  it('runs an unsubscribe retry even though the old KV record is still present', async () => {
+    const email = 'invariant-shadow-retry@example.com';
     const store = createProviderStub();
     const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
     try {
+      // An active subscriber: KV record present, provider active.
+      const seeded = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.260' },
+        body: JSON.stringify({ email }),
+      });
+      await seeded.json();
+      await local.drain();
+      assert.equal(store.membership.get(email), true);
+
       const stub = await local.coordinator(email);
-      // Publishes intent without writing the shadow, which is what a legacy request
-      // whose coordinator call failed leaves behind.
+      // Emulate intent recorded while the shadow delete has not happened yet: the
+      // precise state left by a transient KV failure.
       await stub.fetch('https://coordinator/intent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ desired: 'subscribed', email, recordOnly: true }),
+        body: JSON.stringify({ desired: 'unsubscribed', email, recordOnly: true }),
       });
 
       const sync = await (await stub.fetch('https://coordinator/sync', { method: 'POST' })).json();
 
-      // The shadow says this address is not subscribed, so recreating it would
-      // undo whatever removed it.
-      assert.equal(sync.outcome, 'superseded');
-      assert.equal(store.membership.get(email), undefined, 'the provider must not be touched');
+      // The retry must complete, not treat its own unfinished shadow write as a
+      // newer intent.
+      assert.equal(sync.outcome, 'completed');
+      assert.equal(store.membership.get(email), false, 'the removal must actually run');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('supersession is explicit, never inferred from KV state', () => {
+  it('only supersedes when a fence is newer than the intent', () => {
+    const intent = { recordedAtMs: 1_000 };
+    assert.equal(supersessionDecision(intent, null, false), 'run');
+    assert.equal(supersessionDecision(intent, { desired: 'unsubscribed', at: 999 }, false), 'run');
+    assert.equal(supersessionDecision(intent, { desired: 'unsubscribed', at: 1_000 }, false), 'run');
+    assert.equal(supersessionDecision(intent, { desired: 'unsubscribed', at: 1_001 }, false), 'supersede');
+  });
+
+  it('never supersedes on an unreadable or malformed fence', () => {
+    const intent = { recordedAtMs: 1_000 };
+    // A read failure proves nothing, so accepted work must survive it.
+    assert.equal(supersessionDecision(intent, { desired: 'unsubscribed', at: 5_000 }, true), 'run');
+    assert.equal(supersessionDecision(intent, null, true), 'run');
+    assert.equal(supersessionDecision(intent, { desired: 'unsubscribed' }, false), 'run');
+  });
+});
+
+describe('legacy work cannot undo a newer intent', () => {
+  it('does not let a stale durable create override an unsubscribe served inline', async () => {
+    const email = 'invariant-legacy-undo@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    let creating = false;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/subscribers' && request.method === 'POST') {
+        if (creating) return new Response('{"error":"boom"}', { status: 500 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      creating = true;
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.250' },
+        body: JSON.stringify({ email }),
+      });
+      await signup.json();
+      await local.drain();
+
+      const stub = await local.coordinator(email);
+      let state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.ok(state.pending, 'the failed create must be pending');
+
+      // The coordinator is now unavailable for provider work (legacy rollback). An
+      // unsubscribe is served inline: the provider is changed directly and the
+      // intent is published to the object without doing provider work.
+      creating = false;
+      await base(new Request(`https://mail.philippdubach.com/api/subscribers/query/lists`, {
+        method: 'PUT',
+        body: JSON.stringify({ query: `subscribers.email = '${email}'`, action: 'unsubscribe', target_list_ids: [3] }),
+      }));
+      assert.equal(store.membership.get(email), false);
+      await stub.fetch('https://coordinator/intent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ desired: 'unsubscribed', email, recordOnly: true }),
+      });
+
+      // The old pending job must not resurrect the subscription.
+      await stub.fetch('https://coordinator/sync', { method: 'POST' });
+      await local.drain();
+
+      state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(store.membership.get(email), false, 'stale work must not re-subscribe');
+      assert.equal(state.intent.desired, 'unsubscribed');
+      assert.equal(state.pending, null);
+      assert.ok(!store.events.slice(store.events.indexOf('remove-commit')).includes('create-commit'),
+        `unexpected events ${store.events.join(' > ')}`);
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('the provider phase is bounded as a whole', () => {
+  it('gives up on a slow sequence inside the budget, not at the 30-second reset', async () => {
+    const email = 'invariant-stall@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    const slow = () => new Promise((resolve) => setTimeout(resolve, 6000));
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      // Each call is inside its own 10-second timer, so only a combined budget
+      // bounds the sequence: lookup, create and welcome together.
+      if (url.pathname === '/api/subscribers' || url.pathname === '/api/tx') await slow();
+      return base(request);
+    };
+
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, PROVIDER_BUDGET_MS: '2000' },
+      outboundService: store.handler,
+    });
+    try {
+      const started = Date.now();
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.251' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json();
+      await local.drain();
+      const elapsed = Date.now() - started;
+
+      assert.ok(elapsed < 8000, `took ${elapsed}ms, which means the sequence outlived the budget`);
+      assert.equal(body.status, 'accepted');
+
+      const stub = await local.coordinator(email);
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+      // The boundary the reset made observable: durable state survives and agrees.
+      assert.equal(state.intent.desired, 'subscribed');
+      assert.ok(state.pending, 'an over-budget sequence must leave recoverable work');
+      assert.ok(state.alarm, 'the recovery must remain scheduled');
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it('bounds a provider body that never finishes', async () => {
+    const email = 'invariant-stall-body@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/subscribers' && request.method === 'GET') {
+        // Headers arrive, the body never completes. This is the read the lookup
+        // actually performs, unlike the create path which never reads a 200 body.
+        return new Response(new ReadableStream({ start() {} }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, PROVIDER_BUDGET_MS: '1500' },
+      outboundService: store.handler,
+    });
+    try {
+      const started = Date.now();
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.252' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json();
+      await local.drain();
+      const elapsed = Date.now() - started;
+
+      // The budget, not the 10-second per-call timer, has to bound this.
+      assert.ok(elapsed < 6000, `took ${elapsed}ms`);
+      assert.equal(body.status, 'accepted');
+      const stub = await local.coordinator(email);
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.ok(state.pending);
+      assert.ok(state.alarm);
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('the deadline reaches welcome and fallback', () => {
+  it('bounds a slow welcome, not just lookup and create', async () => {
+    const email = 'invariant-slow-welcome@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      // Lookup and create are fast, so the budget is only consumed by the welcome.
+      if (url.pathname === '/api/tx') {
+        await new Promise((resolve) => setTimeout(resolve, 6000));
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, PROVIDER_BUDGET_MS: '1500' },
+      outboundService: store.handler,
+    });
+    try {
+      const started = Date.now();
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.270' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json();
+      await local.drain();
+      const elapsed = Date.now() - started;
+
+      // Previously ~3.5 s because the welcome ignored the caller's deadline.
+      assert.ok(elapsed < 3000, `took ${elapsed}ms, so the welcome ignored the budget`);
+      // The subscription itself completed; what was cut short is the welcome.
+      assert.ok([200, 202].includes(response.status), `unexpected status ${response.status}`);
+      assert.equal(body.success, true);
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it('bounds a slow Plunk fallback when the welcome fails', async () => {
+    const email = 'invariant-slow-fallback@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/tx') return new Response('{"error":"boom"}', { status: 500 });
+      if (url.host === 'next-api.useplunk.com') {
+        await new Promise((resolve) => setTimeout(resolve, 6000));
+        return new Response('{}', { status: 200 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, PLUNK_SECRET_KEY: 'runtime-suite-plunk', PROVIDER_BUDGET_MS: '1500' },
+      outboundService: store.handler,
+    });
+    try {
+      const started = Date.now();
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.271' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json();
+      await local.drain();
+      const elapsed = Date.now() - started;
+
+      assert.ok(elapsed < 3500, `took ${elapsed}ms, so the fallback ignored the budget`);
+      assert.ok([200, 202].includes(response.status), `unexpected status ${response.status}`);
+      assert.equal(body.success, true);
     } finally {
       await local.dispose();
     }

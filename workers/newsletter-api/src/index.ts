@@ -359,7 +359,7 @@ export async function reconcileSignup(
 }
 
 async function sendFallbackWelcome(email: string, env: Env, deadline?: AbortSignal): Promise<void> {
-  const fallback = await sendPlunkWelcomeFallback(email, env);
+  const fallback = await sendPlunkWelcomeFallback(email, env, deadline);
   if (!fallback.success) {
     console.error(`Plunk fallback also failed for ${redactEmail(email)}: ${fallback.error}`);
   }
@@ -420,6 +420,24 @@ function combineSignals(own: AbortSignal, external?: AbortSignal | null): AbortS
   own.addEventListener('abort', abort, { once: true });
   external.addEventListener('abort', abort, { once: true });
   return controller.signal;
+}
+
+/**
+ * Resolves with `fallback` if the deadline fires first. Used for work that cannot
+ * take an AbortSignal itself, so it cannot extend a budgeted phase.
+ */
+function raceDeadline<T>(work: Promise<T>, deadline: AbortSignal | undefined, fallback: T): Promise<T> {
+  if (!deadline) return work;
+  if (deadline.aborted) return Promise.resolve(fallback);
+  return new Promise<T>((resolve) => {
+    const finish = (value: T) => {
+      deadline.removeEventListener('abort', onAbort);
+      resolve(value);
+    };
+    const onAbort = () => resolve(fallback);
+    deadline.addEventListener('abort', onAbort, { once: true });
+    work.then(finish).catch(() => finish(fallback));
+  });
 }
 
 function isListmonkConfigured(env: Env): boolean {
@@ -658,12 +676,15 @@ async function sendListmonkWelcome(email: string, env: Env, deadline?: AbortSign
   }
   try {
     const templateId = parseInt(env.LISTMONK_WELCOME_TEMPLATE_ID, 10);
-    const latestUrl = await getLatestNewsletterUrl(env);
+    // The R2 listing has no abort signal of its own, so it races the deadline and
+    // degrades to "no link" rather than extending the phase.
+    const latestUrl = await raceDeadline(getLatestNewsletterUrl(env), deadline, null);
     const data: Record<string, string> = {};
     if (latestUrl) data.latest_newsletter_url = latestUrl;
 
     const resp = await callListmonk(env, '/api/tx', {
       method: 'POST',
+      signal: deadline,
       body: JSON.stringify({
         subscriber_email: email,
         template_id: templateId,
@@ -703,7 +724,7 @@ function requireAuth(request: Request, env: Env): boolean {
   return timingSafeEqual(token, expectedToken);
 }
 
-async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Promise<{ success: boolean; error?: string }> {
+async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; error?: string }> {
   if (!env.PLUNK_SECRET_KEY) {
     return { success: false, error: 'PLUNK_SECRET_KEY not configured' };
   }
@@ -732,6 +753,8 @@ async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Prom
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
+  // The caller's budget must apply here too, and stay armed through the body.
+  const signal = combineSignals(controller.signal, deadline);
 
   try {
     const response = await fetch('https://next-api.useplunk.com/v1/send', {
@@ -741,15 +764,15 @@ async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env): Prom
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(emailPayload),
-      signal: controller.signal,
+      signal,
     });
-    clearTimeout(timeoutId);
     const responseText = await response.text();
     if (!response.ok) return { success: false, error: `Plunk HTTP ${response.status}: ${responseText.slice(0, 200)}` };
     return { success: true };
   } catch (error) {
-    clearTimeout(timeoutId);
     return { success: false, error: `Plunk exception: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -778,6 +801,27 @@ function coordinatorStubFor(env: Env, email: string): DurableObjectStub | null {
     return namespace.get(namespace.idFromName(email.trim().toLowerCase()));
   } catch {
     return null;
+  }
+}
+
+/**
+ * Records a fence for a request that will change intent without this object
+ * performing the work. Written before the provider call so a crash still leaves
+ * evidence, and read by a retry to decide whether its own work is stale.
+ */
+async function publishFence(
+  env: Env,
+  email: string,
+  desired: 'subscribed' | 'unsubscribed',
+): Promise<void> {
+  try {
+    await env.NEWSLETTER_SUBSCRIBERS.put(
+      fenceKey(email),
+      JSON.stringify({ desired, at: Date.now() } satisfies IntentFence),
+      { expirationTtl: 86400 },
+    );
+  } catch {
+    // Best effort: the intent publish below is the primary channel.
   }
 }
 
@@ -940,7 +984,10 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       return subscribeResponse(result, request, env);
     }
 
-    if (isLegacyMode(env)) await publishIntent(coordinatorStubFor(env, email), 'subscribed', email, clientIP, request);
+    if (isLegacyMode(env)) {
+      await publishFence(env, email, 'subscribed');
+      await publishIntent(coordinatorStubFor(env, email), 'subscribed', email, clientIP, request);
+    }
 
     // Fallback for environments without the binding (unit tests, local runs
     // without migrations). Behaviour matches the pre-coordinator code, including
@@ -1005,7 +1052,10 @@ async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionConte
       return unsubscribeResponse(result, request, env);
     }
 
-    if (isLegacyMode(env)) await publishIntent(coordinatorStubFor(env, email), 'unsubscribed', email, getClientIP(request), request);
+    if (isLegacyMode(env)) {
+      await publishFence(env, email, 'unsubscribed');
+      await publishIntent(coordinatorStubFor(env, email), 'unsubscribed', email, getClientIP(request), request);
+    }
 
     if (!isListmonkConfigured(env)) {
       return jsonResponse({ success: false, error: 'Unsubscribe unavailable; please try again later' }, 502, request, env);
@@ -1257,6 +1307,40 @@ interface CoordinatorIntent {
   desired: 'subscribed' | 'unsubscribed';
   seq: number;
   updatedAt: string;
+  /** Milliseconds, used only to order this intent against a legacy fence. */
+  recordedAtMs: number;
+}
+
+/**
+ * Written by a request that changed intent without reaching this object: the
+ * legacy path, or a request whose publish failed. It is the only evidence of
+ * supersession for work this object did not record itself.
+ */
+interface IntentFence {
+  desired: 'subscribed' | 'unsubscribed';
+  at: number;
+}
+
+export function fenceKey(email: string): string {
+  return `intent:fence:${email.trim().toLowerCase()}`;
+}
+
+/**
+ * Whether stored work has been superseded by a newer intent recorded elsewhere.
+ *
+ * The KV shadow is deliberately not consulted. A shadow that disagrees with the
+ * stored intent is at least as likely to be this operation's own unfinished write,
+ * or an eventually consistent read, as a newer request. Only an explicit fence
+ * newer than the intent supersedes it, and a failed read never does.
+ */
+export function supersessionDecision(
+  intent: { recordedAtMs: number },
+  fence: IntentFence | null,
+  fenceReadFailed: boolean,
+): 'run' | 'supersede' {
+  if (fenceReadFailed) return 'run';
+  if (!fence || typeof fence.at !== 'number') return 'run';
+  return fence.at > intent.recordedAtMs ? 'supersede' : 'run';
 }
 
 interface CoordinatorPending {
@@ -1375,7 +1459,14 @@ export class SubscriptionCoordinator {
     const email = input.email.trim().toLowerCase();
     const previous = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
     const seq = (previous?.seq ?? 0) + 1;
-    const intent: CoordinatorIntent = { email, desired: input.desired, seq, updatedAt: new Date().toISOString() };
+    const recordedAtMs = Date.now();
+    const intent: CoordinatorIntent = {
+      email,
+      desired: input.desired,
+      seq,
+      updatedAt: new Date(recordedAtMs).toISOString(),
+      recordedAtMs,
+    };
 
     await this.state.storage.put(INTENT_KEY, intent);
     await this.state.storage.put<CoordinatorPending>(PENDING_KEY, {
@@ -1386,6 +1477,12 @@ export class SubscriptionCoordinator {
       nextAt: Date.now(),
     });
     await this.state.storage.setAlarm(Date.now());
+    // This object owns the newest intent now, so an older fence cannot supersede it.
+    try {
+      await this.env.NEWSLETTER_SUBSCRIBERS.delete(fenceKey(email));
+    } catch {
+      // Best effort; a stale fence only matters if it is newer.
+    }
 
     if (input.recordOnly) {
       // A legacy request publishes its intent so older durable work can be fenced,
@@ -1405,25 +1502,6 @@ export class SubscriptionCoordinator {
   private pendingInput: { ip?: string; userAgent?: string } = {};
 
   /**
-   * True when the KV shadow says the address asked for something other than the
-   * stored intent. Used to fence stale durable work against a newer request that
-   * was served by the legacy path and therefore never reached this object.
-   *
-   * KV is not strongly consistent, so this is a best-effort fence; it is paired
-   * with the intent write that legacy requests make when the object is reachable.
-   */
-  private async shadowDisagrees(intent: CoordinatorIntent): Promise<boolean> {
-    try {
-      const shadow = await this.env.NEWSLETTER_SUBSCRIBERS.get(intent.email);
-      if (intent.desired === 'subscribed') return shadow === null;
-      return shadow !== null;
-    } catch {
-      // If the shadow cannot be read, do not act on stale intent.
-      return true;
-    }
-  }
-
-  /**
    * Converges the KV shadow and the provider toward the stored intent.
    *
    * `fresh` means this object has just recorded the intent itself, so the shadow
@@ -1438,14 +1516,23 @@ export class SubscriptionCoordinator {
     if (fresh) {
       const shadow = await this.applyShadow(intent);
       if (!shadow.ok) return await this.scheduleRetry(intent, { outcome: 'failed', error: shadow.error, retryable: true }, 'shadow');
-    } else if (await this.shadowDisagrees(intent)) {
-      // A newer intent may have been served outside this object (legacy mode, or a
-      // shadow write from a request whose coordinator call failed). Work that
-      // would contradict it must not run, however old it is.
-      await this.state.storage.delete(PENDING_KEY);
-      await this.state.storage.deleteAlarm();
-      console.warn(`coordinator discarded stale ${intent.desired} work for ${redactEmail(intent.email)}: the shadow disagrees`);
-      return { outcome: 'superseded', retryable: false };
+    } else {
+      const { decision, fence } = await this.readFence(intent);
+      if (decision === 'supersede') {
+        // A newer request recorded its intent elsewhere and served it itself, so
+        // this work is stale. Adopt that intent rather than acting on the old one.
+        await this.state.storage.put<CoordinatorIntent>(INTENT_KEY, {
+          ...intent,
+          desired: fence!.desired,
+          seq: intent.seq + 1,
+          updatedAt: new Date().toISOString(),
+          recordedAtMs: fence!.at,
+        });
+        await this.state.storage.delete(PENDING_KEY);
+        await this.state.storage.deleteAlarm();
+        console.warn(`coordinator adopted a newer ${fence!.desired} intent for ${redactEmail(intent.email)} and dropped stale ${intent.desired} work`);
+        return { outcome: 'superseded', retryable: false };
+      }
     }
 
     // One deadline covers lookup, create, welcome and fallback, so the exclusive
@@ -1486,6 +1573,20 @@ export class SubscriptionCoordinator {
       return result;
     }
     return await this.scheduleRetry(intent, result, intent.desired === 'subscribed' ? 'create' : 'remove');
+  }
+
+  private async readFence(
+    intent: CoordinatorIntent,
+  ): Promise<{ decision: 'run' | 'supersede'; fence: IntentFence | null }> {
+    try {
+      const raw = await this.env.NEWSLETTER_SUBSCRIBERS.get(fenceKey(intent.email));
+      if (!raw) return { decision: 'run', fence: null };
+      const fence = JSON.parse(raw) as IntentFence;
+      return { decision: supersessionDecision(intent, fence, false), fence };
+    } catch {
+      // An unreadable fence proves nothing. Never erase accepted work for it.
+      return { decision: 'run', fence: null };
+    }
   }
 
   private async applyShadow(intent: CoordinatorIntent): Promise<{ ok: boolean; error?: string }> {
