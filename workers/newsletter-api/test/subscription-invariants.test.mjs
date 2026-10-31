@@ -109,9 +109,11 @@ function subscribe(email) {
 async function seedSubscriber(email) {
   const first = await subscribe(email);
   assert.equal(first.status, 200);
+  // Consume the body before draining, and never hand back an unread response.
+  const body = await first.json();
   await drain();
   provider.reset();
-  return first;
+  return body;
 }
 
 function setProviderStatus(email, { global = 'enabled', listStatus } = {}) {
@@ -138,8 +140,10 @@ describe('an existing KV record is not evidence of provider membership', () => {
     setProviderStatus(email, { listStatus: 'confirmed' });
 
     const response = await subscribe(email);
-    await drain();
+    // Read the body before any further runtime request: the response is a live
+    // stream and a drain request can invalidate it.
     const body = await response.json();
+    await drain();
 
     assert.equal(body.message, 'Already subscribed');
     // A confirmed subscriber needs no create, so the recovery path stays quiet.
@@ -152,8 +156,10 @@ describe('an existing KV record is not evidence of provider membership', () => {
     setProviderStatus(email, { listStatus: 'unsubscribed' });
 
     const response = await subscribe(email);
-    await drain();
+    // Read the body before any further runtime request: the response is a live
+    // stream and a drain request can invalidate it.
     const body = await response.json();
+    await drain();
 
     // The inventory found a live instance of this: KV says present, Listmonk
     // says unsubscribed. Re-creating would undo a deliberate unsubscribe.
@@ -168,8 +174,10 @@ describe('an existing KV record is not evidence of provider membership', () => {
     setProviderStatus(email, { global: 'blocklisted', listStatus: 'unsubscribed' });
 
     const response = await subscribe(email);
-    await drain();
+    // Read the body before any further runtime request: the response is a live
+    // stream and a drain request can invalidate it.
     const body = await response.json();
+    await drain();
 
     assert.notEqual(body.success, true);
     assert.equal(provider.mutations().length, 0, 'a blocklisted address must never be re-enabled');
@@ -255,8 +263,8 @@ describe('a contradictory lookup response establishes nothing', () => {
 
       try {
         const response = await subscribe(email);
-        await drain();
         const body = await response.json();
+        await drain();
         assert.notEqual(body.message, 'Already subscribed');
         assert.equal(body.status, 'unverified');
         assert.equal(provider.mutations().length, 0);
@@ -278,8 +286,10 @@ describe('a contradictory lookup response establishes nothing', () => {
 
     try {
       const response = await subscribe(email);
-      await drain();
+      // Read the body before any further runtime request: the response is a live
+      // stream and a drain request can invalidate it.
       const body = await response.json();
+      await drain();
       assert.equal(body.status, 'unverified');
       assert.equal(provider.mutations().length, 0, 'a contradictory count must not trigger a create');
     } finally {
@@ -301,14 +311,43 @@ describe('a contradictory lookup response establishes nothing', () => {
 
     try {
       const response = await subscribe(email);
-      await drain();
+      // Read the body before any further runtime request: the response is a live
+      // stream and a drain request can invalidate it.
       const body = await response.json();
+      await drain();
       assert.notEqual(body.message, 'Already subscribed');
       assert.equal(body.status, 'unverified');
     } finally {
       provider.clearRawLookup();
     }
   });
+
+  for (const total of [-1, 0.5]) {
+    it(`treats a ${total} count as uninterpretable rather than confirmed`, async () => {
+      const email = `invariant-count-${String(total).replace('.', '_')}@example.com`;
+      await seedSubscriber(email);
+      // A matching, enabled, confirmed row with an impossible count. A `> 1`
+      // bound would let these through to the length checks and report the
+      // address as confirmed.
+      provider.setRawLookup(() => new Response(JSON.stringify({
+        data: {
+          results: [{ email, status: 'enabled', lists: [{ id: LIST_ID, subscription_status: 'confirmed' }] }],
+          total,
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+      try {
+        const response = await subscribe(email);
+        const body = await response.json();
+        await drain();
+        assert.notEqual(body.message, 'Already subscribed');
+        assert.equal(body.status, 'unverified');
+        assert.equal(provider.mutations().length, 0);
+      } finally {
+        provider.clearRawLookup();
+      }
+    });
+  }
 
   it('does not accept a result for a different address', async () => {
     const email = 'invariant-wrong-identity@example.com';
@@ -322,8 +361,10 @@ describe('a contradictory lookup response establishes nothing', () => {
 
     try {
       const response = await subscribe(email);
-      await drain();
+      // Read the body before any further runtime request: the response is a live
+      // stream and a drain request can invalidate it.
       const body = await response.json();
+      await drain();
       assert.notEqual(body.message, 'Already subscribed');
       assert.equal(body.status, 'unverified');
     } finally {
@@ -339,8 +380,10 @@ describe('the browser can show the explanation', () => {
     setProviderStatus(email, { listStatus: 'unsubscribed' });
 
     const response = await subscribe(email);
-    await drain();
+    // Read the body before any further runtime request: the response is a live
+    // stream and a drain request can invalidate it.
     const body = await response.json();
+    await drain();
 
     // site.js reads data.error on failure, so message alone is invisible.
     assert.equal(typeof body.error, 'string');
@@ -356,8 +399,10 @@ describe('the browser can show the explanation', () => {
 
     try {
       const response = await subscribe(email);
-      await drain();
+      // Read the body before any further runtime request: the response is a live
+      // stream and a drain request can invalidate it.
       const body = await response.json();
+      await drain();
       assert.equal(body.status, 'unverified');
       assert.doesNotMatch(body.error, /is not currently subscribed/i);
       assert.match(body.error, /verify/i);

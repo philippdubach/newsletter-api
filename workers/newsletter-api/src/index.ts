@@ -468,8 +468,11 @@ async function lookupListmonkSubscriber(email: string, env: Env): Promise<Upstre
     // The count and the rows have to agree before either is used. `per_page=1`
     // caps the rows, so anything above one match is ambiguous for an exact-email
     // query rather than a page of results.
-    if (typeof total !== 'number' || !Number.isFinite(total)) return 'unverified';
-    if (total > 1) return 'unverified';
+    //
+    // A strict comparison against {0, 1} rather than a `> 1` bound: negative and
+    // fractional values are equally uninterpretable, and a range check would let
+    // them through to the length tests below.
+    if (total !== 0 && total !== 1) return 'unverified';
     if (total === 1 && results.length !== 1) return 'unverified';
     if (total === 0 && results.length !== 0) return 'unverified';
     if (total === 0) return 'absent';

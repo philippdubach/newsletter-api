@@ -137,6 +137,9 @@ export async function startRuntime({ entry = join(workerDir, 'src/index.ts'), ex
     runtime,
     attempts,
     /** Waits until every ctx.waitUntil promise the Worker registered has settled. */
+    // Consume any response body before calling this. `dispatchFetch` returns a
+    // live stream, and issuing the drain request first can leave the body
+    // already read, which surfaces intermittently as "Body is unusable".
     drain: async () => {
       const response = await runtime.dispatchFetch(`http://localhost${DRAIN_PATH}`);
       return (await response.json()).drained;
