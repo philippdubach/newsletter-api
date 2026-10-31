@@ -625,9 +625,12 @@ describe('provider effects are serialized per address', () => {
       assert.equal(store.membership.get(email), false, 'provider must end unsubscribed');
       assert.equal(state.pending, null, 'no work may be left unscheduled');
 
-      // The removal must be the last membership effect, not merely present.
+      // Exactly one create and one remove, in that order. Compensation after the
+      // fact would still leave the provider correct, so the sequence is what
+      // distinguishes serialization from repair.
       const commits = store.events.filter((e) => e === 'create-commit' || e === 'remove-commit');
-      assert.equal(commits.at(-1), 'remove-commit', `unexpected order ${commits.join(' > ')}`);
+      assert.deepEqual(commits, ['create-commit', 'remove-commit'], `unexpected order ${commits.join(' > ')}`);
+      assert.equal(store.events.filter((e) => e === 'create-start').length, 1, 'the create must not be retried');
       // The signup's answer must match what actually happened for it.
       assert.ok(signupBody.status === 'accepted' || signupBody.message === 'Subscribed successfully');
     } finally {
@@ -1146,10 +1149,12 @@ describe('the deadline reaches welcome and fallback', () => {
     const email = 'invariant-slow-fallback@example.com';
     const store = createProviderStub();
     const base = store.handler;
+    let plunkCalls = 0;
     store.handler = async (request) => {
       const url = new URL(request.url);
       if (url.pathname === '/api/tx') return new Response('{"error":"boom"}', { status: 500 });
       if (url.host === 'next-api.useplunk.com') {
+        plunkCalls += 1;
         await new Promise((resolve) => setTimeout(resolve, 6000));
         return new Response('{}', { status: 200 });
       }
@@ -1174,6 +1179,8 @@ describe('the deadline reaches welcome and fallback', () => {
       assert.ok(elapsed < 3500, `took ${elapsed}ms, so the fallback ignored the budget`);
       assert.ok([200, 202].includes(response.status), `unexpected status ${response.status}`);
       assert.equal(body.success, true);
+      // A missing fallback would also finish quickly, so assert it was attempted.
+      assert.ok(plunkCalls > 0, 'the Plunk fallback must actually be attempted');
     } finally {
       await local.dispose();
     }
