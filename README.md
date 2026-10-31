@@ -221,6 +221,16 @@ Cloudflare migration/control-plane behavior. A disposable remote migration and
 rollback-forward canary still requires separate upload authorization; neither
 local tests nor the production dry run establish that proof.
 
+A separately authorized live lifecycle drill passed on 2026-10-31 for PR #6:
+class creation with `v1`, redeployment with `v1` already applied, preservation of
+synthetic durable intent, rollback-forward into maintenance, an actual alarm
+pausing without spending attempts, and alarm-driven resumption after returning
+to `on`. The disposable Worker used the candidate coordinator class without
+production KV/R2 bindings or application credentials. Its namespace and Worker
+were deleted afterward; production deployment metadata remained unchanged. This
+validates the tested lifecycle, not an instantaneous global pause or a production
+migration. Future live drills still require separate authorization.
+
 An accepted unsubscribe is a durable recipient tombstone: an unauthenticated
 signup cannot cancel it, even after retry exhaustion or completed removal. The
 address keeps reporting as unsubscribed until the caller proves control through
