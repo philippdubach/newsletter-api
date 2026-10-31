@@ -36,6 +36,7 @@ new_sqlite_classes = ["SubscriptionCoordinator"]
 # `.dev.vars` when testing that path.
 [vars]
 ENVIRONMENT = "development"
+COORDINATOR_MODE = "on"
 ALLOWED_ORIGIN = "http://localhost:1313,http://localhost:3000"
 
 # Production environment
@@ -61,6 +62,9 @@ jurisdiction = "eu"
 [env.production.vars]
 ALLOWED_ORIGIN = "https://philippdubach.com,https://www.philippdubach.com,https://phil-dubach.com"
 ENVIRONMENT = "production"
+# Rollback lever: deploying this same code with "legacy" keeps the Durable Object
+# class and its pending operations, and returns writes to the inline path.
+COORDINATOR_MODE = "on"
 LINKEDIN_NEWSLETTER_URLS = "https://www.linkedin.com/pulse/ai-lab-60b-cursor-25b-anthropic-chinese-open-weight-triple-dubach-ltbae"
 LISTMONK_API_URL = "https://mail.philippdubach.com"
 LISTMONK_LIST_ID = "3"

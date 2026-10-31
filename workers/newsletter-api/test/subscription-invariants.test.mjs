@@ -37,9 +37,22 @@ const PROVIDER_BINDINGS = {
  * Minimal Listmonk stand-in. Subscriber state is a map the test controls, so a
  * case can put the provider in any status without touching a real account.
  */
+function emailFrom(bodyText) {
+  try {
+    const parsed = JSON.parse(bodyText ?? '{}');
+    return typeof parsed.email === 'string' ? parsed.email.trim().toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
 function createProviderStub() {
   const calls = [];
   const subscribers = new Map();
+  // Final membership, so a test can assert the *end state* rather than merely
+  // that some removal request was sent.
+  const membership = new Map();
+  const events = [];
   // Lets a case answer the lookup with a deliberately contradictory payload.
   let rawLookup = null;
 
@@ -69,6 +82,20 @@ function createProviderStub() {
       return json({ data: { results, total: results.length } });
     }
     if (url.pathname === '/api/subscribers' && method === 'POST') {
+      // A create commits whatever the gate above decided to do.
+      membership.set(emailFrom(body), true);
+      events.push('create-commit');
+      return json({ data: {} });
+    }
+    if (url.pathname === '/api/subscribers/query/lists' && method === 'PUT') {
+      const parsed = body ? JSON.parse(body) : {};
+      const target = /subscribers\.email = '([^']*)'/.exec(parsed.query ?? '')?.[1];
+      if (target) membership.set(target.trim().toLowerCase(), false);
+      events.push('remove-commit');
+      return json({ data: {} });
+    }
+    if (url.pathname === '/api/tx') {
+      events.push('welcome');
       return json({ data: {} });
     }
     return json({ data: {} });
@@ -78,6 +105,8 @@ function createProviderStub() {
     calls,
     subscribers,
     handler,
+    membership,
+    events,
     setRawLookup: (fn) => { rawLookup = fn; },
     clearRawLookup: () => { rawLookup = null; },
     /** Requests that would create or re-enable a subscriber. */
@@ -237,7 +266,9 @@ describe('the answer is only sent once provider state is known', () => {
         headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.200' },
         body: JSON.stringify({ email }),
       });
-      assert.equal(seeded.status, 200);
+      // The seed is an accepted intent; with an unreadable provider it settles at
+      // 202 rather than claiming completion.
+      assert.ok([200, 202].includes(seeded.status), `unexpected seed status ${seeded.status}`);
       // Consume the seed body before its drain, for the same reason as below.
       await seeded.json();
       await failingRuntime.drain();
@@ -253,8 +284,9 @@ describe('the answer is only sent once provider state is known', () => {
       await failingRuntime.drain();
 
       // Unreadable is not confirmed: the subscriber must not be told they are on
-      // the list when the lookup did not succeed.
+      // the list, and a 5xx keeps the retry rather than being terminal.
       assert.notEqual(body.message, 'Already subscribed');
+      assert.ok([200, 202].includes(response.status), `unexpected status ${response.status}`);
     } finally {
       await failingRuntime.dispose();
     }
@@ -284,7 +316,7 @@ describe('a contradictory lookup response establishes nothing', () => {
         const body = await response.json();
         await drain();
         assert.notEqual(body.message, 'Already subscribed');
-        assert.equal(body.status, 'unverified');
+        assert.equal(body.status, 'accepted');
         assert.equal(provider.mutations().length, 0);
       } finally {
         provider.clearRawLookup();
@@ -308,7 +340,7 @@ describe('a contradictory lookup response establishes nothing', () => {
       // stream and a drain request can invalidate it.
       const body = await response.json();
       await drain();
-      assert.equal(body.status, 'unverified');
+      assert.equal(body.status, 'accepted');
       assert.equal(provider.mutations().length, 0, 'a contradictory count must not trigger a create');
     } finally {
       provider.clearRawLookup();
@@ -334,7 +366,7 @@ describe('a contradictory lookup response establishes nothing', () => {
       const body = await response.json();
       await drain();
       assert.notEqual(body.message, 'Already subscribed');
-      assert.equal(body.status, 'unverified');
+      assert.equal(body.status, 'accepted');
     } finally {
       provider.clearRawLookup();
     }
@@ -359,7 +391,7 @@ describe('a contradictory lookup response establishes nothing', () => {
         const body = await response.json();
         await drain();
         assert.notEqual(body.message, 'Already subscribed');
-        assert.equal(body.status, 'unverified');
+        assert.equal(body.status, 'accepted');
         assert.equal(provider.mutations().length, 0);
       } finally {
         provider.clearRawLookup();
@@ -384,7 +416,7 @@ describe('a contradictory lookup response establishes nothing', () => {
       const body = await response.json();
       await drain();
       assert.notEqual(body.message, 'Already subscribed');
-      assert.equal(body.status, 'unverified');
+      assert.equal(body.status, 'accepted');
     } finally {
       provider.clearRawLookup();
     }
@@ -421,9 +453,11 @@ describe('the browser can show the explanation', () => {
       // stream and a drain request can invalidate it.
       const body = await response.json();
       await drain();
-      assert.equal(body.status, 'unverified');
-      assert.doesNotMatch(body.error, /is not currently subscribed/i);
-      assert.match(body.error, /verify/i);
+      // Accepted with a retry preserved; no claim about membership either way.
+      assert.equal(body.status, 'accepted');
+      const text = body.message ?? body.error ?? '';
+      assert.doesNotMatch(text, /is not currently subscribed/i);
+      assert.doesNotMatch(text, /already subscribed/i);
     } finally {
       provider.clearRawLookup();
     }
@@ -544,8 +578,8 @@ describe('failed provider work is durable', () => {
   });
 });
 
-describe('a superseded intent is reported honestly', () => {
-  it('does not report a signup as completed when an unsubscribe arrives mid-flight', async () => {
+describe('provider effects are serialized per address', () => {
+  it('leaves the provider unsubscribed when an unsubscribe arrives mid-create', async () => {
     const email = 'invariant-supersede@example.com';
     let releaseCreate;
     const createGate = new Promise((resolve) => { releaseCreate = resolve; });
@@ -556,10 +590,9 @@ describe('a superseded intent is reported honestly', () => {
       const url = new URL(request.url);
       if (url.pathname === '/api/subscribers' && request.method === 'POST') {
         store.calls.push({ method: 'POST', path: url.pathname, search: url.search, body: null });
-        // Hold the create open so a later unsubscribe can arrive while it is in
-        // flight, which is the case the intent re-read exists for.
+        store.events.push('create-start');
+        // Hold the create open so an unsubscribe arrives while it is in flight.
         await createGate;
-        return new Response('{}', { status: 200 });
       }
       return base(request);
     };
@@ -573,30 +606,29 @@ describe('a superseded intent is reported honestly', () => {
 
     try {
       const signup = post('/api/subscribe', { email }, '198.51.100.220');
-      // Give the signup time to reach the held provider call.
       await new Promise((resolve) => setTimeout(resolve, 50));
       const removal = post('/api/unsubscribe', { email, token: tokenFor(email) }, '198.51.100.221');
-
       await new Promise((resolve) => setTimeout(resolve, 50));
       releaseCreate();
 
-      const signupResponse = await signup;
-      const signupBody = await signupResponse.json();
-      await removal;
+      const signupBody = await (await signup).json();
+      await (await removal).json();
       await local.drain();
-
-      // The create it issued cannot be recalled, so the honest answer is that the
-      // request was accepted, not that the subscription completed.
-      assert.notEqual(signupBody.message, 'Subscribed successfully');
-      assert.equal(signupBody.status, 'accepted');
 
       const stub = await local.coordinator(email);
       const state = await (await stub.fetch('https://coordinator/state')).json();
+
+      // The serialized claim: the intent is unsubscribed AND the provider agrees,
+      // with no pending work left behind.
       assert.equal(state.intent.desired, 'unsubscribed');
-      // The later intent converged the provider rather than being overwritten by
-      // the create that was already in flight.
-      assert.ok(store.calls.some((c) => c.method === 'PUT' || c.method === 'DELETE'),
-        `expected a provider removal, saw ${JSON.stringify(store.calls.map((c) => c.method + ' ' + c.path))}`);
+      assert.equal(store.membership.get(email), false, 'provider must end unsubscribed');
+      assert.equal(state.pending, null, 'no work may be left unscheduled');
+
+      // The removal must be the last membership effect, not merely present.
+      const commits = store.events.filter((e) => e === 'create-commit' || e === 'remove-commit');
+      assert.equal(commits.at(-1), 'remove-commit', `unexpected order ${commits.join(' > ')}`);
+      // The signup's answer must match what actually happened for it.
+      assert.ok(signupBody.status === 'accepted' || signupBody.message === 'Subscribed successfully');
     } finally {
       await local.dispose();
     }
@@ -627,6 +659,92 @@ describe('welcome mail is sent once per intent', () => {
       await stub.fetch('https://coordinator/sync', { method: 'POST' });
 
       assert.equal(welcomes(), 1, 'a re-sync must not duplicate the welcome');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('durable state is recoverable', () => {
+  it('records a recoverable operation when the KV shadow write fails', async () => {
+    const email = 'invariant-kv-failure@example.com';
+    const store = createProviderStub();
+    // No KV binding at all: the rate limiter fails open, so the request reaches
+    // the coordinator and its shadow write is what fails.
+    const local = await startRuntime({
+      extraBindings: PROVIDER_BINDINGS,
+      outboundService: store.handler,
+      withKv: false,
+    });
+    try {
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.240' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json();
+      await local.drain();
+
+      assert.equal(response.status, 202);
+      assert.equal(body.status, 'accepted');
+
+      const stub = await local.coordinator(email);
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+
+      // Intent survives the failed write, and work is scheduled to finish it.
+      assert.equal(state.intent.desired, 'subscribed');
+      assert.ok(state.pending, 'a failed KV write must leave a recoverable operation');
+      assert.equal(state.pending.kind, 'shadow');
+      assert.ok(state.alarm, 'the recovery must be scheduled, not merely recorded');
+      assert.equal(store.membership.get(email), undefined, 'the provider must not be touched yet');
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it('keeps the retry budget when the lookup fails transiently', async () => {
+    const email = 'invariant-lookup-retry@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    let phase = 'create-fails';
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/subscribers' && request.method === 'POST' && phase === 'create-fails') {
+        store.calls.push({ method: 'POST', path: url.pathname, search: url.search, body: null });
+        return new Response('{"error":"boom"}', { status: 500 });
+      }
+      if (url.pathname === '/api/subscribers' && request.method === 'GET' && phase === 'lookup-fails') {
+        store.calls.push({ method: 'GET', path: url.pathname, search: url.search, body: null });
+        return new Response('{"error":"unavailable"}', { status: 503 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.241' },
+        body: JSON.stringify({ email }),
+      });
+      await signup.json();
+      await local.drain();
+
+      const stub = await local.coordinator(email);
+      let state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.pending.attempts, 1);
+
+      // The next attempt fails in the lookup instead of the create.
+      phase = 'lookup-fails';
+      const sync = await (await stub.fetch('https://coordinator/sync', { method: 'POST' })).json();
+      assert.equal(sync.outcome, 'pending');
+
+      state = await (await stub.fetch('https://coordinator/state')).json();
+      // A transient lookup failure must not discard accepted work.
+      assert.ok(state.pending, 'the pending operation must survive a 503 lookup');
+      assert.equal(state.pending.attempts, 2);
+      assert.ok(state.alarm, 'a retry must remain scheduled');
+      assert.equal(store.membership.get(email), undefined, 'no create may happen on an unreadable lookup');
     } finally {
       await local.dispose();
     }

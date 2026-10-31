@@ -180,6 +180,24 @@ Individually:
 
 `npm run deploy:production` refuses to upload unless `npm run verify` passes.
 
+### Rolling this back
+
+Rolling back to a version that predates the Durable Object class is not supported
+by Cloudflare: a rollback cannot cross a class creation. The supported path is a
+forward deploy with the same code:
+
+```bash
+# 1. Set the lever in wrangler.toml:  COORDINATOR_MODE = "legacy"
+npm run deploy:production
+```
+
+`COORDINATOR_MODE = "legacy"` keeps the binding, the class and every pending
+operation, and returns writes to the unserialized inline path. Alarms still fire
+and continue converging any pending work, because the class is never removed.
+Switch back to `"on"` with another deploy. The configuration guard rejects any
+value other than `on` or `legacy`, so the lever cannot be set to something the
+Worker does not understand.
+
 ### Runtime suite
 
 The suite in `test/runtime.test.mjs` runs the Worker in workerd through Miniflare

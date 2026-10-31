@@ -28,6 +28,7 @@ tag = "v1"
 new_sqlite_classes = ["SubscriptionCoordinator"]
 [vars]
 ENVIRONMENT = "development"
+COORDINATOR_MODE = "on"
 ALLOWED_ORIGIN = "http://localhost:1313"
 [env.production]
 name = "newsletter-api"
@@ -42,6 +43,7 @@ binding = "R2_BUCKET"
 bucket_name = "static-eu"
 [env.production.vars]
 ENVIRONMENT = "production"
+COORDINATOR_MODE = "on"
 `;
 
 const check = (text) => checkConfig(parseConfig(text));
@@ -76,7 +78,10 @@ test('provider configuration in development is rejected', () => {
 });
 
 test('a development environment labelled production is rejected', () => {
-  const errors = check(SAFE.replace('ENVIRONMENT = "development"', 'ENVIRONMENT = "production"'));
+  const errors = check(SAFE.replace(
+    'ENVIRONMENT = "development"\nCOORDINATOR_MODE = "on"',
+    'ENVIRONMENT = "production"\nCOORDINATOR_MODE = "on"',
+  ));
   assert.equal(errors.length, 1);
   assert.match(errors[0], /must be "development"/);
 });
@@ -102,6 +107,7 @@ tag = "v1"
 new_sqlite_classes = ["SubscriptionCoordinator"]
 [vars]
 ENVIRONMENT = "development"
+COORDINATOR_MODE = "on"
 ALLOWED_ORIGIN = "https://example.invalid/#fragment"
 [env.production]
 name = "newsletter-api"
@@ -116,6 +122,7 @@ name = "SUBSCRIPTION_COORDINATOR"
 class_name = "SubscriptionCoordinator"
 [env.production.vars]
 ENVIRONMENT = "production"
+COORDINATOR_MODE = "on"
 `);
   assert.equal(config.vars.ALLOWED_ORIGIN, 'https://example.invalid/#fragment');
   assert.deepEqual(checkConfig(config), []);
@@ -149,7 +156,9 @@ test('quoted keys cannot hide provider variables', () => {
 });
 
 test('inline tables cannot bypass the checks', () => {
-  const inlineVars = SAFE.replace(/\[vars\][\s\S]*?\[env\.production\]/, '[env.production]').replace('name = "newsletter-api-dev"\n', 'name = "newsletter-api-dev"\nvars = { ENVIRONMENT = "development", LISTMONK_LIST_ID = "3" }\n');
+  const inlineVars = SAFE.replace(/\[vars\][\s\S]*?\[env\.production\]/, '[env.production]')
+    .replace('name = "newsletter-api-dev"\n',
+      'name = "newsletter-api-dev"\nvars = { ENVIRONMENT = "development", COORDINATOR_MODE = "on", LISTMONK_LIST_ID = "3" }\n');
   has(check(inlineVars), /real provider/);
   const inlineKv = SAFE.replace(/\[\[kv_namespaces\]\][^\[]*/, 'kv_namespaces = [{ binding = "NEWSLETTER_SUBSCRIBERS", id = "prod-kv-id" }]\n');
   has(check(inlineKv.replace('name = "newsletter-api-dev"\n', 'name = "newsletter-api-dev"\n')), /production namespace/);
@@ -172,7 +181,10 @@ test('resource identifiers cannot be missing or empty', () => {
 
 test('the production Worker name and environment labels are required', () => {
   has(check(SAFE.replace('name = "newsletter-api"\n', 'name = "other"\n')), /production Worker name/);
-  has(check(SAFE.replace('ENVIRONMENT = "production"', 'ENVIRONMENT = "development"')), /production ENVIRONMENT/);
+  has(check(SAFE.replace(
+    'ENVIRONMENT = "production"\nCOORDINATOR_MODE = "on"',
+    'ENVIRONMENT = "development"\nCOORDINATOR_MODE = "on"',
+  )), /production ENVIRONMENT/);
 });
 
 test('preview references to production resources are rejected', () => {
@@ -222,4 +234,18 @@ test('a missing migration is rejected', () => {
   const withoutMigration = SAFE.replace(/\[\[migrations\]\]\ntag = "v1"\nnew_sqlite_classes = .*\n/, '');
   const errors = check(withoutMigration);
   has(errors, /no migration declares the SubscriptionCoordinator class/);
+});
+
+test('a missing coordinator mode is rejected', () => {
+  const errors = check(SAFE.replace(/COORDINATOR_MODE = "on"\n/g, ''));
+  has(errors, /must set COORDINATOR_MODE/);
+});
+
+test('an unrecognised coordinator mode is rejected', () => {
+  const errors = check(SAFE.replace(/COORDINATOR_MODE = "on"/g, 'COORDINATOR_MODE = "off"'));
+  has(errors, /must be "on" or "legacy"/);
+});
+
+test('legacy mode is accepted', () => {
+  assert.deepEqual(check(SAFE.replace(/COORDINATOR_MODE = "on"/g, 'COORDINATOR_MODE = "legacy"')), []);
 });

@@ -133,6 +133,16 @@ export function checkConfig(config) {
     }
   }
 
+  // The rollback lever has to exist in production, and has to hold a value the
+  // Worker understands, or a rollback becomes an unplanned code change.
+  for (const [label, vars] of [['development', devVars], ['production', prodVars]]) {
+    const mode = vars.COORDINATOR_MODE;
+    if (mode === undefined) errors.push(`${label} must set COORDINATOR_MODE`);
+    else if (mode !== 'on' && mode !== 'legacy') {
+      errors.push(`${label} COORDINATOR_MODE must be "on" or "legacy", found ${JSON.stringify(mode)}`);
+    }
+  }
+
   const migrations = Array.isArray(dev.migrations) ? dev.migrations.filter(isObject) : [];
   const declaresClass = migrations.some((migration) => {
     for (const key of ['new_classes', 'new_sqlite_classes']) {

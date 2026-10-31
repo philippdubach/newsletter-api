@@ -3,6 +3,10 @@ export interface Env {
   // Optional so environments without the migration still run; the coordinator is
   // the production path and serializes writes per address.
   SUBSCRIPTION_COORDINATOR?: DurableObjectNamespace;
+  // 'on' routes writes through the coordinator. 'legacy' uses the unserialized
+  // inline path while keeping the binding and every pending operation intact,
+  // which is what makes a rollback possible without crossing a class creation.
+  COORDINATOR_MODE?: string;
   R2_BUCKET?: R2Bucket;
   ALLOWED_ORIGIN?: string;
   ENVIRONMENT?: string;
@@ -736,6 +740,11 @@ interface IntentResult {
 }
 
 function coordinatorFor(env: Env, email: string): DurableObjectStub | null {
+  // Rolling back across a Durable Object class creation is not permitted by
+  // Cloudflare, so the supported rollback is a forward deploy that keeps the
+  // binding and switches this mode. Pending operations and alarms stay live and
+  // keep converging, because the class is never removed.
+  if ((env.COORDINATOR_MODE ?? 'on') === 'legacy') return null;
   const namespace = env.SUBSCRIPTION_COORDINATOR;
   if (!namespace) return null;
   try {
@@ -1163,7 +1172,7 @@ interface CoordinatorIntent {
 }
 
 interface CoordinatorPending {
-  kind: 'create' | 'remove';
+  kind: 'create' | 'remove' | 'shadow';
   seq: number;
   attempts: number;
   lastError: string | null;
@@ -1178,8 +1187,20 @@ interface SyncResult {
   error?: string;
   reason?: string;
   attempts?: number;
-  // A failure that retrying cannot fix, such as missing configuration.
-  permanent?: boolean;
+  /** False when retrying cannot help: configuration, credentials, a decision. */
+  retryable?: boolean;
+}
+
+/**
+ * A lookup failure that retrying could plausibly fix. Shape and contract
+ * mismatches count, because provider replication lag looks exactly like an
+ * inconsistent payload; they are bounded by the attempt budget either way.
+ * Definitive answers (blocklisted, unsubscribed, confirmed) never reach here.
+ */
+function isRetryableLookupReason(reason: string): boolean {
+  if (reason === 'not_configured') return false;
+  if (/^http_4(0[1-3]|04)$/.test(reason)) return false;
+  return true;
 }
 
 export class SubscriptionCoordinator {
@@ -1198,10 +1219,10 @@ export class SubscriptionCoordinator {
         const body = await request.json() as {
           desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
         };
-        return Response.json(await this.setIntent(body));
+        return Response.json(await this.runExclusive(() => this.setIntent(body)));
       }
       if (url.pathname === '/sync' && request.method === 'POST') {
-        return Response.json(await this.sync());
+        return Response.json(await this.runExclusive(() => this.sync()));
       }
       if (url.pathname === '/state') {
         return Response.json({
@@ -1221,19 +1242,43 @@ export class SubscriptionCoordinator {
 
   /** Retries whatever the last intent left unfinished. */
   async alarm(): Promise<void> {
-    const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
-    if (!pending) return;
-    const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
-    if (!intent || intent.seq !== pending.seq) {
-      await this.state.storage.delete(PENDING_KEY);
-      return;
-    }
-    await this.sync();
+    await this.runExclusive(async () => {
+      const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
+      if (!pending) return;
+      const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
+      if (!intent || intent.seq !== pending.seq) {
+        await this.state.storage.delete(PENDING_KEY);
+        return;
+      }
+      await this.sync();
+    });
   }
 
   /**
-   * Records what the caller asked for and converges the provider toward it.
-   * Serialized by the object, so it cannot interleave with another intent.
+   * Runs `work` with no other event delivered concurrently.
+   *
+   * A Durable Object is single-threaded but NOT serialized across `await`s: two
+   * requests interleave freely while one is waiting on an external fetch. Without
+   * this, a create and a later remove can be in flight at the same time and the
+   * provider commits them in either order — which is the exact failure this
+   * coordinator exists to prevent. `blockConcurrencyWhile` holds other events
+   * until the promise settles, so provider effects are ordered per address.
+   */
+  private async runExclusive<T>(work: () => Promise<T>): Promise<T> {
+    let result!: T;
+    await this.state.blockConcurrencyWhile(async () => {
+      result = await work();
+    });
+    return result;
+  }
+
+  /**
+   * Records what the caller asked for, then converges the provider.
+   *
+   * The intent and a pending operation are written *before* any external I/O, and
+   * the alarm is armed then too. That ordering is what makes a crash or a failed
+   * KV write recoverable: there is never a moment where durable state says one
+   * thing and nothing is scheduled to act on it.
    */
   private async setIntent(input: {
     desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
@@ -1244,50 +1289,80 @@ export class SubscriptionCoordinator {
     const intent: CoordinatorIntent = { email, desired: input.desired, seq, updatedAt: new Date().toISOString() };
 
     await this.state.storage.put(INTENT_KEY, intent);
-    // Any pending work belonged to the superseded intent.
-    await this.state.storage.delete(PENDING_KEY);
+    await this.state.storage.put<CoordinatorPending>(PENDING_KEY, {
+      kind: input.desired === 'subscribed' ? 'create' : 'remove',
+      seq,
+      attempts: 0,
+      lastError: null,
+      nextAt: Date.now(),
+    });
+    await this.state.storage.setAlarm(Date.now());
 
-    // The KV shadow follows intent immediately, so reads (count, dedupe) stay
-    // consistent even while the provider call is unresolved.
-    if (input.desired === 'subscribed') {
-      await this.env.NEWSLETTER_SUBSCRIBERS.put(email, JSON.stringify({
-        timestamp: intent.updatedAt,
-        ip: input.ip ?? 'unknown',
-        userAgent: input.userAgent ?? 'unknown',
-        seq: Date.now(),
-      }));
-    } else {
-      await this.env.NEWSLETTER_SUBSCRIBERS.delete(email);
-      // The intent row is the tombstone: deleting the KV shadow no longer
-      // erases the fact that this address asked to leave.
-    }
-
+    this.pendingInput = { ip: input.ip, userAgent: input.userAgent };
     const result = await this.sync();
     return { ...result, seq, desired: intent.desired };
   }
 
-  /** Converges the provider toward the stored intent, or schedules a retry. */
+  // Set immediately before a sync that follows an intent, so the KV shadow can be
+  // written without threading it through every sync call.
+  private pendingInput: { ip?: string; userAgent?: string } = {};
+
+  /** Converges the KV shadow and the provider toward the stored intent. */
   private async sync(): Promise<SyncResult> {
     const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
-    if (!intent) return { outcome: 'failed', error: 'no intent recorded' };
+    if (!intent) return { outcome: 'failed', error: 'no intent recorded', retryable: false };
+
+    // KV shadow first: it is local, cheap, and reads depend on it.
+    const shadow = await this.applyShadow(intent);
+    if (!shadow.ok) return await this.scheduleRetry(intent, { outcome: 'failed', error: shadow.error, retryable: true }, 'shadow');
 
     const result = intent.desired === 'subscribed'
       ? await this.syncSubscribed(intent)
       : await this.syncUnsubscribed(intent);
 
-    // The intent may have changed while the provider call was in flight. That
-    // request cannot be recalled, so the honest answer is "superseded" and the
-    // newer intent has its own handler.
+    // Fence after the provider call, for the case where an intent somehow changed
+    // beneath us. Under `runExclusive` this should not happen, which is why the
+    // compensation below is defensive rather than the primary mechanism.
     const current = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
-    if (!current || current.seq !== intent.seq) return { ...result, outcome: 'superseded' };
+    if (!current || current.seq !== intent.seq) {
+      if (result.outcome === 'completed' && result.created && intent.desired === 'subscribed') {
+        // A create committed for an address that has since asked to leave: undo it.
+        const removed = await unsubscribeFromListmonk(intent.email, this.env);
+        console.warn(`coordinator compensated a stale create for ${redactEmail(intent.email)}: ${removed.success ? 'removed' : 'removal failed'}`);
+      }
+      return { ...result, outcome: 'superseded', retryable: false };
+    }
 
-    if (result.permanent
-      || result.outcome === 'completed' || result.outcome === 'unsubscribed'
-      || result.outcome === 'blocklisted' || result.outcome === 'unverified') {
+    if (result.outcome === 'completed') {
       await this.state.storage.delete(PENDING_KEY);
+      await this.state.storage.deleteAlarm();
       return result;
     }
-    return await this.scheduleRetry(intent, result);
+    if (result.outcome === 'unsubscribed' || result.outcome === 'blocklisted') {
+      // A decision by the recipient, not a failure.
+      await this.state.storage.delete(PENDING_KEY);
+      await this.state.storage.deleteAlarm();
+      return result;
+    }
+    return await this.scheduleRetry(intent, result, intent.desired === 'subscribed' ? 'create' : 'remove');
+  }
+
+  private async applyShadow(intent: CoordinatorIntent): Promise<{ ok: boolean; error?: string }> {
+    try {
+      if (intent.desired === 'subscribed') {
+        await this.env.NEWSLETTER_SUBSCRIBERS.put(intent.email, JSON.stringify({
+          timestamp: intent.updatedAt,
+          ip: this.pendingInput.ip ?? 'unknown',
+          userAgent: this.pendingInput.userAgent ?? 'unknown',
+          seq: Date.now(),
+        }));
+      } else {
+        await this.env.NEWSLETTER_SUBSCRIBERS.delete(intent.email);
+      }
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   private async syncSubscribed(intent: CoordinatorIntent): Promise<SyncResult> {
@@ -1297,15 +1372,23 @@ export class SubscriptionCoordinator {
     // Both are the recipient's decision, taken elsewhere. Never overwrite them.
     if (upstream === 'blocklisted') return { outcome: 'blocklisted' };
     if (upstream === 'unsubscribed') return { outcome: 'unsubscribed' };
-    if (upstream === 'pending') return { outcome: 'unverified', reason };
-    if (upstream === 'unverified') return { outcome: 'unverified', reason };
+    if (upstream === 'pending') return { outcome: 'unverified', reason, retryable: false };
+    if (upstream === 'unverified') {
+      // A transient failure keeps its retry budget; a definitive one does not.
+      return { outcome: 'unverified', reason, retryable: isRetryableLookupReason(reason) };
+    }
 
-    // Absent upstream: create it.
     const created = await createListmonkSubscriber(intent.email, 'coordinator', this.env);
-    if (!created.success) return { outcome: 'failed', error: created.error ?? 'create failed' };
+    if (!created.success) return { outcome: 'failed', error: created.error ?? 'create failed', retryable: true };
+
+    // Fence before any mail is sent: a welcome for an intent that has already been
+    // superseded is a message the recipient did not ask for.
+    const current = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
+    if (!current || current.seq !== intent.seq || current.desired !== 'subscribed') {
+      return { outcome: 'superseded', retryable: false };
+    }
 
     if (!created.duplicate) {
-      // Welcome once per intent sequence, so a retry cannot send a second one.
       const welcomed = await this.state.storage.get<number>(WELCOME_KEY);
       if (welcomed !== intent.seq) {
         await this.state.storage.put(WELCOME_KEY, intent.seq);
@@ -1321,24 +1404,34 @@ export class SubscriptionCoordinator {
 
   private async syncUnsubscribed(intent: CoordinatorIntent): Promise<SyncResult> {
     if (!isListmonkConfigured(this.env)) {
-      // Missing configuration will not fix itself by retrying.
-      return { outcome: 'failed', error: 'Listmonk not configured', permanent: true };
+      return { outcome: 'failed', error: 'Listmonk not configured', retryable: false };
     }
     const result = await unsubscribeFromListmonk(intent.email, this.env);
-    if (!result.success) return { outcome: 'failed', error: result.error ?? 'unsubscribe failed' };
+    if (!result.success) return { outcome: 'failed', error: result.error ?? 'unsubscribe failed', retryable: true };
     return { outcome: 'completed' };
   }
 
   /** Persists the failure and arms an alarm. Retries survive eviction. */
-  private async scheduleRetry(intent: CoordinatorIntent, result: SyncResult): Promise<SyncResult> {
+  private async scheduleRetry(
+    intent: CoordinatorIntent,
+    result: SyncResult,
+    kind: 'create' | 'remove' | 'shadow',
+  ): Promise<SyncResult> {
+    if (result.retryable === false) {
+      // Terminal: keep the reason, drop the work, do not wake up again.
+      await this.state.storage.delete(PENDING_KEY);
+      await this.state.storage.deleteAlarm();
+      return result;
+    }
+
     const existing = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
     const attempts = (existing?.attempts ?? 0) + 1;
-    const kind: 'create' | 'remove' = intent.desired === 'subscribed' ? 'create' : 'remove';
 
     if (attempts > MAX_SYNC_ATTEMPTS) {
       console.error(`coordinator gave up after ${MAX_SYNC_ATTEMPTS} attempts for ${redactEmail(intent.email)}: ${result.error ?? result.reason ?? 'unknown'}`);
       await this.state.storage.delete(PENDING_KEY);
-      return { outcome: 'failed', error: result.error ?? result.reason ?? 'retries exhausted', attempts };
+      await this.state.storage.deleteAlarm();
+      return { outcome: 'failed', error: result.error ?? result.reason ?? 'retries exhausted', attempts, retryable: false };
     }
 
     const nextAt = Date.now() + retryDelayMs(attempts);
@@ -1352,7 +1445,7 @@ export class SubscriptionCoordinator {
     await this.state.storage.put(PENDING_KEY, pending);
     await this.state.storage.setAlarm(nextAt);
 
-    console.warn(`coordinator scheduled retry ${attempts}/${MAX_SYNC_ATTEMPTS} for ${redactEmail(intent.email)}: ${pending.lastError}`);
+    console.warn(`coordinator scheduled retry ${attempts}/${MAX_SYNC_ATTEMPTS} (${kind}) for ${redactEmail(intent.email)}: ${pending.lastError}`);
     return { outcome: 'pending', attempts, error: pending.lastError ?? undefined };
   }
 }
