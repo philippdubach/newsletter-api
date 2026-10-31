@@ -1407,3 +1407,170 @@ describe('publishing an intent does not cancel durable work', () => {
     }
   });
 });
+
+describe('an unresolved removal is protected whatever it is waiting on', () => {
+  it('refuses an anonymous signup while a shadow repair is pending', async () => {
+    const email = 'invariant-shadow-pending@example.com';
+    const store = createProviderStub();
+    // No KV binding at all, so the shadow step fails and the queued operation is
+    // a shadow repair rather than a removal.
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler, withKv: false });
+    try {
+      const stub = await local.coordinator(email);
+      await stub.fetch('https://coordinator/intent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ desired: 'unsubscribed', email }),
+      });
+
+      let state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.pending.kind, 'shadow', 'this case must exercise the shadow kind');
+
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.300' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await signup.json();
+      await local.drain();
+
+      assert.notEqual(body.message, 'Subscribed successfully');
+      assert.notEqual(body.message, 'Already subscribed');
+      state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.intent.desired, 'unsubscribed', 'the removal intent must survive');
+      assert.ok(state.pending, 'its retry must survive too');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('legacy mode enforces the same rule', () => {
+  it('refuses an anonymous signup that would cancel a pending removal', async () => {
+    const email = 'invariant-legacy-cancel@example.com';
+    const store = createProviderStub();
+    const base = store.handler;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/subscribers/query/lists' && request.method === 'PUT') {
+        store.calls.push({ method: 'PUT', path: url.pathname, search: url.search, body: null });
+        return new Response('{"error":"boom"}', { status: 500 });
+      }
+      return base(request);
+    };
+
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, COORDINATOR_MODE: 'legacy' },
+      outboundService: store.handler,
+    });
+    try {
+      const stub = await local.coordinator(email);
+      // An accepted removal whose provider call failed: durable, unresolved.
+      await stub.fetch('https://coordinator/intent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ desired: 'unsubscribed', email }),
+      });
+      let state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.ok(state.pending, 'the removal must be pending');
+
+      // The public route in legacy mode.
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.301' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await signup.json();
+      await local.drain();
+
+      assert.notEqual(body.message, 'Subscribed successfully');
+      state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.intent.desired, 'unsubscribed', 'the fence must not override the refusal');
+      assert.ok(state.pending, 'the removal job must survive');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('a removal never deletes the shadow before it can act', () => {
+  it('keeps the KV record when the provider is unconfigured', async () => {
+    const email = 'invariant-unconfigured-removal@example.com';
+    // No Listmonk configuration at all.
+    const local = await startRuntime({ outboundService: async () => new Response('{}', { status: 200 }) });
+    try {
+      await local.kv.put(email, { timestamp: '2026-01-01T00:00:00.000Z', ip: 'x', userAgent: 'x', seq: 1 });
+      assert.ok(await local.kv.get(email));
+
+      const removal = await local.runtime.dispatchFetch('http://localhost/api/unsubscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.302' },
+        body: JSON.stringify({ email, token: tokenFor(email) }),
+      });
+      const body = await removal.json();
+      await local.drain();
+
+      assert.equal(removal.status, 502);
+      assert.equal(body.success, false);
+      // Deleting it first would leave KV empty while Listmonk keeps mailing.
+      assert.ok(await local.kv.get(email), 'the shadow must not be removed when the provider cannot act');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('a fence obeys the same authorization rule as an intent', () => {
+  async function pendingRemoval(email) {
+    const store = createProviderStub();
+    const base = store.handler;
+    store.handler = async (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/api/subscribers/query/lists' && request.method === 'PUT') {
+        store.calls.push({ method: 'PUT', path: url.pathname, search: url.search, body: null });
+        return new Response('{"error":"boom"}', { status: 500 });
+      }
+      return base(request);
+    };
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    const stub = await local.coordinator(email);
+    await stub.fetch('https://coordinator/intent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ desired: 'unsubscribed', email }),
+    });
+    const state = await (await stub.fetch('https://coordinator/state')).json();
+    return { local, stub, store, intentAt: state.intent.recordedAtMs };
+  }
+
+  it('ignores an unauthenticated subscribe fence over an unresolved removal', async () => {
+    const email = 'invariant-fence-unauth@example.com';
+    const { local, stub, intentAt } = await pendingRemoval(email);
+    try {
+      await local.kv.put(`intent:fence:${email}`, { desired: 'subscribed', at: intentAt + 1000 });
+      const sync = await (await stub.fetch('https://coordinator/sync', { method: 'POST' })).json();
+
+      assert.notEqual(sync.outcome, 'superseded', 'an anonymous fence must not supersede');
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.intent.desired, 'unsubscribed');
+      assert.ok(state.pending, 'the removal job must survive');
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it('honours a fence the caller proved control for', async () => {
+    const email = 'invariant-fence-auth@example.com';
+    const { local, stub, intentAt } = await pendingRemoval(email);
+    try {
+      await local.kv.put(`intent:fence:${email}`, { desired: 'subscribed', at: intentAt + 1000, authenticated: true });
+      const sync = await (await stub.fetch('https://coordinator/sync', { method: 'POST' })).json();
+
+      assert.equal(sync.outcome, 'superseded');
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.intent.desired, 'subscribed');
+    } finally {
+      await local.dispose();
+    }
+  });
+});

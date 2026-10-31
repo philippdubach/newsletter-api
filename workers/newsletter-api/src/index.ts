@@ -813,11 +813,12 @@ async function publishFence(
   env: Env,
   email: string,
   desired: 'subscribed' | 'unsubscribed',
+  authenticated: boolean,
 ): Promise<void> {
   try {
     await env.NEWSLETTER_SUBSCRIBERS.put(
       fenceKey(email),
-      JSON.stringify({ desired, at: Date.now() } satisfies IntentFence),
+      JSON.stringify({ desired, at: Date.now(), authenticated } satisfies IntentFence),
       { expirationTtl: 86400 },
     );
   } catch {
@@ -836,10 +837,11 @@ async function publishIntent(
   email: string,
   clientIP: string,
   request: Request,
-): Promise<void> {
-  if (!stub) return;
+  authenticated = false,
+): Promise<IntentResult> {
+  if (!stub) return { outcome: 'completed' };
   try {
-    await stub.fetch('https://coordinator/intent', {
+    const response = await stub.fetch('https://coordinator/intent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -848,10 +850,14 @@ async function publishIntent(
         ip: clientIP,
         userAgent: request.headers.get('User-Agent') || 'unknown',
         recordOnly: true,
+        authenticated,
       }),
     });
+    if (!response.ok) return { outcome: 'failed', error: `coordinator HTTP ${response.status}` };
+    return await response.json() as IntentResult;
   } catch {
-    // Recorded in the shadow instead; nothing else to do here.
+    // The object is unreachable, which is what the fence is for.
+    return { outcome: 'failed', error: 'coordinator unreachable' };
   }
 }
 
@@ -987,8 +993,15 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
     }
 
     if (isLegacyMode(env)) {
-      await publishFence(env, email, 'subscribed');
-      await publishIntent(coordinatorStubFor(env, email), 'subscribed', email, clientIP, request);
+      const authenticated = requireAuth(request, env);
+      const published = await publishIntent(coordinatorStubFor(env, email), 'subscribed', email, clientIP, request, authenticated);
+      // The object may refuse this because a removal is unresolved. A rejected
+      // publish must stop the inline path, and must not leave a fence that would
+      // let a later retry adopt what was just refused.
+      if (published.outcome === 'unsubscribed') {
+        return subscribeResponse(published, request, env);
+      }
+      await publishFence(env, email, 'subscribed', authenticated);
     }
 
     // Fallback for environments without the binding (unit tests, local runs
@@ -1061,8 +1074,9 @@ async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionConte
     }
 
     if (isLegacyMode(env)) {
-      await publishFence(env, email, 'unsubscribed');
-      await publishIntent(coordinatorStubFor(env, email), 'unsubscribed', email, getClientIP(request), request);
+      // An unsubscribe is always authorized here: the token has been checked.
+      await publishFence(env, email, 'unsubscribed', true);
+      await publishIntent(coordinatorStubFor(env, email), 'unsubscribed', email, getClientIP(request), request, true);
     }
 
     if (!isListmonkConfigured(env)) {
@@ -1332,6 +1346,8 @@ interface CoordinatorIntent {
 interface IntentFence {
   desired: 'subscribed' | 'unsubscribed';
   at: number;
+  /** Whether the caller proved control of the address. */
+  authenticated?: boolean;
 }
 
 export function fenceKey(email: string): string {
@@ -1347,13 +1363,21 @@ export function fenceKey(email: string): string {
  * newer than the intent supersedes it, and a failed read never does.
  */
 export function supersessionDecision(
-  intent: { recordedAtMs: number },
+  intent: { recordedAtMs: number; desired: 'subscribed' | 'unsubscribed'; removalUnresolved?: boolean },
   fence: IntentFence | null,
   fenceReadFailed: boolean,
 ): 'run' | 'supersede' {
   if (fenceReadFailed) return 'run';
   if (!fence || typeof fence.at !== 'number') return 'run';
-  return fence.at > intent.recordedAtMs ? 'supersede' : 'run';
+  if (fence.at <= intent.recordedAtMs) return 'run';
+  // The same authorization rule as the intent path: an unauthenticated signup may
+  // not cancel an unsubscribe that has been accepted but not yet completed, so a
+  // fence written by one cannot supersede it either.
+  if (fence.desired === 'subscribed' && intent.desired === 'unsubscribed'
+    && intent.removalUnresolved && fence.authenticated !== true) {
+    return 'run';
+  }
+  return 'supersede';
 }
 
 interface CoordinatorPending {
@@ -1489,7 +1513,11 @@ export class SubscriptionCoordinator {
     // intent. An anonymous request must not cancel it; only a caller who proved
     // control of the address may resubscribe while it is in flight.
     const pendingBefore = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
-    const removalInFlight = pendingBefore?.kind === 'remove' && pendingBefore.seq === previous?.seq;
+    // The intent is what protects the removal, not the operation that happens to
+    // be queued next: a pending shadow repair is still an accepted unsubscribe.
+    const removalInFlight = previous?.desired === 'unsubscribed'
+      && pendingBefore != null
+      && pendingBefore.seq === previous.seq;
     if (input.desired === 'subscribed' && removalInFlight && !input.authenticated) {
       return { outcome: 'unsubscribed', seq: previous!.seq, desired: 'unsubscribed' };
     }
@@ -1543,7 +1571,9 @@ export class SubscriptionCoordinator {
     // otherwise a missing provider configuration leaves KV without the record and
     // Listmonk still mailing them.
     if (intent.desired === 'unsubscribed' && !isListmonkConfigured(this.env)) {
-      if (!fresh) return await this.scheduleRetry(intent, { outcome: 'failed', error: 'Listmonk not configured', retryable: false }, 'remove');
+      // Including the first attempt: deleting the shadow first would leave KV
+      // without the record while Listmonk still mails them.
+      return await this.scheduleRetry(intent, { outcome: 'failed', error: 'Listmonk not configured', retryable: false }, 'remove');
     }
 
     if (!fresh) {
@@ -1619,7 +1649,12 @@ export class SubscriptionCoordinator {
       const raw = await this.env.NEWSLETTER_SUBSCRIBERS.get(fenceKey(intent.email));
       if (!raw) return { decision: 'run', fence: null };
       const fence = JSON.parse(raw) as IntentFence;
-      return { decision: supersessionDecision(intent, fence, false), fence };
+      const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
+      const removalUnresolved = pending != null && pending.seq === intent.seq;
+      return {
+        decision: supersessionDecision({ ...intent, removalUnresolved }, fence, false),
+        fence,
+      };
     } catch {
       // An unreadable fence proves nothing. Never erase accepted work for it.
       return { decision: 'run', fence: null };
