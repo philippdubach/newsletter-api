@@ -65,6 +65,9 @@ ENVIRONMENT = "production"
 # Rollback lever: deploying this same code with "legacy" keeps the Durable Object
 # class and pending operations, but pauses subscriber writes and retries.
 COORDINATOR_MODE = "on"
+# New signups stay unconfirmed until the Listmonk opt-in link is clicked. Set to
+# "off" together with the list's opt-in type to return to single opt-in.
+DOUBLE_OPTIN = "on"
 # Overall budget for one provider phase, well under the 30-second Durable Object
 # reset threshold that applies while blockConcurrencyWhile is held.
 PROVIDER_BUDGET_MS = "20000"

@@ -20,6 +20,12 @@ export interface Env {
   LISTMONK_API_TOKEN?: string;
   LISTMONK_LIST_ID?: string;
   LISTMONK_WELCOME_TEMPLATE_ID?: string;
+  // "on": Listmonk mails an opt-in link and the subscription stays unconfirmed
+  // until it is clicked, so the Worker sends no welcome of its own.
+  DOUBLE_OPTIN?: string;
+  // Comma-separated client IPs refused at /api/subscribe. A secret, because
+  // workers.dev traffic does not pass through any zone's WAF rules.
+  BLOCKED_IPS?: string;
 
   // Rollback path: direct Plunk API call (kept as automatic fallback).
   // To force-rollback: remove LISTMONK_* secrets and Worker uses these instead.
@@ -276,6 +282,14 @@ async function verifyUnsubscribeToken(email: string, token: string | undefined, 
 function unsubscribeUrl(email: string, token: string, env: Env): string {
   const base = env.UNSUBSCRIBE_BASE_URL || DEFAULT_UNSUBSCRIBE_BASE_URL;
   return `${base}/api/unsubscribe?email=${encodeURIComponent(email)}&token=${encodeURIComponent(token)}`;
+}
+
+function isDoubleOptIn(env: Env): boolean {
+  return env.DOUBLE_OPTIN === 'on';
+}
+
+function isBlockedIP(ip: string, env: Env): boolean {
+  return (env.BLOCKED_IPS ?? '').split(',').some((blocked) => blocked.trim() === ip);
 }
 
 function getClientIP(request: Request): string {
@@ -602,7 +616,7 @@ async function createListmonkSubscriber(email: string, clientIP: string, env: En
         name: '',
         status: 'enabled',
         lists: [listId],
-        preconfirm_subscriptions: true,
+        preconfirm_subscriptions: !isDoubleOptIn(env),
         attribs: {
           source: 'newsletter-api',
           subscribed_ip: clientIP,
@@ -782,6 +796,7 @@ async function sendPlunkWelcomeFallback(subscriberEmail: string, env: Env, deadl
 interface IntentResult {
   outcome: SyncOutcome;
   created?: boolean;
+  awaitingConfirmation?: boolean;
   seq?: number;
   attempts?: number;
   error?: string;
@@ -840,6 +855,7 @@ async function submitIntent(
 }
 
 const TEXT_BLOCKLISTED = 'This address cannot be subscribed. Please contact us.';
+const TEXT_CONFIRM_SUBSCRIBE = 'Almost done. Please check your inbox and click the link to confirm your subscription.';
 const TEXT_UNSUBSCRIBED = 'This address is unsubscribed. Please contact us to resubscribe.';
 // An unreadable provider establishes nothing about the subscription, so the
 // wording must not claim the address is or is not on the list.
@@ -851,6 +867,9 @@ const TEXT_ACCEPTED_UNSUBSCRIBE = 'We received your request and will finish remo
 function subscribeResponse(result: IntentResult, request: Request, env: Env): Response {
   switch (result.outcome) {
     case 'completed':
+      if (result.awaitingConfirmation) {
+        return jsonResponse({ success: true, status: 'confirmation_required', message: TEXT_CONFIRM_SUBSCRIBE }, 200, request, env);
+      }
       return jsonResponse(
         { success: true, message: result.created ? 'Subscribed successfully' : 'Already subscribed' },
         200, request, env,
@@ -900,7 +919,7 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       return jsonResponse({ success: false, error: 'Request too large' }, 413, request, env);
     }
     const clientIP = getClientIP(request);
-    if (!await checkRateLimit(clientIP, env)) {
+    if (isBlockedIP(clientIP, env) || !await checkRateLimit(clientIP, env)) {
       return jsonResponse({ success: false, error: 'Too many requests. Please try again later.' }, 429, request, env);
     }
 
@@ -1271,6 +1290,7 @@ type SyncOutcome = 'completed' | 'unverified' | 'unsubscribed' | 'blocklisted' |
 interface SyncResult {
   outcome: SyncOutcome;
   created?: boolean;
+  awaitingConfirmation?: boolean;
   error?: string;
   reason?: string;
   attempts?: number;
@@ -1503,7 +1523,11 @@ export class SubscriptionCoordinator {
     // Both are the recipient's decision, taken elsewhere. Never overwrite them.
     if (upstream === 'blocklisted') return { outcome: 'blocklisted' };
     if (upstream === 'unsubscribed') return { outcome: 'unsubscribed' };
-    if (upstream === 'pending') return { outcome: 'unverified', reason, retryable: false };
+    if (upstream === 'pending') {
+      // Under double opt-in this is the normal state of an unclicked link.
+      if (isDoubleOptIn(this.env)) return { outcome: 'completed', created: false, awaitingConfirmation: true };
+      return { outcome: 'unverified', reason, retryable: false };
+    }
     if (upstream === 'unverified') {
       // A transient failure keeps its retry budget; a definitive one does not.
       return { outcome: 'unverified', reason, retryable: isRetryableLookupReason(reason) };
@@ -1517,6 +1541,10 @@ export class SubscriptionCoordinator {
     const current = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
     if (!current || current.seq !== intent.seq || current.desired !== 'subscribed') {
       return { outcome: 'superseded', retryable: false };
+    }
+
+    if (isDoubleOptIn(this.env) && !created.duplicate) {
+      return { outcome: 'completed', created: true, awaitingConfirmation: true };
     }
 
     if (!created.duplicate) {

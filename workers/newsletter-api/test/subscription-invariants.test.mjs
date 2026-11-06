@@ -1218,3 +1218,75 @@ describe('a removal never deletes the shadow before it can act', () => {
     }
   });
 });
+
+describe('double opt-in', () => {
+  const OPTIN_BINDINGS = { ...PROVIDER_BINDINGS, DOUBLE_OPTIN: 'on' };
+
+  function post(local, email, ip) {
+    return local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+      body: JSON.stringify({ email }),
+    });
+  }
+
+  it('leaves the confirmation to Listmonk and sends no welcome', async () => {
+    const email = 'invariant-optin@example.com';
+    const store = createProviderStub();
+    const local = await startRuntime({ extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+    try {
+      const response = await post(local, email, '198.51.100.80');
+      const body = await response.json();
+      await local.drain();
+
+      assert.equal(body.success, true);
+      assert.equal(body.status, 'confirmation_required');
+      assert.equal(JSON.parse(store.mutations()[0].body).preconfirm_subscriptions, false);
+      assert.equal(store.calls.filter((call) => call.path === '/api/tx').length, 0);
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it('does not recreate or report a failure for an unclicked link', async () => {
+    const email = 'invariant-optin-pending@example.com';
+    const store = createProviderStub();
+    store.subscribers.set(email, { email, status: 'enabled', lists: [{ id: LIST_ID, subscription_status: 'unconfirmed' }] });
+    const local = await startRuntime({ extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+    try {
+      const response = await post(local, email, '198.51.100.81');
+      const body = await response.json();
+      await local.drain();
+
+      assert.equal(body.status, 'confirmation_required');
+      assert.equal(store.mutations().length, 0);
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('blocked addresses', () => {
+  it('refuses a blocked caller before any provider call', async () => {
+    const store = createProviderStub();
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, BLOCKED_IPS: '203.0.113.9, 2001:db8::9' },
+      outboundService: store.handler,
+    });
+    try {
+      for (const ip of ['203.0.113.9', '2001:db8::9']) {
+        const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+          body: JSON.stringify({ email: 'invariant-blocked@example.com' }),
+        });
+        await response.json();
+        assert.equal(response.status, 429);
+      }
+      await local.drain();
+      assert.equal(store.calls.length, 0);
+    } finally {
+      await local.dispose();
+    }
+  });
+});
