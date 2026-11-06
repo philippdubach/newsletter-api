@@ -28,6 +28,10 @@ npm run deploy:production   # Deploy to production — USE THIS
 2. `ctx.waitUntil` → `createListmonkSubscriber` (POST `/api/subscribers`) → `sendListmonkWelcome` (POST `/api/tx` with template id from `LISTMONK_WELCOME_TEMPLATE_ID`, pre-fetching the latest newsletter URL from R2).
 3. On any Listmonk failure, falls back to `sendPlunkWelcomeFallback` with a legacy hardcoded welcome. Note: `/api/tx` is asynchronous, so an SMTP failure *inside* Listmonk does not trigger this fallback; it only shows in `journalctl -u listmonk` on the server.
 
+With `DOUBLE_OPTIN = "on"` (production), the coordinator creates the subscriber with `preconfirm_subscriptions: false` and sends no welcome. Listmonk mails the opt-in link because list 3 is a double opt-in list, and the response carries `status: "confirmation_required"`. Change the Worker var and the list's opt-in type together.
+
+`BLOCKED_IPS` is an optional comma-separated secret of client IPs refused at `/api/subscribe`. It lives in the Worker because zone WAF rules do not cover the `workers.dev` hostname.
+
 To bypass Listmonk: delete `LISTMONK_API_USER` and `LISTMONK_API_TOKEN` secrets — `isListmonkConfigured()` will return false and the Worker will send the welcome via Plunk directly.
 
 **Subscriber-count** (`/api/subscriber-count`): Listmonk is the source of truth. Calls `GET /api/subscribers?list_id={LISTMONK_LIST_ID}&per_page=1` and reads `data.total`. This avoids the JOIN double-count bug in `/api/lists/{id}.subscriber_count`. Falls back to counting KV keys (excluding `rate_limit:*` and `cache:*`) if Listmonk is unreachable. Adds LinkedIn follower counts (cached, scraped from `LINKEDIN_NEWSLETTER_URLS`) and rounds the total up to the nearest 10. The combined response is cached in KV under `cache:subscriber_count` for 10 minutes.
