@@ -1,0 +1,16 @@
+{{ define "message" }}
+    {{ template "header" .}}
+    {{ if eq .Data.Title "Confirmed" }}
+        <meta http-equiv="refresh" content="0; url=https://philippdubach.com/#subscribed">
+    {{ end }}
+
+    <h2>{{ .Data.Title }}</h2>
+    <div>
+        {{ .Data.Message }}
+    </div>
+    {{ if eq .Data.Title "Confirmed" }}
+        <p><a href="https://philippdubach.com/#subscribed">Continue to philippdubach.com</a></p>
+    {{ end }}
+
+    {{ template "footer" .}}
+{{ end }}
