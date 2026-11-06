@@ -239,6 +239,24 @@ describe('an existing KV record is not evidence of provider membership', () => {
     // this path a failed background write has no retry channel at all.
     assert.equal(provider.mutations().length, 1);
   });
+
+  it('records the caller as subscribed_ip on the created subscriber', async () => {
+    const email = 'invariant-client-ip@example.com';
+    const clientIP = '198.51.100.77';
+
+    const response = await harness.runtime.dispatchFetch('http://localhost/api/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': clientIP },
+      body: JSON.stringify({ email }),
+    });
+    await response.json();
+    await drain();
+
+    // This is the only consent evidence Listmonk keeps, so it must name the
+    // caller and not the object that relayed the request.
+    const created = provider.mutations().find((call) => JSON.parse(call.body).email === email);
+    assert.equal(JSON.parse(created.body).attribs.subscribed_ip, clientIP);
+  });
 });
 
 describe('the answer is only sent once provider state is known', () => {

@@ -1509,7 +1509,7 @@ export class SubscriptionCoordinator {
       return { outcome: 'unverified', reason, retryable: isRetryableLookupReason(reason) };
     }
 
-    const created = await createListmonkSubscriber(intent.email, 'coordinator', this.env, deadline);
+    const created = await createListmonkSubscriber(intent.email, intent.ip ?? 'unknown', this.env, deadline);
     if (!created.success) return { outcome: 'failed', error: created.error ?? 'create failed', retryable: true };
 
     // Fence before any mail is sent: a welcome for an intent that has already been
