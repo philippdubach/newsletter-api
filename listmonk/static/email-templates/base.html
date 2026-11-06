@@ -1,0 +1,76 @@
+{{ define "header" }}
+<!doctype html>
+<html lang="en">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1" />
+    <meta name="color-scheme" content="light only">
+    <meta name="supported-color-schemes" content="light only">
+    <base target="_blank">
+    <style type="text/css">
+        :root { color-scheme: light only; }
+        body, table, td, a { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+        table, td { mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+        img { -ms-interpolation-mode: bicubic; border: 0; height: auto; line-height: 100%; outline: none; text-decoration: none; }
+        .content h2 { margin: 0 0 20px 0; font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 28px; font-weight: 700; color: #1a1a1a; line-height: 1.25; letter-spacing: -0.02em; }
+        .content p, .content li { font-family: Georgia, 'Times New Roman', Times, serif; font-size: 16px; line-height: 1.65; color: #333333; }
+        .content a { color: #c8102e; text-decoration: none; }
+        .content a.button { display: inline-block; background-color: #c8102e; border-radius: 6px; color: #ffffff; font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 600; line-height: 48px; padding: 0 32px; }
+        @media screen and (max-width: 600px) {
+            .wrapper { width: 100% !important; max-width: 100% !important; }
+            .mobile-padding { padding-left: 20px !important; padding-right: 20px !important; }
+        }
+    </style>
+</head>
+<body style="margin: 0; padding: 0; background-color: #ffffff;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color: #ffffff; margin: 0; padding: 0;">
+        <tr>
+            <td align="center" style="padding: 0; margin: 0;">
+                <table class="wrapper" role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="max-width: 600px; width: 100%; margin: 0 auto; background-color: #ffffff;">
+                    <tr>
+                        <td class="mobile-padding" style="padding: 48px 24px 0 24px;">
+                            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                                <tr>
+                                    <td style="padding-bottom: 16px;">
+                                        <a href="https://philippdubach.com" style="text-decoration: none; display: inline-block;">
+                                            <img src="https://philippdubach.com/icons/favicon-96x96.png" alt="" width="18" height="18" style="display: inline-block; width: 18px; height: 18px; vertical-align: middle; margin-right: 6px; border-radius: 3px; border: 0;"><span style="font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 16px; font-weight: 700; color: #1a1a1a; vertical-align: middle; letter-spacing: -0.01em;">philippdubach</span>
+                                        </a>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="border-top: 1.5px solid #c8102e; padding-top: 10px;">
+                                        <span style="font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #999999;">Newsletter</span>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="mobile-padding content" style="padding: 40px 24px 0 24px;">
+{{ end }}
+
+{{ define "footer" }}
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="mobile-padding" style="padding: 48px 24px 28px 24px;">
+                            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                                <tr>
+                                    <td align="center" style="border-top: 1px solid #e5e5e5; padding: 24px 0 4px 0; font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 12px; color: #999999;">
+                                        <a href="https://philippdubach.com" style="color: #999999; text-decoration: none;">Blog</a>
+                                        <span style="color: #dddddd;">&nbsp;&middot;&nbsp;</span>
+                                        <a href="https://philippdubach.com/projects/" style="color: #999999; text-decoration: none;">Projects</a>
+                                        <span style="color: #dddddd;">&nbsp;&middot;&nbsp;</span>
+                                        <a href="https://philippdubach.com/research/" style="color: #999999; text-decoration: none;">Research</a>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+{{ end }}

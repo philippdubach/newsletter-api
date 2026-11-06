@@ -1,0 +1,40 @@
+{{ define "header" }}
+<!DOCTYPE html>
+<html>
+<head>
+	<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />	
+	<title>{{ .Data.Title }} - {{ .SiteName }}</title>
+	<meta name="description" content="{{ .Data.Description }}" />
+	<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1" />
+
+	{{ if .EnablePublicArchive }}
+		<link rel="alternate" type="application/rss+xml" title="{{ L.T "public.archiveTitle" }} - {{ .SiteName }}"
+			href="{{ .RootURL }}/archive.xml" />
+	{{ end }}
+
+	<link href="/public/static/style.css?v={{ .AssetVersion }}" rel="stylesheet" type="text/css" />
+	<link href="/public/custom.css?v={{ .AssetVersion }}" rel="stylesheet" type="text/css">
+	<script src="/public/custom.js?v={{ .AssetVersion }}" async defer></script>
+
+	<link rel="icon" href="https://philippdubach.com/icons/favicon-96x96.png" type="image/png" />
+</head>
+<body>
+    <div class="container wrap">
+		<header class="header">
+			<div class="logo">
+				<a href="https://philippdubach.com" aria-label="philippdubach"></a>
+			</div>
+		</header>
+{{ end }}
+
+{{ define "footer" }}
+	</div>
+	
+	<footer class="container">
+		<a href="https://philippdubach.com">Blog</a> &middot;
+		<a href="https://philippdubach.com/projects/">Projects</a> &middot;
+		<a href="https://philippdubach.com/research/">Research</a>
+	</footer>
+</body>
+</html>
+{{ end }}

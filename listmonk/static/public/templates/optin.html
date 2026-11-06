@@ -1,0 +1,33 @@
+{{ define "optin" }}
+{{ template "header" .}}
+{{/* A browser follows this redirect, so the email button is the only click.
+     Plain link scanners do not, which keeps a fetched link from confirming. */}}
+<meta http-equiv="refresh" content="0; url={{ .RootURL }}/subscription/optin/{{ .Data.SubUUID }}?confirm=true{{ range .Data.Lists }}&l={{ .UUID }}{{ end }}">
+<section>
+    <h2>{{ L.T "public.confirmSubTitle" }}</h2>
+    <p>
+        {{ L.T "public.confirmSubInfo" }}
+    </p>
+
+    <form method="post" class="optin-form">
+        <ul>
+            {{ range $i, $l := .Data.Lists }}
+                <input type="hidden" name="l" value="{{ $l.UUID }}" />
+                {{ if eq $l.Type "public" }}
+                    <li>{{ $l.Name }}</li>
+                {{ else }}
+                    <li>{{ L.Ts "public.subPrivateList" }}</li>
+                {{ end }}
+            {{ end }}
+        </ul>
+        <p>
+            <input type="hidden" name="confirm" value="true" />
+            <button type="submit" class="button" id="btn-unsub">
+                {{ L.Ts "public.confirmSub" }}
+            </button>
+        </p>
+    </form>
+</section>
+
+{{ template "footer" .}}
+{{ end }}
