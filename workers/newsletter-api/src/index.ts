@@ -1329,6 +1329,12 @@ const WELCOME_KEY = 'welcome-seq';
 const OPTIN_RESENT_KEY = 'optin-resent-at';
 // Anyone can submit any address, so this bounds the mail one address can receive.
 const OPTIN_RESEND_WINDOW_MS = 24 * 60 * 60_000;
+const OPTIN_REMINDER_KEY = 'optin-reminder-at';
+// One reminder for a link that is still unclicked two days after the signup.
+const OPTIN_REMINDER_DELAY_MS = 48 * 60 * 60_000;
+// A Listmonk outage delays the reminder. After the limit, the reminder is dropped.
+const OPTIN_REMINDER_RETRY_MS = 60 * 60_000;
+const OPTIN_REMINDER_MAX_DELAY_MS = 24 * 60 * 60_000;
 // Total attempts, including the initial request; at most seven scheduled retries.
 const MAX_SYNC_ATTEMPTS = 8;
 // The whole provider phase must finish well inside the 30-second limit after which
@@ -1436,6 +1442,7 @@ export class SubscriptionCoordinator {
           intent: (await this.state.storage.get(INTENT_KEY)) ?? null,
           pending: (await this.state.storage.get(PENDING_KEY)) ?? null,
           exhausted: (await this.state.storage.get(EXHAUSTED_KEY)) ?? null,
+          reminder: (await this.state.storage.get(OPTIN_REMINDER_KEY)) ?? null,
           alarm: await this.state.storage.getAlarm(),
         });
       }
@@ -1452,17 +1459,19 @@ export class SubscriptionCoordinator {
   async alarm(): Promise<void> {
     await this.runExclusive(async () => {
       const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
-      if (!pending) return;
-      if (isLegacyMode(this.env)) {
-        await this.state.storage.setAlarm(Date.now() + 60_000);
-        return;
+      if (pending) {
+        if (isLegacyMode(this.env)) {
+          await this.state.storage.setAlarm(Date.now() + 60_000);
+          return;
+        }
+        const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
+        if (!intent || intent.seq !== pending.seq) {
+          await this.state.storage.delete(PENDING_KEY);
+        } else {
+          await this.sync();
+        }
       }
-      const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
-      if (!intent || intent.seq !== pending.seq) {
-        await this.state.storage.delete(PENDING_KEY);
-        return;
-      }
-      await this.sync();
+      await this.sendDueReminder();
     });
   }
 
@@ -1593,13 +1602,13 @@ export class SubscriptionCoordinator {
     }
     if (result.outcome === 'completed') {
       await this.state.storage.delete(PENDING_KEY);
-      await this.state.storage.deleteAlarm();
+      await this.endRetries();
       return result;
     }
     if (result.outcome === 'unsubscribed' || result.outcome === 'blocklisted') {
       // A decision by the recipient, not a failure.
       await this.state.storage.delete(PENDING_KEY);
-      await this.state.storage.deleteAlarm();
+      await this.endRetries();
       return result;
     }
     return await this.scheduleRetry(intent, result, intent.desired === 'subscribed' ? 'create' : 'remove');
@@ -1659,6 +1668,7 @@ export class SubscriptionCoordinator {
     }
 
     if (isDoubleOptIn(this.env) && !created.duplicate) {
+      await this.state.storage.put(OPTIN_REMINDER_KEY, Date.now() + OPTIN_REMINDER_DELAY_MS);
       return { outcome: 'completed', created: true, awaitingConfirmation: true };
     }
 
@@ -1697,6 +1707,55 @@ export class SubscriptionCoordinator {
     }
   }
 
+  /**
+   * Mails the opt-in link once more to an address that has not clicked it. The key
+   * goes before the send, so a crash cannot mail twice. Only a lookup that could not
+   * answer keeps the reminder. The resend window still applies, so a recent resend
+   * uses up the reminder and no second mail goes out.
+   */
+  private async sendDueReminder(): Promise<void> {
+    const due = await this.state.storage.get<number>(OPTIN_REMINDER_KEY);
+    if (due === undefined) return;
+    // The retry alarm is armed, and endRetries() rearms this reminder.
+    if (await this.state.storage.get(PENDING_KEY)) return;
+    if (isLegacyMode(this.env)) {
+      await this.state.storage.setAlarm(Date.now() + 60_000);
+      return;
+    }
+    if (Date.now() < due) {
+      await this.state.storage.setAlarm(due);
+      return;
+    }
+    const intent = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
+    if (intent?.desired !== 'subscribed' || !isDoubleOptIn(this.env)) {
+      await this.state.storage.delete(OPTIN_REMINDER_KEY);
+      return;
+    }
+
+    const controller = new AbortController();
+    const budget = setTimeout(() => controller.abort(), providerBudgetMs(this.env));
+    try {
+      const { state: upstream, reason, id } = await lookupListmonkSubscriber(intent.email, this.env, controller.signal);
+      if (upstream === 'unverified' && isRetryableLookupReason(reason)
+        && Date.now() - due < OPTIN_REMINDER_MAX_DELAY_MS) {
+        await this.state.storage.setAlarm(Date.now() + OPTIN_REMINDER_RETRY_MS);
+        return;
+      }
+      await this.state.storage.delete(OPTIN_REMINDER_KEY);
+      // Any other state means the reader clicked, left or was blocked.
+      if (upstream === 'pending') await this.resendOptin(intent, id, controller.signal);
+    } finally {
+      clearTimeout(budget);
+    }
+  }
+
+  /** Retry work is over. The one alarm that can remain is a waiting reminder. */
+  private async endRetries(): Promise<void> {
+    const reminder = await this.state.storage.get<number>(OPTIN_REMINDER_KEY);
+    if (reminder === undefined) await this.state.storage.deleteAlarm();
+    else await this.state.storage.setAlarm(reminder);
+  }
+
   private async syncUnsubscribed(intent: CoordinatorIntent, deadline: AbortSignal): Promise<SyncResult> {
     if (!isListmonkConfigured(this.env)) {
       return { outcome: 'failed', error: 'Listmonk not configured', retryable: false };
@@ -1716,7 +1775,7 @@ export class SubscriptionCoordinator {
     if (result.retryable === false) {
       // Terminal: keep the reason, drop the work, do not wake up again.
       await this.state.storage.delete(PENDING_KEY);
-      await this.state.storage.deleteAlarm();
+      await this.endRetries();
       return result;
     }
 
@@ -1734,7 +1793,7 @@ export class SubscriptionCoordinator {
         at: new Date().toISOString(),
       });
       await this.state.storage.delete(PENDING_KEY);
-      await this.state.storage.deleteAlarm();
+      await this.endRetries();
       return { outcome: 'failed', error: lastError, attempts, retryable: false };
     }
 

@@ -1394,6 +1394,134 @@ describe('double opt-in', () => {
       }
     });
 
+    describe('the 48-hour reminder', () => {
+      const intent = (email, desired = 'subscribed') => ({ email, desired, seq: 1, updatedAt: new Date().toISOString() });
+      const seedState = (stub, seed) => stub.fetch('https://coordinator/fixture', { method: 'POST', body: JSON.stringify({ seed }) });
+      const settled = async (stub) => {
+        for (let i = 0; i < 200; i++) {
+          const current = await state(stub);
+          const metrics = await (await stub.fetch('https://coordinator/metrics')).json();
+          const waiting = metrics.delays.at(-1) > 1000;
+          if (current.pending === null && (current.reminder === null || waiting)) return { ...current, requested: metrics.delays.at(-1) };
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        assert.fail(`the reminder did not settle: ${JSON.stringify(await state(stub))}`);
+      };
+      async function withReminder(email, seed, check, { subscriber = unconfirmed(email), wrap } = {}) {
+        const store = createProviderStub();
+        if (subscriber) store.subscribers.set(email, subscriber);
+        const base = store.handler;
+        const local = await startRuntime({
+          scheduler: true,
+          extraBindings: OPTIN_BINDINGS,
+          outboundService: wrap ? wrap(base) : base,
+        });
+        try {
+          const stub = await local.coordinator(email);
+          await seedState(stub, seed);
+          await check(stub, store);
+        } finally {
+          await local.dispose();
+        }
+      }
+
+      it('waits 48 hours after a first signup', async () => {
+        const email = 'invariant-reminder-armed@example.com';
+        const store = createProviderStub();
+        const local = await startRuntime({ scheduler: true, extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+        try {
+          const before = Date.now();
+          const body = await (await post(local, email, '198.51.100.90')).json();
+          await local.drain();
+
+          assert.equal(body.status, 'confirmation_required');
+          const stored = await settled(await local.coordinator(email));
+          assert.ok(Math.abs(stored.reminder - before - 48 * HOUR) < 60_000, 'the reminder is due in 48 hours');
+          assert.ok(Math.abs(stored.requested - 48 * HOUR) < 60_000, 'the end of the signup must leave the reminder armed');
+          assert.equal(resends(store).length, 0);
+        } finally {
+          await local.dispose();
+        }
+      });
+
+      it('mails an unclicked link once, and does not arm again', async () => {
+        const email = 'invariant-reminder-due@example.com';
+        await withReminder(email, { intent: intent(email), 'optin-reminder-at': Date.now() - 1000 }, async (stub, store) => {
+          const stored = await settled(stub);
+          assert.deepEqual(resends(store).map((call) => call.path), ['/api/subscribers/4242/optin']);
+          assert.equal(stored.reminder, null);
+          assert.equal(stored.alarm, null);
+          assert.equal(store.mutations().length, 0);
+        });
+      });
+
+      for (const [name, status] of [['confirmed', 'confirmed'], ['unsubscribed', 'unsubscribed']]) {
+        it(`sends nothing to a ${name} reader`, async () => {
+          const email = `invariant-reminder-${name}@example.com`;
+          const subscriber = { ...unconfirmed(email), lists: [{ id: LIST_ID, subscription_status: status }] };
+          await withReminder(email, { intent: intent(email), 'optin-reminder-at': Date.now() - 1000 }, async (stub, store) => {
+            const stored = await settled(stub);
+            assert.equal(resends(store).length, 0);
+            assert.equal(stored.reminder, null);
+          }, { subscriber });
+        });
+      }
+
+      it('sends nothing after the reader asked to leave', async () => {
+        const email = 'invariant-reminder-left@example.com';
+        await withReminder(email, { intent: intent(email, 'unsubscribed'), 'optin-reminder-at': Date.now() - 1000 }, async (stub, store) => {
+          const stored = await settled(stub);
+          assert.equal(resends(store).length, 0);
+          assert.equal(stored.reminder, null);
+        });
+      });
+
+      it('counts as a resend, so one sent recently stops it', async () => {
+        const email = 'invariant-reminder-recent@example.com';
+        const seed = { intent: intent(email), 'optin-reminder-at': Date.now() - 1000, 'optin-resent-at': Date.now() - HOUR };
+        await withReminder(email, seed, async (stub, store) => {
+          const stored = await settled(stub);
+          assert.equal(resends(store).length, 0);
+          assert.equal(stored.reminder, null);
+        });
+      });
+
+      const lookupFails = (base) => async (request) => (
+        new URL(request.url).pathname === '/api/subscribers' ? new Response('{}', { status: 503 }) : base(request)
+      );
+
+      it('keeps the reminder through a Listmonk outage', async () => {
+        const email = 'invariant-reminder-outage@example.com';
+        await withReminder(email, { intent: intent(email), 'optin-reminder-at': Date.now() - 1000 }, async (stub, store) => {
+          const stored = await settled(stub);
+          assert.equal(resends(store).length, 0);
+          assert.ok(stored.reminder, 'an unanswered lookup must keep the reminder');
+          assert.ok(Math.abs(stored.requested - HOUR) < 60_000, 'the next attempt is in one hour');
+        }, { wrap: lookupFails });
+      });
+
+      it('drops the reminder when the outage outlasts the limit', async () => {
+        const email = 'invariant-reminder-stale@example.com';
+        await withReminder(email, { intent: intent(email), 'optin-reminder-at': Date.now() - 25 * HOUR }, async (stub, store) => {
+          const stored = await settled(stub);
+          assert.equal(resends(store).length, 0);
+          assert.equal(stored.reminder, null);
+          assert.equal(stored.alarm, null);
+        }, { wrap: lookupFails });
+      });
+
+      it('survives retry work that ends first', async () => {
+        const email = 'invariant-reminder-retry@example.com';
+        const due = Date.now() + 40 * HOUR;
+        const pending = { kind: 'create', seq: 1, attempts: 1, lastError: 'x', nextAt: Date.now() };
+        await withReminder(email, { intent: intent(email), pending, 'optin-reminder-at': due }, async (stub) => {
+          const stored = await settled(stub);
+          assert.equal(stored.reminder, due);
+          assert.ok(Math.abs(stored.requested - 40 * HOUR) < 60_000, 'finished retries must not cancel the reminder');
+        });
+      });
+    });
+
     for (const [age, expected] of [[23, 0], [25, 1]]) {
       it(`${expected ? 'resends' : 'holds back'} when the last resend was ${age} hours ago`, async () => {
         const email = `invariant-resend-${age}h@example.com`;

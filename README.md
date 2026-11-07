@@ -25,7 +25,7 @@ Email button -> philippdubach.com/?confirm#<id> -> POST /api/confirm -> Listmonk
 2. The Worker checks the blocklist, the rate limit and the honeypot field.
 3. `SubscriptionCoordinator` is one Durable Object for each address. It records the intent, so a signup and an unsubscribe cannot overlap.
 4. The coordinator reads the current state from Listmonk. It creates the subscriber if the address is absent. It does not overwrite a blocklisted or unsubscribed address.
-5. Listmonk sends the confirmation email, because list 3 is a double opt-in list.
+5. Listmonk sends the confirmation email, because list 3 is a double opt-in list. If the link is unclicked after 48 hours, the coordinator asks Listmonk to send it once more.
 6. The email button opens the site. The site posts the subscriber id to `/api/confirm`, and the Worker confirms in Listmonk.
 
 The Worker sends no welcome email while `DOUBLE_OPTIN` is `on`.

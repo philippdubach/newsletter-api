@@ -31,6 +31,8 @@ npm run deploy:production   # Deploy to production — USE THIS
 3. The coordinator reads Listmonk, then creates the subscriber if the address is absent. It writes the KV shadow record. A transient failure retries by alarm, with eight attempts in total. A 4xx create and a subscriber with no list row are terminal. Exhausted work is stored under `exhausted` and shown by `/state`.
 4. With `DOUBLE_OPTIN = "on"` (production), the create uses `preconfirm_subscriptions: false`, and the Worker sends no welcome. Listmonk mails the opt-in link because list 3 is a double opt-in list. The response carries `status: "confirmation_required"`. Change the Worker var and the list's opt-in type together. If the address is already unconfirmed, the coordinator resends the opt-in at most once per 24 hours.
 
+**Reminder:** a first signup under double opt-in stores `optin-reminder-at`, 48 hours ahead. The reminder shares the coordinator's alarm with retries, so `endRetries()` must rearm it. At the due time, `sendDueReminder()` resends the opt-in once if Listmonk still reports the address as unconfirmed. The 24-hour resend window also applies.
+
 **Confirm flow** (`handleConfirm`): the email links to `philippdubach.com/?confirm#<subscriber uuid>`. The site posts the id to `/api/confirm`, and the Worker posts to Listmonk's public `/subscription/optin/<uuid>`. Do not change the link format. The query avoids a stale cached homepage, and the fragment keeps the id out of logs. See `OPERATIONS.md` in the site repository.
 
 `BLOCKED_IPS` is an optional comma-separated secret. It lives in the Worker because zone WAF rules do not cover the `workers.dev` hostname.
