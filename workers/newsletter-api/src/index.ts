@@ -1233,6 +1233,15 @@ const COMBINED_COUNT_CACHE_KEY = 'cache:subscriber_count';
 const LINKEDIN_LAST_KNOWN_PREFIX = 'cache:linkedin_last_known:';
 const COMBINED_COUNT_CACHE_TTL = 600;
 
+/** A KV failure must not hide a healthy Listmonk answer, so a miss is the worst case. */
+async function readCountCache(key: string, env: Env): Promise<string | null> {
+  try {
+    return await env.NEWSLETTER_SUBSCRIBERS.get(key);
+  } catch {
+    return null;
+  }
+}
+
 function linkedInLastKnownKey(url: string): string {
   let hash = 0;
   for (let i = 0; i < url.length; i++) {
@@ -1262,7 +1271,7 @@ async function fetchOneLinkedInFollowers(url: string, env: Env, ctx: ExecutionCo
     return count;
   } catch {
     clearTimeout(timeoutId);
-    const lastKnown = await env.NEWSLETTER_SUBSCRIBERS.get(cacheKey);
+    const lastKnown = await readCountCache(cacheKey, env);
     return lastKnown ? parseInt(lastKnown, 10) || 0 : 0;
   }
 }
@@ -1801,7 +1810,7 @@ export default {
 
     if (path === '/api/subscriber-count' && request.method === 'GET') {
       try {
-        const cached = await env.NEWSLETTER_SUBSCRIBERS.get(COMBINED_COUNT_CACHE_KEY);
+        const cached = await readCountCache(COMBINED_COUNT_CACHE_KEY, env);
         if (cached) {
           return jsonResponse(JSON.parse(cached), 200, request, env);
         }
@@ -1821,7 +1830,7 @@ export default {
             cursor = result.list_complete ? undefined : result.cursor;
           } while (cursor);
           return count;
-        })();
+        })().catch(() => null);
 
         const [listmonkCount, kvCount, linkedInCount] = await Promise.all([
           fetchListmonkSubscriberCount(env),
@@ -1830,6 +1839,7 @@ export default {
         ]);
 
         const subscriberCount = listmonkCount ?? kvCount;
+        if (subscriberCount === null) throw new Error('no subscriber count source answered');
         const total = subscriberCount + linkedInCount;
         const displayCount = Math.ceil(total / 10) * 10;
         const payload = { count: displayCount, display: `${displayCount}+` };

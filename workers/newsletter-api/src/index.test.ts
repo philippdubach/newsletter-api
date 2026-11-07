@@ -620,6 +620,51 @@ describe('Newsletter API', () => {
       expect(body.count).toBe(10);
       expect(body.display).toBe('10+');
     });
+
+    function listmonkCount(total: number): Response {
+      return new Response(JSON.stringify({ data: { total } }), { status: 200 });
+    }
+
+    async function count(): Promise<{ count: number; display: string }> {
+      const response = await worker.fetch(new Request('https://api.example.com/api/subscriber-count'), mockEnv, mockCtx);
+      expect(response.status).toBe(200);
+      return await response.json() as { count: number; display: string };
+    }
+
+    it('keeps the Listmonk number when the KV list fails', async () => {
+      global.fetch = vi.fn().mockResolvedValue(listmonkCount(123));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.list.mockRejectedValue(new Error('kv unavailable'));
+
+      expect(await count()).toEqual({ count: 130, display: '130+' });
+    });
+
+    it('keeps the Listmonk number when every KV read fails', async () => {
+      mockEnv.LINKEDIN_NEWSLETTER_URLS = 'https://linkedin.example.com/newsletter';
+      global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).startsWith('https://linkedin.example.com')) return new Response('down', { status: 503 });
+        return listmonkCount(123);
+      }) as unknown as typeof fetch;
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockRejectedValue(new Error('kv unavailable'));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.list.mockRejectedValue(new Error('kv unavailable'));
+
+      expect(await count()).toEqual({ count: 130, display: '130+' });
+    });
+
+    it('keeps the live answer when the cache write fails', async () => {
+      global.fetch = vi.fn().mockResolvedValue(listmonkCount(123));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.list.mockResolvedValue({ keys: [], list_complete: true });
+      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockRejectedValue(new Error('kv unavailable'));
+
+      expect(await count()).toEqual({ count: 130, display: '130+' });
+    });
+
+    it('answers 0+ and caches nothing when both sources fail', async () => {
+      global.fetch = vi.fn().mockRejectedValue(new Error('provider unreachable'));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.list.mockRejectedValue(new Error('kv unavailable'));
+
+      expect(await count()).toEqual({ count: 0, display: '0+' });
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.put).not.toHaveBeenCalled();
+    });
   });
 
   describe('GET /api/health', () => {
