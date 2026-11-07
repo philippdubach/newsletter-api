@@ -32,7 +32,7 @@ The Worker sends no welcome email while `DOUBLE_OPTIN` is `on`.
 
 Listmonk is the source of truth. KV keeps a shadow record with the time, IP address and user agent of each signup. KV also holds the rate limit counters and caches. A KV record does not prove that an address is subscribed.
 
-A failed provider call retries by Durable Object alarm. There are eight attempts in total. After that, an operator must investigate.
+A failed provider call retries by Durable Object alarm. There are eight attempts in total. After that, the coordinator stores an `exhausted` record, and an operator must investigate. The next accepted intent clears the record. A 4xx answer to a create, other than 409 and 429, is final and does not retry.
 
 ## Endpoints
 

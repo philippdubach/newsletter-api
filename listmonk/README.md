@@ -8,6 +8,8 @@
 The site posts that id to the Worker's `/api/confirm`, so the reader sees one
 page and a plain fetch of the link confirms nothing. The `<title data-i18n>` tag
 sets the subject. `optin.html` and `message.html` remain for links already sent.
+The Worker also reads `message.html`: `/api/confirm` reports success only when
+the page has the title "Confirmed" in an `h2`.
 
 Recheck these copies against upstream when upgrading Listmonk. `index.html` and
 `optin.html` start from the upstream files. `optin.html` adds a redirect that
