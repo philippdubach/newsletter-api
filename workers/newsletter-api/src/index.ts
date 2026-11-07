@@ -1345,6 +1345,8 @@ interface CoordinatorPending {
   attempts: number;
   lastError: string | null;
   nextAt: number;
+  /** The provider removal for this intent succeeded; only the shadow is owed. */
+  providerRemoved?: boolean;
 }
 
 type SyncOutcome = 'completed' | 'unverified' | 'unsubscribed' | 'blocklisted' | 'pending' | 'failed' | 'superseded';
@@ -1516,9 +1518,13 @@ export class SubscriptionCoordinator {
     // The shadow is repaired on every attempt, not only the first. Otherwise a
     // failed shadow write is never retried and the two stores drift permanently.
     const shadow = await this.applyShadow(intent);
-    if (!shadow.ok) {
+    // A signup waits for the shadow. A removal does not: Listmonk decides who gets
+    // mail, so a KV outage must not keep a reader on the list.
+    if (!shadow.ok && intent.desired === 'subscribed') {
       return await this.scheduleRetry(intent, { outcome: 'failed', error: shadow.error, retryable: true }, 'shadow');
     }
+    const pending = await this.state.storage.get<CoordinatorPending>(PENDING_KEY);
+    const providerRemoved = pending?.seq === intent.seq && pending.providerRemoved === true;
 
     // One deadline covers lookup, create, welcome and fallback, so the exclusive
     // section cannot outlive the runtime's patience.
@@ -1526,9 +1532,9 @@ export class SubscriptionCoordinator {
     const budget = setTimeout(() => controller.abort(), providerBudgetMs(this.env));
     let result: SyncResult;
     try {
-      result = intent.desired === 'subscribed'
-        ? await this.syncSubscribed(intent, controller.signal)
-        : await this.syncUnsubscribed(intent, controller.signal);
+      if (intent.desired === 'subscribed') result = await this.syncSubscribed(intent, controller.signal);
+      else if (providerRemoved) result = { outcome: 'completed' };
+      else result = await this.syncUnsubscribed(intent, controller.signal);
     } finally {
       clearTimeout(budget);
     }
@@ -1546,6 +1552,9 @@ export class SubscriptionCoordinator {
       return { ...result, outcome: 'superseded', retryable: false };
     }
 
+    if (!shadow.ok && result.outcome === 'completed') {
+      return await this.scheduleRetry(intent, { outcome: 'failed', error: shadow.error, retryable: true }, 'shadow', true);
+    }
     if (result.outcome === 'completed') {
       await this.state.storage.delete(PENDING_KEY);
       await this.state.storage.deleteAlarm();
@@ -1663,6 +1672,7 @@ export class SubscriptionCoordinator {
     intent: CoordinatorIntent,
     result: SyncResult,
     kind: 'create' | 'remove' | 'shadow',
+    providerRemoved = false,
   ): Promise<SyncResult> {
     if (result.retryable === false) {
       // Terminal: keep the reason, drop the work, do not wake up again.
@@ -1688,6 +1698,7 @@ export class SubscriptionCoordinator {
       attempts,
       lastError: result.error ?? result.reason ?? null,
       nextAt,
+      ...(providerRemoved ? { providerRemoved } : {}),
     };
     await this.state.storage.put(PENDING_KEY, pending);
     await this.state.storage.setAlarm(nextAt);

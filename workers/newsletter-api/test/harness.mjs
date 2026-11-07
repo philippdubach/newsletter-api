@@ -93,6 +93,7 @@ export class SubscriptionCoordinator extends ProductionCoordinator {
     super(proxy, testEnv);
     this.testState = state;
     this.testEnv = testEnv;
+    this.realKv = env.NEWSLETTER_SUBSCRIBERS;
     this.metrics = metrics;
   }
   async alarm() { this.metrics.callbacks++; return super.alarm(); }
@@ -101,6 +102,11 @@ export class SubscriptionCoordinator extends ProductionCoordinator {
     if (path === '/fixture') {
       const input = await request.json();
       if (input.mode) this.testEnv.COORDINATOR_MODE = input.mode;
+      if (input.failShadow !== undefined) {
+        this.testEnv.NEWSLETTER_SUBSCRIBERS = input.failShadow
+          ? { put: async () => { throw new Error('kv unavailable'); }, delete: async () => { throw new Error('kv unavailable'); } }
+          : this.realKv;
+      }
       if (input.seed) {
         await this.testState.storage.put(input.seed);
         await this.testState.storage.setAlarm(Date.now() + 25);

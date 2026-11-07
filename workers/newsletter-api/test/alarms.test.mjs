@@ -88,6 +88,90 @@ describe('workerd scheduler delivers retries; /sync is used only to assert the p
     } finally { await local.dispose(); }
   });
 
+  function removal(email) {
+    const seeded = seed(email);
+    seeded.intent.desired = 'unsubscribed';
+    seeded.intent.authenticated = true;
+    seeded.pending.kind = 'remove';
+    return seeded;
+  }
+
+  it('removes from the provider once while the shadow delete keeps failing', async () => {
+    const calls = [];
+    const local = await startRuntime({ scheduler: true, extraBindings: bindings, outboundService: request => {
+      calls.push(`${request.method} ${new URL(request.url).pathname}`);
+      return new Response('{}', { status: 200 });
+    } });
+    try {
+      const email = 'shadow-down@example.com';
+      const stub = await local.coordinator(email);
+      await fixture(stub, { failShadow: true, seed: removal(email) });
+      await until(async () => (await json(stub, '/metrics')).callbacks >= 2);
+      const midway = await json(stub, '/state');
+      assert.equal(midway.pending.kind, 'shadow');
+      assert.match(midway.pending.lastError, /kv unavailable/);
+      assert.ok(midway.alarm, 'the shadow repair must stay scheduled');
+      await until(async () => (await json(stub, '/state')).pending === null);
+      assert.deepEqual(calls, ['PUT /api/subscribers/query/lists']);
+      assert.equal((await json(stub, '/metrics')).callbacks, 8);
+    } finally { await local.dispose(); }
+  });
+
+  it('finishes the shadow repair without repeating the removal once KV recovers', async () => {
+    const calls = [];
+    const local = await startRuntime({ scheduler: true, extraBindings: bindings, outboundService: request => {
+      calls.push(new URL(request.url).pathname);
+      return new Response('{}', { status: 200 });
+    } });
+    try {
+      const email = 'shadow-recovers@example.com';
+      await local.kv.put(email, { seq: 1 });
+      const stub = await local.coordinator(email);
+      await fixture(stub, { failShadow: true, seed: removal(email) });
+      await until(async () => (await json(stub, '/metrics')).callbacks >= 2);
+      await fixture(stub, { failShadow: false });
+      await until(async () => (await json(stub, '/state')).pending === null);
+      assert.equal(calls.length, 1);
+      assert.equal(await local.kv.get(email), null);
+      assert.equal((await json(stub, '/state')).alarm, null);
+    } finally { await local.dispose(); }
+  });
+
+  it('keeps retrying the removal itself when both stores fail', async () => {
+    let calls = 0;
+    const local = await startRuntime({ scheduler: true, extraBindings: bindings, outboundService: () => {
+      calls++;
+      return new Response('', { status: 503 });
+    } });
+    try {
+      const email = 'both-down@example.com';
+      const stub = await local.coordinator(email);
+      await fixture(stub, { failShadow: true, seed: removal(email) });
+      await until(async () => (await json(stub, '/state')).pending === null);
+      assert.equal(calls, 8);
+    } finally { await local.dispose(); }
+  });
+
+  it('answers a real unsubscribe as accepted while the shadow is down', async () => {
+    const calls = [];
+    const local = await startRuntime({ scheduler: true, withKv: false, extraBindings: bindings, outboundService: request => {
+      calls.push(new URL(request.url).pathname);
+      return new Response('{}', { status: 200 });
+    } });
+    try {
+      const email = 'no-kv@example.com';
+      const token = `v1:${createHmac('sha256', 'runtime-suite-hmac-secret-not-a-production-value').update(email).digest('hex')}`;
+      const response = await local.runtime.dispatchFetch('http://localhost/api/unsubscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, token }),
+      });
+      assert.equal(response.status, 202);
+      assert.equal((await response.json()).status, 'accepted');
+      assert.deepEqual(calls, ['/api/subscribers/query/lists']);
+    } finally { await local.dispose(); }
+  });
+
   it('drops orphaned work without provider or shadow I/O', async () => {
     let calls = 0;
     const local = await startRuntime({ scheduler: true, extraBindings: bindings, outboundService: () => { calls++; return new Response('', { status: 503 }); } });
