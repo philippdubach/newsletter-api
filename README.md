@@ -48,7 +48,7 @@ A failed provider call retries by Durable Object alarm. There are eight attempts
 | GET | `/api/health` | Health check |
 | POST | `/api/test-email` | Send a test email. Operator authorization is required |
 
-`/api/subscriber-count` counts every row on the list, including blocklisted and unsubscribed rows, and adds LinkedIn followers. It therefore shows more than the number of active subscribers.
+`/api/subscriber-count` counts confirmed subscribers on the list and adds LinkedIn followers.
 
 ## Security
 

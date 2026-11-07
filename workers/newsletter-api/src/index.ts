@@ -1241,9 +1241,10 @@ async function fetchListmonkSubscriberCount(env: Env): Promise<number | null> {
   try {
     const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
     // Per-list filter via /api/subscribers?list_id=… avoids the JOIN double-count
-    // bug in /api/lists/{id}.subscriber_count. per_page=1 keeps the response tiny;
-    // we only read data.total.
-    const resp = await callListmonk(env, `/api/subscribers?list_id=${listId}&per_page=1`, { method: 'GET' });
+    // bug in /api/lists/{id}.subscriber_count. The status filter drops unsubscribed,
+    // blocklisted and unconfirmed rows, which list_id alone keeps. per_page=1 keeps
+    // the response tiny; we only read data.total.
+    const resp = await callListmonk(env, `/api/subscribers?list_id=${listId}&subscription_status=confirmed&per_page=1`, { method: 'GET' });
     if (!resp.ok) return null;
     const body = await resp.json() as { data?: { total?: number } };
     const total = body?.data?.total;

@@ -1361,3 +1361,20 @@ describe('confirming from the blog', () => {
     }
   });
 });
+
+describe('the public subscriber count', () => {
+  it('counts only confirmed subscribers', async () => {
+    const store = createProviderStub();
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscriber-count');
+      await response.json();
+      const lookup = store.calls.find((call) => call.path === '/api/subscribers' && call.search.includes('list_id'));
+      const params = new URLSearchParams(lookup.search);
+      assert.equal(params.get('list_id'), String(LIST_ID));
+      assert.equal(params.get('subscription_status'), 'confirmed');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
