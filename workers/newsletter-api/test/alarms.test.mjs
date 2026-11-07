@@ -62,6 +62,14 @@ describe('workerd scheduler delivers retries; /sync is used only to assert the p
       assert.equal(before.alarm, null);
       assert.equal(before.intent.desired, 'unsubscribed');
       assert.equal(before.intent.authenticated, true);
+      // No pending work means both outcomes look alike without this record.
+      if (exhausted) {
+        const { at, ...rest } = before.exhausted;
+        assert.deepEqual(rest, { seq: 1, kind: 'remove', desired: 'unsubscribed', lastError: 'Listmonk unsubscribe HTTP 503: {}' });
+        assert.ok(Math.abs(Date.parse(at) - Date.now()) < 5000);
+      } else {
+        assert.equal(before.exhausted, null);
+      }
       assert.equal(calls.length, exhausted ? 8 : 1);
       assert.ok(calls.every(call => call.method === 'PUT' && call.path === '/api/subscribers/query/lists'));
       const metrics = await json(stub, '/metrics');
@@ -80,11 +88,51 @@ describe('workerd scheduler delivers retries; /sync is used only to assert the p
       await sleep(100);
       const after = await json(stub, '/state');
       assert.deepEqual(after.intent, before.intent, 'anonymous signup must not change the tombstone or sequence');
+      assert.deepEqual(after.exhausted, before.exhausted, 'a refused intent must not clear the failure record');
       assert.equal(after.pending, null);
       assert.equal(after.alarm, null);
       assert.equal(calls.length, exhausted ? 8 : 1, 'no lookup, create, or other provider call after refusal');
       assert.equal((await json(stub, '/metrics')).callbacks, metrics.callbacks);
       assert.equal(await local.kv.get(email), null);
+    } finally { await local.dispose(); }
+  });
+
+  it('clears the exhausted record on the next accepted intent', async () => {
+    let healthy = false;
+    const email = 'exhausted-recovers@example.com';
+    const local = await startRuntime({ scheduler: true, extraBindings: bindings, outboundService: request => {
+      if (!healthy) return new Response('', { status: 503 });
+      return request.method === 'GET'
+        ? Response.json({ data: { total: 1, results: [{ email, status: 'enabled', lists: [{ id: 1, subscription_status: 'confirmed' }] }] } })
+        : new Response('{}', { status: 200 });
+    } });
+    try {
+      const stub = await local.coordinator(email);
+      await fixture(stub, { seed: seed(email) });
+      await until(async () => (await json(stub, '/state')).pending === null);
+      assert.equal((await json(stub, '/state')).exhausted.kind, 'create');
+      assert.equal((await json(stub, '/state')).exhausted.lastError, 'http_503');
+      healthy = true;
+      const signup = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.91' },
+        body: JSON.stringify({ email }),
+      });
+      assert.equal((await signup.json()).message, 'Already subscribed');
+      assert.equal((await json(stub, '/state')).exhausted, null);
+    } finally { await local.dispose(); }
+  });
+
+  it('records an exhausted shadow repair as shadow work', async () => {
+    const local = await startRuntime({ scheduler: true, extraBindings: bindings, outboundService: () => new Response('{}', { status: 200 }) });
+    try {
+      const email = 'exhausted-shadow@example.com';
+      const stub = await local.coordinator(email);
+      await fixture(stub, { failShadow: true, seed: removal(email) });
+      await until(async () => (await json(stub, '/state')).pending === null);
+      const { exhausted } = await json(stub, '/state');
+      assert.equal(exhausted.kind, 'shadow');
+      assert.match(exhausted.lastError, /kv unavailable/);
     } finally { await local.dispose(); }
   });
 

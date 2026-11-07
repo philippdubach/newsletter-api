@@ -1302,6 +1302,7 @@ async function fetchLinkedInFollowers(env: Env, ctx: ExecutionContext): Promise<
 
 const INTENT_KEY = 'intent';
 const PENDING_KEY = 'pending';
+const EXHAUSTED_KEY = 'exhausted';
 const WELCOME_KEY = 'welcome-seq';
 const OPTIN_RESENT_KEY = 'optin-resent-at';
 // Anyone can submit any address, so this bounds the mail one address can receive.
@@ -1347,6 +1348,15 @@ interface CoordinatorPending {
   nextAt: number;
   /** The provider removal for this intent succeeded; only the shadow is owed. */
   providerRemoved?: boolean;
+}
+
+/** Work dropped after the last attempt. Without this it would look completed. */
+interface CoordinatorExhausted {
+  seq: number;
+  kind: CoordinatorPending['kind'];
+  desired: CoordinatorIntent['desired'];
+  lastError: string;
+  at: string;
 }
 
 type SyncOutcome = 'completed' | 'unverified' | 'unsubscribed' | 'blocklisted' | 'pending' | 'failed' | 'superseded';
@@ -1401,6 +1411,7 @@ export class SubscriptionCoordinator {
         return Response.json({
           intent: (await this.state.storage.get(INTENT_KEY)) ?? null,
           pending: (await this.state.storage.get(PENDING_KEY)) ?? null,
+          exhausted: (await this.state.storage.get(EXHAUSTED_KEY)) ?? null,
           alarm: await this.state.storage.getAlarm(),
         });
       }
@@ -1483,6 +1494,7 @@ export class SubscriptionCoordinator {
       return { outcome: 'unsubscribed', seq: previous!.seq, desired: 'unsubscribed' };
     }
 
+    await this.state.storage.delete(EXHAUSTED_KEY);
     await this.state.storage.put(INTENT_KEY, intent);
     await this.state.storage.put<CoordinatorPending>(PENDING_KEY, {
       kind: input.desired === 'subscribed' ? 'create' : 'remove',
@@ -1685,10 +1697,18 @@ export class SubscriptionCoordinator {
     const attempts = (existing?.attempts ?? 0) + 1;
 
     if (attempts >= MAX_SYNC_ATTEMPTS) {
-      console.error(`coordinator gave up after ${MAX_SYNC_ATTEMPTS} attempts for ${redactEmail(intent.email)}: ${result.error ?? result.reason ?? 'unknown'}`);
+      const lastError = result.error ?? result.reason ?? 'retries exhausted';
+      console.error(`coordinator gave up after ${MAX_SYNC_ATTEMPTS} attempts for ${redactEmail(intent.email)}: ${lastError}`);
+      await this.state.storage.put<CoordinatorExhausted>(EXHAUSTED_KEY, {
+        seq: intent.seq,
+        kind,
+        desired: intent.desired,
+        lastError,
+        at: new Date().toISOString(),
+      });
       await this.state.storage.delete(PENDING_KEY);
       await this.state.storage.deleteAlarm();
-      return { outcome: 'failed', error: result.error ?? result.reason ?? 'retries exhausted', attempts, retryable: false };
+      return { outcome: 'failed', error: lastError, attempts, retryable: false };
     }
 
     const nextAt = Date.now() + retryDelayMs(attempts);
