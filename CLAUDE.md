@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Newsletter subscription management API built on Cloudflare Workers. Single-file application (`workers/newsletter-api/src/index.ts`) using **Listmonk** (self-hosted on Hetzner) as the email-sending source of truth, **KV** as a dual-write durable shadow + rate-limit + cache store, **R2** for newsletter archives (EU jurisdiction), and **Plunk** (direct `/v1/send` API) as an automatic fallback when Listmonk is unreachable. Listmonk itself relays all mail through Plunk SMTP (`next-smtp.useplunk.com:2587`) since 2026-10-01; Resend is no longer used.
+Newsletter signup system: a Cloudflare Worker and Listmonk template overrides. `README.md` describes the system, and `docs/REFERENCE.md` holds design notes.
+
+Built on Cloudflare Workers. Single-file application (`workers/newsletter-api/src/index.ts`) using **Listmonk** (self-hosted on Hetzner) as the email-sending source of truth, **KV** as a dual-write durable shadow + rate-limit + cache store, **R2** for newsletter archives (EU jurisdiction), and **Plunk** (direct `/v1/send` API) as an automatic fallback when Listmonk is unreachable. Listmonk itself relays all mail through Plunk SMTP (`next-smtp.useplunk.com:2587`) since 2026-10-01; Resend is no longer used.
 
 ## Commands
 
@@ -24,23 +26,25 @@ npm run deploy:production   # Deploy to production — USE THIS
 **Single handler pattern:** `src/index.ts` exports a default Workers `fetch` handler that routes requests by method + pathname to handler functions (`handleSubscribe`, `handleUnsubscribe`, `handleGetNewsletters`, etc.).
 
 **Subscribe flow** (`handleSubscribe`):
-1. Sync KV write for the email (rate-limit + durable shadow).
-2. `ctx.waitUntil` → `createListmonkSubscriber` (POST `/api/subscribers`) → `sendListmonkWelcome` (POST `/api/tx` with template id from `LISTMONK_WELCOME_TEMPLATE_ID`, pre-fetching the latest newsletter URL from R2).
-3. On any Listmonk failure, falls back to `sendPlunkWelcomeFallback` with a legacy hardcoded welcome. Note: `/api/tx` is asynchronous, so an SMTP failure *inside* Listmonk does not trigger this fallback; it only shows in `journalctl -u listmonk` on the server.
+1. Refuse `BLOCKED_IPS`, apply the rate limit, and reject the honeypot field.
+2. Send the intent to `SubscriptionCoordinator`, one Durable Object for each address. It serializes signups and unsubscribes.
+3. The coordinator reads Listmonk, then creates the subscriber if the address is absent. It writes the KV shadow record. A failed call retries by alarm, with eight attempts in total.
+4. With `DOUBLE_OPTIN = "on"` (production), the create uses `preconfirm_subscriptions: false`, and the Worker sends no welcome. Listmonk mails the opt-in link because list 3 is a double opt-in list. The response carries `status: "confirmation_required"`. Change the Worker var and the list's opt-in type together.
 
-With `DOUBLE_OPTIN = "on"` (production), the coordinator creates the subscriber with `preconfirm_subscriptions: false` and sends no welcome. Listmonk mails the opt-in link because list 3 is a double opt-in list, and the response carries `status: "confirmation_required"`. Change the Worker var and the list's opt-in type together.
+**Confirm flow** (`handleConfirm`): the email links to `philippdubach.com/?confirm#<subscriber uuid>`. The site posts the id to `/api/confirm`, and the Worker posts to Listmonk's public `/subscription/optin/<uuid>`. Do not change the link format. The query avoids a stale cached homepage, and the fragment keeps the id out of logs. See `OPERATIONS.md` in the site repository.
 
-`BLOCKED_IPS` is an optional comma-separated secret of client IPs refused at `/api/subscribe`. It lives in the Worker because zone WAF rules do not cover the `workers.dev` hostname.
+`BLOCKED_IPS` is an optional comma-separated secret. It lives in the Worker because zone WAF rules do not cover the `workers.dev` hostname.
 
-To bypass Listmonk: delete `LISTMONK_API_USER` and `LISTMONK_API_TOKEN` secrets — `isListmonkConfigured()` will return false and the Worker will send the welcome via Plunk directly.
+The welcome and Plunk fallback paths run only when `DOUBLE_OPTIN` is off.
 
-**Subscriber-count** (`/api/subscriber-count`): Listmonk is the source of truth. Calls `GET /api/subscribers?list_id={LISTMONK_LIST_ID}&per_page=1` and reads `data.total`. This avoids the JOIN double-count bug in `/api/lists/{id}.subscriber_count`. Falls back to counting KV keys (excluding `rate_limit:*` and `cache:*`) if Listmonk is unreachable. Adds LinkedIn follower counts (cached, scraped from `LINKEDIN_NEWSLETTER_URLS`) and rounds the total up to the nearest 10. The combined response is cached in KV under `cache:subscriber_count` for 10 minutes.
+**Subscriber-count** (`/api/subscriber-count`): Listmonk is the source of truth. Calls `GET /api/subscribers?list_id={LISTMONK_LIST_ID}&per_page=1` and reads `data.total`. This total includes blocklisted and unsubscribed rows, so the public count is too high. This avoids the JOIN double-count bug in `/api/lists/{id}.subscriber_count`. Falls back to counting KV keys (excluding `rate_limit:*` and `cache:*`) if Listmonk is unreachable. Adds LinkedIn follower counts (cached, scraped from `LINKEDIN_NEWSLETTER_URLS`) and rounds the total up to the nearest 10. The combined response is cached in KV under `cache:subscriber_count` for 10 minutes.
 
 **Bindings (defined in `wrangler.toml`):**
 - `NEWSLETTER_SUBSCRIBERS` — KV namespace (subscriber shadow + rate limits + caches)
 - `R2_BUCKET` — R2 bucket `static-eu` (EU jurisdiction) for newsletter archive files
-- Vars: `ALLOWED_ORIGIN`, `ENVIRONMENT`, `LINKEDIN_NEWSLETTER_URLS`, `LISTMONK_API_URL`, `LISTMONK_LIST_ID`, `LISTMONK_WELCOME_TEMPLATE_ID`
-- Secrets (set via `wrangler secret put ... --env production`): `LISTMONK_API_USER`, `LISTMONK_API_TOKEN`, `PLUNK_SECRET_KEY`, `ADMIN_TOKEN` (not set in production, so `/api/test-email` returns 401 there)
+- `SUBSCRIPTION_COORDINATOR` — Durable Object namespace, one object for each address
+- Vars: `ALLOWED_ORIGIN`, `ENVIRONMENT`, `COORDINATOR_MODE`, `DOUBLE_OPTIN`, `PROVIDER_BUDGET_MS`, `LINKEDIN_NEWSLETTER_URLS`, `LISTMONK_API_URL`, `LISTMONK_LIST_ID`, `LISTMONK_WELCOME_TEMPLATE_ID`
+- Secrets (set via `wrangler secret put ... --env production`): `LISTMONK_API_USER`, `LISTMONK_API_TOKEN`, `PLUNK_SECRET_KEY`, `ADMIN_TOKEN`, `UNSUBSCRIBE_HMAC_SECRET`, `BLOCKED_IPS`
 
 **KV key conventions:**
 - Subscriber emails stored directly as keys (lowercased) with subscription metadata as the value
@@ -52,7 +56,7 @@ To bypass Listmonk: delete `LISTMONK_API_USER` and `LISTMONK_API_TOKEN` secrets 
 
 ## Testing
 
-Worker tests in `src/**/*.test.ts` run under Node with mocked KV, R2 and fetch, not workerd. Configuration and deploy-wrapper tests run through `node:test` in `scripts/`. `npm run verify` runs typechecking, both suites and the config guard. Local dev secrets go in ignored `.dev.vars`; use only non-production provider credentials and dummy addresses.
+Unit tests in `src/**/*.test.ts` run under Node with mocked KV, R2 and fetch. Tests in `test/` run the Worker in workerd. Configuration and deploy-wrapper tests run through `node:test` in `scripts/`. `npm run verify` runs typechecking, both suites and the config guard. Local dev secrets go in ignored `.dev.vars`; use only non-production provider credentials and dummy addresses.
 
 ## Deployment
 
@@ -74,3 +78,11 @@ npx wrangler secret list --env production
 ```
 
 No CI/CD — deployment is manual via Wrangler CLI.
+
+## Listmonk templates
+
+`listmonk/static/` overlays the Listmonk templates at `/etc/listmonk/static` on `pd-prod`. See `listmonk/README.md`. Render a template offline before you install it. Do not send test signups without authorization.
+
+## Subscriber data
+
+CSV exports in `workers/newsletter-api/` hold addresses. Git ignores them. Never commit, publish or delete them without the owner's request.
