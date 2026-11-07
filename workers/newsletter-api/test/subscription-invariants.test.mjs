@@ -724,6 +724,79 @@ describe('durable state is recoverable', () => {
     }
   });
 
+  describe('a create the provider answers with an error', () => {
+    function rejecting(answer) {
+      const store = createProviderStub();
+      const base = store.handler;
+      return {
+        store,
+        handler: async (request) => {
+          const response = await base(request);
+          return request.method === 'POST' && new URL(request.url).pathname === '/api/subscribers' ? answer() : response;
+        },
+      };
+    }
+    async function attempt(email, answer, ip) {
+      const { store, handler } = rejecting(answer);
+      const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: handler });
+      try {
+        const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+          body: JSON.stringify({ email }),
+        });
+        const body = await response.json();
+        await local.drain();
+        const stub = await local.coordinator(email);
+        const state = await (await stub.fetch('https://coordinator/state')).json();
+        return { response, body, state, store };
+      } finally {
+        await local.dispose();
+      }
+    }
+
+    for (const status of [400, 403, 422]) {
+      it(`treats HTTP ${status} as terminal`, async () => {
+        const { response, body, state, store } = await attempt(
+          `invariant-create-${status}@example.com`,
+          () => new Response('{"message":"invalid"}', { status }),
+          '198.51.100.241',
+        );
+        assert.equal(response.status, 503);
+        assert.equal(body.success, false);
+        assert.equal(state.pending, null, 'a permanent rejection must not retry');
+        assert.equal(state.alarm, null);
+        assert.equal(state.exhausted, null, 'a refusal is not exhausted work');
+        assert.equal(store.calls.filter((call) => call.path === '/api/tx').length, 0);
+      });
+    }
+
+    for (const [name, answer] of [
+      ['HTTP 429', () => new Response('slow down', { status: 429 })],
+      ['HTTP 500', () => new Response('boom', { status: 500 })],
+      ['HTTP 503', () => new Response('down', { status: 503 })],
+      ['a network failure', () => { throw new Error('connection reset'); }],
+    ]) {
+      it(`keeps ${name} retryable`, async () => {
+        const { response, body, state } = await attempt('invariant-create-transient@example.com', answer, '198.51.100.242');
+        assert.equal(response.status, 202);
+        assert.equal(body.status, 'accepted');
+        assert.equal(state.pending.attempts, 1);
+        assert.ok(state.alarm);
+      });
+    }
+
+    it('still treats HTTP 409 as an existing subscriber', async () => {
+      const { response, state } = await attempt(
+        'invariant-create-409@example.com',
+        () => new Response('{"message":"exists"}', { status: 409 }),
+        '198.51.100.243',
+      );
+      assert.equal(response.status, 200);
+      assert.equal(state.pending, null);
+    });
+  });
+
   it('keeps the retry budget when the lookup fails transiently', async () => {
     const email = 'invariant-lookup-retry@example.com';
     const store = createProviderStub();

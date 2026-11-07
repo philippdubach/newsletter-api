@@ -609,7 +609,7 @@ async function callListmonk(env: Env, path: string, init: RequestInit = {}): Pro
   }
 }
 
-async function createListmonkSubscriber(email: string, clientIP: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; duplicate?: boolean; error?: string }> {
+async function createListmonkSubscriber(email: string, clientIP: string, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; duplicate?: boolean; permanent?: boolean; error?: string }> {
   if (!isListmonkConfigured(env)) {
     return { success: false, error: 'Listmonk not configured' };
   }
@@ -637,7 +637,9 @@ async function createListmonkSubscriber(email: string, clientIP: string, env: En
     // must NOT be treated as success (audit item 35).
     if (resp.status === 409) return { success: true, duplicate: true };
     const body = await resp.text();
-    return { success: false, error: `Listmonk subscribe HTTP ${resp.status}: ${body.slice(0, 200)}` };
+    // The same request gets the same 4xx, so only rate limiting is worth retrying.
+    const permanent = resp.status >= 400 && resp.status < 500 && resp.status !== 429;
+    return { success: false, permanent, error: `Listmonk subscribe HTTP ${resp.status}: ${body.slice(0, 200)}` };
   } catch (err) {
     return { success: false, error: `Listmonk subscribe exception: ${err instanceof Error ? err.message : String(err)}` };
   }
@@ -1622,7 +1624,7 @@ export class SubscriptionCoordinator {
     }
 
     const created = await createListmonkSubscriber(intent.email, intent.ip ?? 'unknown', this.env, deadline);
-    if (!created.success) return { outcome: 'failed', error: created.error ?? 'create failed', retryable: true };
+    if (!created.success) return { outcome: 'failed', error: created.error ?? 'create failed', retryable: !created.permanent };
 
     // Fence before any mail is sent: a welcome for an intent that has already been
     // superseded is a message the recipient did not ask for.
