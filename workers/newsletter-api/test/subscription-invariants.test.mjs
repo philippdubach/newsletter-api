@@ -1264,6 +1264,120 @@ describe('double opt-in', () => {
       await local.dispose();
     }
   });
+
+  describe('resending the opt-in for an unclicked link', () => {
+    const HOUR = 3_600_000;
+    const unconfirmed = (email, id = 4242) => ({ id, email, status: 'enabled', lists: [{ id: LIST_ID, subscription_status: 'unconfirmed' }] });
+    const resends = (store) => store.calls.filter((call) => /^\/api\/subscribers\/[^/]+\/optin$/.test(call.path));
+    const state = async (stub) => (await stub.fetch('https://coordinator/state')).json();
+
+    it('resends once through the subscriber id from the lookup, and never recreates', async () => {
+      const email = 'invariant-resend@example.com';
+      const store = createProviderStub();
+      store.subscribers.set(email, unconfirmed(email));
+      const local = await startRuntime({ extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+      try {
+        const bodies = [];
+        for (const ip of ['198.51.100.82', '198.51.100.83', '198.51.100.84']) {
+          bodies.push(await (await post(local, email, ip)).json());
+        }
+        await local.drain();
+
+        for (const body of bodies) assert.equal(body.status, 'confirmation_required');
+        assert.deepEqual(resends(store).map((call) => [call.method, call.path]), [['POST', '/api/subscribers/4242/optin']]);
+        assert.equal(store.mutations().length, 0, 'a pending address is never recreated');
+      } finally {
+        await local.dispose();
+      }
+    });
+
+    for (const [age, expected] of [[23, 0], [25, 1]]) {
+      it(`${expected ? 'resends' : 'holds back'} when the last resend was ${age} hours ago`, async () => {
+        const email = `invariant-resend-${age}h@example.com`;
+        const store = createProviderStub();
+        store.subscribers.set(email, unconfirmed(email));
+        const local = await startRuntime({ scheduler: true, extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+        try {
+          const stub = await local.coordinator(email);
+          await stub.fetch('https://coordinator/fixture', {
+            method: 'POST',
+            body: JSON.stringify({ seed: { 'optin-resent-at': Date.now() - age * HOUR } }),
+          });
+          const body = await (await post(local, email, '198.51.100.85')).json();
+          await local.drain();
+
+          assert.equal(body.status, 'confirmation_required');
+          assert.equal(resends(store).length, expected);
+        } finally {
+          await local.dispose();
+        }
+      });
+    }
+
+    for (const [name, fail] of [
+      ['an HTTP failure', () => new Response('{"message":"error"}', { status: 500 })],
+      ['a network failure', () => { throw new Error('connection reset'); }],
+    ]) {
+      it(`keeps the response and the retry budget after ${name}`, async () => {
+        const email = 'invariant-resend-failed@example.com';
+        const store = createProviderStub();
+        store.subscribers.set(email, unconfirmed(email));
+        const base = store.handler;
+        const local = await startRuntime({
+          extraBindings: OPTIN_BINDINGS,
+          outboundService: async (request) => {
+            const response = await base(request);
+            return new URL(request.url).pathname.endsWith('/optin') ? fail() : response;
+          },
+        });
+        try {
+          const response = await post(local, email, '198.51.100.86');
+          const body = await response.json();
+          await local.drain();
+
+          assert.equal(response.status, 200);
+          assert.equal(body.success, true);
+          assert.equal(body.status, 'confirmation_required');
+          assert.equal(resends(store).length, 1);
+          const stored = await state(await local.coordinator(email));
+          assert.equal(stored.pending, null, 'a failed resend must not leave retry work');
+          assert.equal(stored.alarm, null);
+        } finally {
+          await local.dispose();
+        }
+      });
+    }
+
+    it('sends nothing when the lookup carries no usable id', async () => {
+      const email = 'invariant-resend-no-id@example.com';
+      const store = createProviderStub();
+      store.subscribers.set(email, unconfirmed(email, '../../admin'));
+      const local = await startRuntime({ extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+      try {
+        const body = await (await post(local, email, '198.51.100.87')).json();
+        await local.drain();
+
+        assert.equal(body.status, 'confirmation_required');
+        assert.equal(resends(store).length, 0);
+      } finally {
+        await local.dispose();
+      }
+    });
+
+    it('sends nothing under single opt-in', async () => {
+      const email = 'invariant-resend-single@example.com';
+      const store = createProviderStub();
+      store.subscribers.set(email, unconfirmed(email));
+      const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+      try {
+        await (await post(local, email, '198.51.100.88')).json();
+        await local.drain();
+        assert.equal(resends(store).length, 0);
+      } finally {
+        await local.dispose();
+      }
+    });
+  });
 });
 
 describe('blocked addresses', () => {

@@ -462,6 +462,13 @@ function isListmonkConfigured(env: Env): boolean {
 // as the address being absent.
 type UpstreamState = 'confirmed' | 'unsubscribed' | 'blocklisted' | 'pending' | 'absent' | 'unverified';
 
+interface ListmonkLookup {
+  state: UpstreamState;
+  reason: string;
+  /** Provider subscriber id, unvalidated. Set only for a 'pending' answer. */
+  id?: unknown;
+}
+
 /**
  * Calls Listmonk and parses the body while the request deadline is still armed.
  *
@@ -519,7 +526,7 @@ async function lookupListmonkSubscriber(
   email: string,
   env: Env,
   deadline?: AbortSignal,
-): Promise<{ state: UpstreamState; reason: string }> {
+): Promise<ListmonkLookup> {
   const answered = await lookupListmonkSubscriberRaw(email, env, deadline);
   if (answered.state === 'unverified') {
     // Deliberately a warning: this is the only signal that the check failed,
@@ -533,7 +540,7 @@ async function lookupListmonkSubscriberRaw(
   email: string,
   env: Env,
   deadline?: AbortSignal,
-): Promise<{ state: UpstreamState; reason: string }> {
+): Promise<ListmonkLookup> {
   if (!isListmonkConfigured(env)) return { state: 'unverified', reason: 'not_configured' };
   try {
     const listId = parseInt(env.LISTMONK_LIST_ID!, 10);
@@ -554,7 +561,7 @@ async function lookupListmonkSubscriberRaw(
     if (total === 0 && results.length !== 0) return { state: 'unverified', reason: 'rows_exceed_count' };
     if (total === 0) return { state: 'absent', reason: 'no_match' };
 
-    const subscriber = results[0] as { email?: unknown; status?: unknown; lists?: unknown };
+    const subscriber = results[0] as { id?: unknown; email?: unknown; status?: unknown; lists?: unknown };
     const returnedEmail = typeof subscriber?.email === 'string' ? subscriber.email.trim().toLowerCase() : null;
     if (returnedEmail !== email.trim().toLowerCase()) return { state: 'unverified', reason: 'identity_mismatch' };
 
@@ -570,7 +577,7 @@ async function lookupListmonkSubscriberRaw(
     if (!entry) return { state: 'unverified', reason: 'no_entry_for_target_list' };
     if (entry.subscription_status === 'confirmed') return { state: 'confirmed', reason: 'list_confirmed' };
     if (entry.subscription_status === 'unsubscribed') return { state: 'unsubscribed', reason: 'list_unsubscribed' };
-    if (entry.subscription_status === 'unconfirmed') return { state: 'pending', reason: 'list_unconfirmed' };
+    if (entry.subscription_status === 'unconfirmed') return { state: 'pending', reason: 'list_unconfirmed', id: subscriber.id };
     return { state: 'unverified', reason: `list_status_${String(entry.subscription_status)}` };
   } catch (error) {
     return { state: 'unverified', reason: `exception:${error instanceof Error ? error.message : String(error)}` };
@@ -668,6 +675,17 @@ async function unsubscribeFromListmonk(email: string, env: Env, deadline?: Abort
   } catch (err) {
     console.error(`Listmonk unsubscribe exception for ${redactEmail(email)}`);
     return { success: false, error: `Listmonk unsubscribe exception: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+/** Asks Listmonk to mail the opt-in link again. Never throws. */
+async function resendListmonkOptin(id: number, env: Env, deadline?: AbortSignal): Promise<{ success: boolean; error?: string }> {
+  try {
+    const resp = await callListmonk(env, `/api/subscribers/${id}/optin`, { method: 'POST', signal: deadline });
+    if (resp.ok) return { success: true };
+    return { success: false, error: `Listmonk opt-in HTTP ${resp.status}` };
+  } catch (err) {
+    return { success: false, error: `Listmonk opt-in exception: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -1285,6 +1303,9 @@ async function fetchLinkedInFollowers(env: Env, ctx: ExecutionContext): Promise<
 const INTENT_KEY = 'intent';
 const PENDING_KEY = 'pending';
 const WELCOME_KEY = 'welcome-seq';
+const OPTIN_RESENT_KEY = 'optin-resent-at';
+// Anyone can submit any address, so this bounds the mail one address can receive.
+const OPTIN_RESEND_WINDOW_MS = 24 * 60 * 60_000;
 // Total attempts, including the initial request; at most seven scheduled retries.
 const MAX_SYNC_ATTEMPTS = 8;
 // The whole provider phase must finish well inside the 30-second limit after which
@@ -1558,7 +1579,7 @@ export class SubscriptionCoordinator {
   }
 
   private async syncSubscribed(intent: CoordinatorIntent, deadline: AbortSignal): Promise<SyncResult> {
-    const { state: upstream, reason } = await lookupListmonkSubscriber(intent.email, this.env, deadline);
+    const { state: upstream, reason, id } = await lookupListmonkSubscriber(intent.email, this.env, deadline);
 
     if (upstream === 'confirmed') return { outcome: 'completed', created: false };
     // Both are the recipient's decision, taken elsewhere. Never overwrite them.
@@ -1566,7 +1587,12 @@ export class SubscriptionCoordinator {
     if (upstream === 'unsubscribed') return { outcome: 'unsubscribed' };
     if (upstream === 'pending') {
       // Under double opt-in this is the normal state of an unclicked link.
-      if (isDoubleOptIn(this.env)) return { outcome: 'completed', created: false, awaitingConfirmation: true };
+      // The reader is told to check their inbox, so make that true: a create here
+      // would be refused, and the original mail may be long gone.
+      if (isDoubleOptIn(this.env)) {
+        await this.resendOptin(intent, id, deadline);
+        return { outcome: 'completed', created: false, awaitingConfirmation: true };
+      }
       return { outcome: 'unverified', reason, retryable: false };
     }
     if (upstream === 'unverified') {
@@ -1600,6 +1626,27 @@ export class SubscriptionCoordinator {
       }
     }
     return { outcome: 'completed', created: !created.duplicate };
+  }
+
+  /**
+   * Best effort: the outcome of a resend never reaches the caller or the retry
+   * budget. The window is spent before the send, like the welcome marker, so a
+   * crash or a failed send cannot lead to a second mail inside it.
+   */
+  private async resendOptin(intent: CoordinatorIntent, id: unknown, deadline: AbortSignal): Promise<void> {
+    try {
+      if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
+        console.warn(`opt-in resend skipped for ${redactEmail(intent.email)}: no usable subscriber id`);
+        return;
+      }
+      const last = await this.state.storage.get<number>(OPTIN_RESENT_KEY);
+      if (last !== undefined && Date.now() - last < OPTIN_RESEND_WINDOW_MS) return;
+      await this.state.storage.put(OPTIN_RESENT_KEY, Date.now());
+      const sent = await resendListmonkOptin(id, this.env, deadline);
+      if (!sent.success) console.error(`opt-in resend failed for ${redactEmail(intent.email)}: ${sent.error}`);
+    } catch (error) {
+      console.error(`opt-in resend failed for ${redactEmail(intent.email)}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private async syncUnsubscribed(intent: CoordinatorIntent, deadline: AbortSignal): Promise<SyncResult> {
