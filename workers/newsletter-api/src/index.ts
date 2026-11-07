@@ -1382,6 +1382,8 @@ interface SyncResult {
  */
 function isRetryableLookupReason(reason: string): boolean {
   if (reason === 'not_configured') return false;
+  // Only an operator can add the list row, so another attempt cannot change this.
+  if (reason === 'no_entry_for_target_list') return false;
   if (/^http_4(0[1-3]|04)$/.test(reason)) return false;
   return true;
 }

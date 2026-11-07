@@ -797,6 +797,35 @@ describe('durable state is recoverable', () => {
     });
   });
 
+  it('answers unverified and stops when the subscriber has no row for this list', async () => {
+    const email = 'invariant-no-list-row@example.com';
+    const store = createProviderStub();
+    store.subscribers.set(email, { email, status: 'enabled', lists: [{ id: LIST_ID + 1, subscription_status: 'confirmed' }] });
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.244' },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json();
+      await local.drain();
+
+      assert.equal(response.status, 200);
+      assert.equal(body.success, false);
+      assert.equal(body.status, 'unverified');
+      assert.equal(body.message, "We couldn't verify your subscription. Please try again later or contact us.");
+      const stub = await local.coordinator(email);
+      const state = await (await stub.fetch('https://coordinator/state')).json();
+      assert.equal(state.pending, null);
+      assert.equal(state.alarm, null);
+      assert.equal(state.exhausted, null);
+      assert.equal(store.mutations().length, 0);
+    } finally {
+      await local.dispose();
+    }
+  });
+
   it('keeps the retry budget when the lookup fails transiently', async () => {
     const email = 'invariant-lookup-retry@example.com';
     const store = createProviderStub();
