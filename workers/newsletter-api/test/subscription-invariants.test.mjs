@@ -1639,3 +1639,31 @@ describe('the public subscriber count', () => {
     }
   });
 });
+
+describe('the KV shadow record', () => {
+  it('keeps the first signup record when the address is submitted again', async () => {
+    const email = 'invariant-first-record@example.com';
+    const store = createProviderStub();
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    const signup = async (ip, agent) => {
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip, 'User-Agent': agent },
+        body: JSON.stringify({ email }),
+      });
+      await response.json();
+      await local.drain();
+    };
+    try {
+      await signup('198.51.100.60', 'first-client');
+      const kv = await local.runtime.getKVNamespace('NEWSLETTER_SUBSCRIBERS');
+      const first = await kv.get(email);
+      assert.equal(JSON.parse(first).ip, '198.51.100.60');
+
+      await signup('198.51.100.61', 'second-client');
+      assert.equal(await kv.get(email), first, 'a repeat signup must not rewrite the consent record');
+    } finally {
+      await local.dispose();
+    }
+  });
+});

@@ -1608,6 +1608,9 @@ export class SubscriptionCoordinator {
   private async applyShadow(intent: CoordinatorIntent): Promise<{ ok: boolean; error?: string }> {
     try {
       if (intent.desired === 'subscribed') {
+        // The record is the signup evidence, so a repeat submission must not replace
+        // it. An unsubscribe deletes it, so a real resubscribe writes a new one.
+        if (await this.env.NEWSLETTER_SUBSCRIBERS.get(intent.email) !== null) return { ok: true };
         await this.env.NEWSLETTER_SUBSCRIBERS.put(intent.email, JSON.stringify({
           timestamp: intent.updatedAt,
           ip: intent.ip ?? 'unknown',
