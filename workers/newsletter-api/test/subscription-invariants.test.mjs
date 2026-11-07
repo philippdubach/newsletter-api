@@ -1290,3 +1290,74 @@ describe('blocked addresses', () => {
     }
   });
 });
+
+describe('confirming from the blog', () => {
+  const UUID = '0d8f6a52-3c1e-4b7a-9f10-2a6c5e7b1d34';
+  const post = (local, token, ip) => local.runtime.dispatchFetch('http://localhost/api/confirm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+    body: JSON.stringify({ token }),
+  });
+
+  it('confirms through the public opt-in route', async () => {
+    const store = createProviderStub();
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      const response = await post(local, UUID, '198.51.100.90');
+      assert.deepEqual(await response.json(), { success: true });
+      const call = store.calls.find((entry) => entry.path === `/subscription/optin/${UUID}`);
+      assert.equal(call.method, 'POST');
+      assert.equal(call.body, 'confirm=true');
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it('never passes a malformed id to the provider', async () => {
+    const store = createProviderStub();
+    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    try {
+      for (const token of ['', '../../api/subscribers', `${UUID}/x`, 'not-a-uuid']) {
+        const response = await post(local, token, '198.51.100.91');
+        await response.json();
+        assert.equal(response.status, 400);
+      }
+      assert.equal(store.calls.length, 0);
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  it('reports a provider failure instead of success', async () => {
+    const store = createProviderStub();
+    const local = await startRuntime({
+      extraBindings: PROVIDER_BINDINGS,
+      outboundService: async () => new Response('down', { status: 500 }),
+    });
+    try {
+      const response = await post(local, UUID, '198.51.100.92');
+      const body = await response.json();
+      assert.equal(response.status, 502);
+      assert.equal(body.success, false);
+    } finally {
+      await local.dispose();
+      assert.equal(store.calls.length, 0);
+    }
+  });
+
+  it('refuses a blocked caller', async () => {
+    const store = createProviderStub();
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, BLOCKED_IPS: '203.0.113.10' },
+      outboundService: store.handler,
+    });
+    try {
+      const response = await post(local, UUID, '203.0.113.10');
+      await response.json();
+      assert.equal(response.status, 429);
+      assert.equal(store.calls.length, 0);
+    } finally {
+      await local.dispose();
+    }
+  });
+});

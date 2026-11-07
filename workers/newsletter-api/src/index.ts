@@ -989,6 +989,46 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
   }
 }
 
+const SUBSCRIBER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Confirms a double opt-in from the blog. The email links to the site and the
+ * page posts here, so a mail scanner that only fetches the link confirms nothing.
+ * Listmonk answers 200 for an address that is already confirmed, which a second
+ * click should treat as success too.
+ */
+async function handleConfirm(request: Request, env: Env): Promise<Response> {
+  if (writesUnavailable(env)) return maintenanceResponse(request, env);
+  try {
+    const clientIP = getClientIP(request);
+    if (isBlockedIP(clientIP, env) || !await checkRateLimit(clientIP, env)) {
+      return jsonResponse({ success: false, error: 'Too many requests. Please try again later.' }, 429, request, env);
+    }
+    const parsed = await readBody(request);
+    if (!parsed.ok) return jsonResponse({ success: false, error: parsed.error }, parsed.status, request, env);
+
+    const id = (parsed.body.token || '').trim().toLowerCase();
+    if (!SUBSCRIBER_UUID.test(id)) {
+      return jsonResponse({ success: false, error: 'Invalid confirmation link' }, 400, request, env);
+    }
+    if (!isListmonkConfigured(env)) {
+      return jsonResponse({ success: false, error: 'Confirmation is unavailable' }, 503, request, env);
+    }
+
+    const resp = await callListmonk(env, `/subscription/optin/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'confirm=true',
+    });
+    if (resp.ok) return jsonResponse({ success: true }, 200, request, env);
+    if (resp.status < 500) return jsonResponse({ success: false, error: 'Invalid confirmation link' }, 400, request, env);
+    console.error(`Listmonk confirm failed: HTTP ${resp.status}`);
+    return jsonResponse({ success: false, error: 'Confirmation is unavailable' }, 502, request, env);
+  } catch {
+    return jsonResponse({ success: false, error: 'Confirmation is unavailable' }, 502, request, env);
+  }
+}
+
 async function handleUnsubscribe(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (writesUnavailable(env)) return maintenanceResponse(request, env);
   try {
@@ -1620,6 +1660,10 @@ export default {
 
     if (path === '/api/subscribe' && request.method === 'POST') {
       return handleSubscribe(request, env, ctx);
+    }
+
+    if (path === '/api/confirm' && request.method === 'POST') {
+      return handleConfirm(request, env);
     }
 
     if (path === '/api/unsubscribe' && request.method === 'POST') {

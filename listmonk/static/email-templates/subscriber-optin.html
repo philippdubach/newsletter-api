@@ -1,15 +1,17 @@
 {{ define "subscriber-optin" }}
+<title data-i18n>One click to confirm your subscription</title>
 {{ template "header" . }}
-<h1 style="margin: 0 0 20px 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 28px; font-weight: 700; color: #1a1a1a; line-height: 1.25; letter-spacing: -0.02em;">One more step.</h1>
-<p style="margin: 0 0 24px 0; font-family: Georgia, 'Times New Roman', Times, serif; font-size: 16px; line-height: 1.65; color: #333333;">Confirm your address to get new essays, once a month.</p>
+<div style="display: none; max-height: 0; overflow: hidden; opacity: 0;">You're almost on the list for new essays on AI and markets.</div>
+<h1 style="margin: 0 0 20px 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 28px; font-weight: 700; color: #1a1a1a; line-height: 1.25; letter-spacing: -0.02em;">Confirm your subscription</h1>
+<p style="margin: 0 0 24px 0; font-family: Georgia, 'Times New Roman', Times, serif; font-size: 16px; line-height: 1.65; color: #333333;">One click and you're on the list for new essays on AI and markets, once a month.</p>
 <table role="presentation" cellpadding="0" cellspacing="0" border="0">
     <tr>
         <td align="center" bgcolor="#c8102e" style="border-radius: 6px;">
-            <a href="{{ .OptinURL }}" style="background-color: #c8102e; border-radius: 6px; color: #ffffff; display: inline-block; font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 600; line-height: 48px; padding: 0 32px; text-align: center; text-decoration: none;">Confirm subscription</a>
+            <a href="https://philippdubach.com/?confirm#{{ .Subscriber.UUID }}" style="background-color: #c8102e; border-radius: 6px; color: #ffffff; display: inline-block; font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 600; line-height: 48px; padding: 0 32px; text-align: center; text-decoration: none;">Yes, subscribe me</a>
         </td>
     </tr>
 </table>
-<p style="margin: 24px 0 0 0; font-family: Georgia, 'Times New Roman', Times, serif; font-size: 16px; line-height: 1.65; color: #333333;">If you didn't sign up, ignore this email. You won't hear from me again.</p>
+<p style="margin: 24px 0 0 0; font-family: Georgia, 'Times New Roman', Times, serif; font-size: 16px; line-height: 1.65; color: #333333;">Didn't sign up? Ignore this email and you won't hear from me again.</p>
 <p style="margin: 24px 0 0 0; font-family: Georgia, 'Times New Roman', Times, serif; font-size: 16px; line-height: 1.65; color: #333333;">&mdash; Phil</p>
 {{ template "footer" }}
 {{ end }}
