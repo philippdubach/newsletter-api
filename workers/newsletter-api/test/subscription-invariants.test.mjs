@@ -18,6 +18,7 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 import { TEST_BINDINGS, startRuntime } from './harness.mjs';
 
@@ -1515,9 +1516,22 @@ describe('confirming from the blog', () => {
     body: JSON.stringify({ token }),
   });
 
+  // Both answers are HTTP 200 from Listmonk's message template; only the title differs.
+  const page = (title, message) => `<!doctype html><html><head><title>${title} - Newsletter</title></head>`
+    + `<body><h2>${title}</h2><div>${message}</div></body></html>`;
+  const answering = (store, answer) => async (request) => {
+    const response = await store.handler(request);
+    return new URL(request.url).pathname.startsWith('/subscription/optin/')
+      ? new Response(answer, { status: 200, headers: { 'content-type': 'text/html' } })
+      : response;
+  };
+
   it('confirms through the public opt-in route', async () => {
     const store = createProviderStub();
-    const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+    const local = await startRuntime({
+      extraBindings: PROVIDER_BINDINGS,
+      outboundService: answering(store, page('Confirmed', 'Subscribed successfully.')),
+    });
     try {
       const response = await post(local, UUID, '198.51.100.90');
       assert.deepEqual(await response.json(), { success: true });
@@ -1527,6 +1541,37 @@ describe('confirming from the blog', () => {
     } finally {
       await local.dispose();
     }
+  });
+
+  for (const [name, answer] of [
+    ['Listmonk\'s "No subscriptions" page', page('No subscriptions', 'There are no subscriptions to confirm.')],
+    ['an error page answered with 200', page('Error', 'Confirmed nothing.')],
+    ['a page that only mentions the word', '<p>Confirmed</p>'],
+    ['a longer title', page('Not Confirmed', '')],
+    ['an empty body', ''],
+    ['JSON', '{"data":true}'],
+  ]) {
+    it(`answers neutrally for ${name}`, async () => {
+      const store = createProviderStub();
+      const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: answering(store, answer) });
+      try {
+        const response = await post(local, UUID, '198.51.100.93');
+        assert.equal(response.status, 200);
+        assert.deepEqual(await response.json(), {
+          success: false,
+          status: 'nothing_to_confirm',
+          error: 'This link has already been used or the subscription has ended.',
+        });
+      } finally {
+        await local.dispose();
+      }
+    });
+  }
+
+  it('matches the title markup of the template production serves', () => {
+    const template = readFileSync(new URL('../../../listmonk/static/public/templates/message.html', import.meta.url), 'utf8');
+    assert.match(template, /<h2>\{\{ \.Data\.Title \}\}<\/h2>/);
+    assert.match(template, /eq \.Data\.Title "Confirmed"/);
   });
 
   it('never passes a malformed id to the provider', async () => {

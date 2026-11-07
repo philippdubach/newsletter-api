@@ -1010,12 +1010,18 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
 }
 
 const SUBSCRIBER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// listmonk/static/public/templates/message.html renders the title in an h2, and the
+// English title is "Confirmed". That template matches the same string.
+const CONFIRMED_PAGE = /<h2[^>]*>\s*Confirmed\s*<\/h2>/;
+const TEXT_NOTHING_TO_CONFIRM = 'This link has already been used or the subscription has ended.';
 
 /**
  * Confirms a double opt-in from the blog. The email links to the site and the
  * page posts here, so a mail scanner that only fetches the link confirms nothing.
- * Listmonk answers 200 for an address that is already confirmed, which a second
- * click should treat as success too.
+ *
+ * Listmonk answers 200 both when it confirms and when there is nothing left to
+ * confirm: a second click, an unsubscribed reader or an unknown id. Only the page
+ * title differs, so anything other than the confirmed title gets the neutral answer.
  */
 async function handleConfirm(request: Request, env: Env): Promise<Response> {
   if (writesUnavailable(env)) return maintenanceResponse(request, env);
@@ -1039,8 +1045,13 @@ async function handleConfirm(request: Request, env: Env): Promise<Response> {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'confirm=true',
+      // callListmonk disarms its own timer at the headers; this one covers the body.
+      signal: AbortSignal.timeout(10000),
     });
-    if (resp.ok) return jsonResponse({ success: true }, 200, request, env);
+    if (resp.ok) {
+      if (CONFIRMED_PAGE.test(await resp.text())) return jsonResponse({ success: true }, 200, request, env);
+      return jsonResponse({ success: false, status: 'nothing_to_confirm', error: TEXT_NOTHING_TO_CONFIRM }, 200, request, env);
+    }
     if (resp.status < 500) return jsonResponse({ success: false, error: 'Invalid confirmation link' }, 400, request, env);
     console.error(`Listmonk confirm failed: HTTP ${resp.status}`);
     return jsonResponse({ success: false, error: 'Confirmation is unavailable' }, 502, request, env);

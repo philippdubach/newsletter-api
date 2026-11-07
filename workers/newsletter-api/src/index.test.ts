@@ -578,6 +578,22 @@ describe('Newsletter API', () => {
     });
   });
 
+  describe('POST /api/confirm', () => {
+    it('reports a provider failure when the 200 body cannot be read', async () => {
+      const broken = new ReadableStream({ start(controller) { controller.error(new Error('stream reset')); } });
+      global.fetch = vi.fn().mockResolvedValue(new Response(broken, { status: 200 }));
+
+      const response = await worker.fetch(new Request('https://api.example.com/api/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: '0d8f6a52-3c1e-4b7a-9f10-2a6c5e7b1d34' }),
+      }), mockEnv, mockCtx);
+
+      expect(response.status).toBe(502);
+      expect(await response.json()).toEqual({ success: false, error: 'Confirmation is unavailable' });
+    });
+  });
+
   describe('GET /api/subscriber-count', () => {
     it('should return subscriber count', async () => {
       mockEnv.LISTMONK_API_TOKEN = ''; // This fixture exercises the KV-only fallback.
