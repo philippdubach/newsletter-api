@@ -29,7 +29,7 @@ interface MockEnv {
 }
 
 // Import the worker
-import worker, { reconcileSignup, type Env } from './index';
+import worker, { reconcileSignup, SubscriptionCoordinator, type Env } from './index';
 
 type EnvLike = Parameters<typeof reconcileSignup>[3];
 
@@ -1086,6 +1086,99 @@ describe('Newsletter API', () => {
       await worker.fetch(signupFrom({ asn: 64500, asOrganization: 'x'.repeat(500) }), mockEnv, mockCtx);
 
       expect((storedRecord().asOrganization as string).length).toBe(200);
+    });
+  });
+
+  describe('Coordinator mail after a signup', () => {
+    const HOUR = 3_600_000;
+    const EMAIL = 'coordinated@example.com';
+
+    // In-memory stand-in for the Durable Object state. The workerd suite covers
+    // the real scheduler; this only needs storage and the alarm slot.
+    function fakeState() {
+      const data = new Map<string, unknown>();
+      let alarm: number | null = null;
+      const state = {
+        storage: {
+          get: async (key: string) => data.get(key),
+          put: async (key: string, value: unknown) => { data.set(key, value); },
+          delete: async (key: string) => data.delete(key),
+          setAlarm: async (at: number) => { alarm = at; },
+          getAlarm: async () => alarm,
+          deleteAlarm: async () => { alarm = null; },
+        },
+        blockConcurrencyWhile: async (work: () => Promise<void>) => work(),
+      } as unknown as DurableObjectState;
+      return { state, data, alarm: () => alarm };
+    }
+
+    // Listmonk answers the lookup from `subscriber` and accepts everything else.
+    function stubListmonk(subscriber: unknown = null): ReturnType<typeof vi.fn> {
+      const f = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes('/api/subscribers?query=') && (init?.method ?? 'GET') === 'GET') {
+          const results = subscriber ? [subscriber] : [];
+          return new Response(JSON.stringify({ data: { results, total: results.length } }), { status: 200 });
+        }
+        return new Response('{}', { status: 200 });
+      });
+      global.fetch = f as unknown as typeof fetch;
+      return f;
+    }
+
+    const callsTo = (f: ReturnType<typeof vi.fn>, method: string, path: RegExp): number =>
+      (f.mock.calls as Array<[RequestInfo | URL, RequestInit | undefined]>)
+        .filter(([input, init]) => (init?.method ?? 'GET') === method && path.test(new URL(String(input)).pathname)).length;
+
+    async function submit(coordinator: SubscriptionCoordinator, verified: boolean): Promise<Record<string, unknown>> {
+      const response = await coordinator.fetch(new Request('https://coordinator/intent', {
+        method: 'POST',
+        body: JSON.stringify({ desired: 'subscribed', email: EMAIL, ip: '203.0.113.9', userAgent: 'test', verified }),
+      }));
+      return await response.json() as Record<string, unknown>;
+    }
+
+    beforeEach(() => {
+      (mockEnv as Env).DOUBLE_OPTIN = 'on';
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(null);
+      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
+    });
+
+    it('arms the 48-hour reminder for a signup that passed the challenge', async () => {
+      const { state, data, alarm } = fakeState();
+      const listmonk = stubListmonk();
+      const before = Date.now();
+
+      const result = await submit(new SubscriptionCoordinator(state, mockEnv), true);
+
+      expect(result).toMatchObject({ outcome: 'completed', created: true, awaitingConfirmation: true });
+      expect(callsTo(listmonk, 'POST', /^\/api\/subscribers$/)).toBe(1);
+      const due = data.get('optin-reminder-at') as number;
+      expect(Math.abs(due - before - 48 * HOUR)).toBeLessThan(5000);
+      expect(alarm()).toBe(due);
+    });
+
+    it('arms no reminder and leaves no alarm for a signup without a passed challenge', async () => {
+      const { state, data, alarm } = fakeState();
+      const listmonk = stubListmonk();
+
+      const result = await submit(new SubscriptionCoordinator(state, mockEnv), false);
+
+      // The create still happens, so Listmonk mails the opt-in link once.
+      expect(result).toMatchObject({ outcome: 'completed', created: true, awaitingConfirmation: true });
+      expect(callsTo(listmonk, 'POST', /^\/api\/subscribers$/)).toBe(1);
+      expect(data.has('optin-reminder-at')).toBe(false);
+      expect(alarm()).toBeNull();
+    });
+
+    it('drops a reminder an earlier signup armed when an unverified signup recreates the address', async () => {
+      const { state, data, alarm } = fakeState();
+      stubListmonk();
+      data.set('optin-reminder-at', Date.now() + 47 * HOUR);
+
+      await submit(new SubscriptionCoordinator(state, mockEnv), false);
+
+      expect(data.has('optin-reminder-at')).toBe(false);
+      expect(alarm()).toBeNull();
     });
   });
 

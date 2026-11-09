@@ -1814,7 +1814,14 @@ export class SubscriptionCoordinator {
     }
 
     if (isDoubleOptIn(this.env) && !created.duplicate) {
-      await this.state.storage.put(OPTIN_REMINDER_KEY, Date.now() + OPTIN_REMINDER_DELAY_MS);
+      // Anyone can submit any address. A signup without a passed challenge gets
+      // Listmonk's opt-in mail and nothing after it, including a reminder that an
+      // earlier signup for this address left armed.
+      if (intent.verified === true) {
+        await this.state.storage.put(OPTIN_REMINDER_KEY, Date.now() + OPTIN_REMINDER_DELAY_MS);
+      } else {
+        await this.state.storage.delete(OPTIN_REMINDER_KEY);
+      }
       return { outcome: 'completed', created: true, awaitingConfirmation: true };
     }
 

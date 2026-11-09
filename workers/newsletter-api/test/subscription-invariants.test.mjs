@@ -1334,13 +1334,16 @@ describe('a removal never deletes the shadow before it can act', () => {
 describe('double opt-in', () => {
   const OPTIN_BINDINGS = { ...PROVIDER_BINDINGS, DOUBLE_OPTIN: 'on' };
 
-  function post(local, email, ip) {
+  function post(local, email, ip, fields = {}) {
     return local.runtime.dispatchFetch('http://localhost/api/subscribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, ...fields }),
     });
   }
+  // Enforcement stays off here, so a token decides only whether a signup is verified.
+  const VERIFYING_BINDINGS = { ...OPTIN_BINDINGS, ...CHALLENGE_BINDINGS };
+  const PASSED = { 'cf-turnstile-response': PASSING_TOKEN };
 
   it('leaves the confirmation to Listmonk and sends no welcome', async () => {
     const email = 'invariant-optin@example.com';
@@ -1434,13 +1437,13 @@ describe('double opt-in', () => {
         }
       }
 
-      it('waits 48 hours after a first signup', async () => {
+      it('waits 48 hours after a first signup that passed the challenge', async () => {
         const email = 'invariant-reminder-armed@example.com';
         const store = createProviderStub();
-        const local = await startRuntime({ scheduler: true, extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+        const local = await startRuntime({ scheduler: true, extraBindings: VERIFYING_BINDINGS, outboundService: store.handler });
         try {
           const before = Date.now();
-          const body = await (await post(local, email, '198.51.100.90')).json();
+          const body = await (await post(local, email, '198.51.100.90', PASSED)).json();
           await local.drain();
 
           assert.equal(body.status, 'confirmation_required');
@@ -1451,6 +1454,46 @@ describe('double opt-in', () => {
         } finally {
           await local.dispose();
         }
+      });
+
+      for (const [name, fields] of [['no token', {}], ['a token that fails', { 'cf-turnstile-response': 'forged' }]]) {
+        it(`arms no reminder and no alarm for a first signup with ${name}`, async () => {
+          const email = `invariant-reminder-unverified-${Object.keys(fields).length}@example.com`;
+          const store = createProviderStub();
+          const local = await startRuntime({ scheduler: true, extraBindings: VERIFYING_BINDINGS, outboundService: store.handler });
+          try {
+            const body = await (await post(local, email, '198.51.100.92', fields)).json();
+            await local.drain();
+
+            // The signup itself is unchanged: Listmonk mails the opt-in link once.
+            assert.equal(body.status, 'confirmation_required');
+            assert.equal(store.mutations().length, 1);
+            const stub = await local.coordinator(email);
+            const stored = await settled(stub);
+            assert.equal(stored.reminder, null);
+            assert.equal(stored.alarm, null, 'nothing is left that could wake up and mail');
+            assert.equal(resends(store).length, 0);
+          } finally {
+            await local.dispose();
+          }
+        });
+      }
+
+      it('drops an armed reminder when an unverified signup recreates the address', async () => {
+        const email = 'invariant-reminder-recreated@example.com';
+        // The provider no longer has the address, so the signup creates it again.
+        await withReminder(email, { intent: intent(email), 'optin-reminder-at': Date.now() + 47 * HOUR }, async (stub, store) => {
+          const signup = await stub.fetch('https://coordinator/intent', {
+            method: 'POST',
+            body: JSON.stringify({ desired: 'subscribed', email, ip: '198.51.100.93', verified: false }),
+          });
+          assert.equal((await signup.json()).awaitingConfirmation, true);
+
+          const stored = await state(stub);
+          assert.equal(store.mutations().length, 1);
+          assert.equal(stored.reminder, null);
+          assert.equal(stored.alarm, null);
+        }, { subscriber: null });
       });
 
       it('mails an unclicked link once, and does not arm again', async () => {
