@@ -18,24 +18,44 @@ the honeypot and the address check, and before `submitIntent`. The token is the
 `https://challenges.cloudflare.com/turnstile/v0/siteverify` with `TURNSTILE_SECRET`
 and the caller's IP address, with a 5-second limit.
 
+A token passes only if the siteverify answer meets all three checks that
+Cloudflare's integration guide requires:
+
+1. `success` is `true`.
+2. `action` is exactly `signup`, the action the site's widget is rendered with.
+   A different, empty or missing action fails.
+3. `hostname` is in `TURNSTILE_HOSTNAMES`, a comma-separated list. The match is
+   exact and ignores case. A subdomain passes only if it is listed.
+
+Checks 2 and 3 refuse a token that is valid for the sitekey but was solved
+somewhere else. Each such refusal logs
+`Turnstile token refused: action "...", hostname "..."`.
+
 | Caller | `TURNSTILE = "on"` | `TURNSTILE = "off"` |
 |---|---|---|
 | Operator bearer token | Accepted, verified | Accepted, verified |
-| Token that passes | Accepted, verified | Accepted, verified (needs the secret) |
+| Token that passes all three checks | Accepted, verified | Accepted, verified (needs the secret and the hostname list) |
 | No token | 400 `challenge_required` | Accepted, unverified |
 | Token that siteverify rejects, or longer than 2048 characters | 400 `challenge_failed` | Accepted, unverified |
+| Token with another or no action, or from a hostname not in the list | 400 `challenge_failed` | Accepted, unverified |
 | Siteverify unreachable, or it reports a bad secret or an internal error | 503 `challenge_unavailable` | Accepted, unverified |
 | `TURNSTILE_SECRET` not set | 503 `challenge_unavailable` | Accepted, unverified, no siteverify call |
+| `TURNSTILE_HOSTNAMES` missing or empty | 503 `challenge_unavailable`, no siteverify call | Accepted, unverified, no siteverify call |
 
 A refusal carries `success: false`, `status`, `error` and `message`, like the other
 signup answers, so the site form shows the text without a change. A refused request
 records no intent, writes no KV record and reaches Listmonk at no point.
 
 Only the exact value `on` enforces. `npm run check:config` rejects any value other
-than `on` or `off`, because a typo would leave the endpoint open.
+than `on` or `off`, because a typo would leave the endpoint open. It also rejects
+`on` without `TURNSTILE_HOSTNAMES`, and a production list that names `localhost`,
+`127.0.0.1` or another loopback host. A token solved on a developer's machine must
+never count in production.
 
-The Worker does not compare the `hostname` or `action` that siteverify returns.
-Restrict the widget to the site's hostnames in the Cloudflare dashboard instead.
+`TURNSTILE_HOSTNAMES` is `philippdubach.com` in production. If the form is ever
+served from another hostname, such as `www.philippdubach.com` or `phil-dubach.com`,
+add that hostname to the list and to the widget in the dashboard. Until then its
+tokens fail check 3.
 
 `verified` is true for a passed token or the operator token. It is stored on the
 coordinator intent and on the KV record. An intent that is not verified gets one
@@ -89,9 +109,9 @@ addresses.
 Each step that changes production needs the owner's approval.
 
 1. Create a Turnstile widget in the Cloudflare dashboard, in Managed mode. Allow
-   the hostnames that serve the form: `philippdubach.com`, `www.philippdubach.com`
-   and any other origin in `ALLOWED_ORIGIN` that shows it. Note the sitekey, which
-   is public, and the secret key.
+   the hostnames that serve the form. Done on 2026-11-09 for `philippdubach.com`.
+   Keep `TURNSTILE_HOSTNAMES` in `wrangler.toml` equal to the hostnames of the
+   widget that show the form. Note the sitekey, which is public, and the secret key.
 2. Store the secret. Run this from `workers/newsletter-api/`:
 
    ```bash
@@ -115,8 +135,13 @@ Each step that changes production needs the owner's approval.
    ```bash
    npx wrangler kv key get "<address>" --binding NEWSLETTER_SUBSCRIBERS --remote --env production
    ```
-5. Set `TURNSTILE = "on"` in `[env.production.vars]` of `wrangler.toml` and deploy
-   again. A request without a token now gets 400.
+5. Wait for cached copies of the site to expire. A page cached before the site
+   release renders the widget without an action, or has no widget. Its token fails
+   the action check or is missing, so with the challenge on that reader gets a 400.
+   While the challenge is off, watch `npx wrangler tail --env production` for
+   `Turnstile token refused: action "undefined"`. Go on when it has stopped.
+   Then set `TURNSTILE = "on"` in `[env.production.vars]` of `wrangler.toml` and
+   deploy again. A request without a passing token now gets 400.
 6. Start the hourly poll of `/api/signup-stats`. See `README.md`.
 7. Leave `BLOCKED_IPS` set through all of the steps above. It may be removed only
    after step 5 is live in production. See "The IP blocklist stays for now".
@@ -150,8 +175,9 @@ The form is in the site repository, `philippdubach.github.io`. It posts to
 
 3. `assets/js/site.js`, in the `[data-newsletter-endpoint]` loop: load the Turnstile
    script on the first focus of the email field, render one widget for each form,
-   and send its token with the address. The Worker's contract is only the field
-   name `cf-turnstile-response`; the code below is one way to meet it.
+   and send its token with the address. The Worker's contract has three parts:
+   the field name `cf-turnstile-response`, the widget action `signup`, and a page
+   hostname that is in `TURNSTILE_HOSTNAMES`. The code below is one way to meet it.
 
    ```js
    // One script load for the page. Cloudflare requires this exact URL: do not bundle or proxy it.
@@ -171,6 +197,7 @@ The form is in the site repository, `philippdubach.github.io`. It posts to
    const showChallenge = () => loadTurnstile().then((turnstile) => {
      widgetId ??= turnstile.render(challenge, {
        sitekey: form.dataset.turnstileSitekey,
+       action: "signup", // The Worker refuses a token with any other action.
        appearance: "interaction-only",
        size: "flexible",
      });
@@ -232,10 +259,18 @@ Three consequences for the site owner to decide on:
 ### Local testing
 
 Cloudflare publishes dummy keys that work on any hostname, listed at
-`developers.cloudflare.com/turnstile/troubleshooting/testing/`. Sitekey
-`1x00000000000000000000AA` with secret `1x0000000000000000000000000000000AA`
-always passes. Secret `2x0000000000000000000000000000000AA` always fails. Put the
-secret in `.dev.vars` with `TURNSTILE = "on"`. A real secret rejects a dummy token.
+`developers.cloudflare.com/turnstile/troubleshooting/testing/`. They cannot produce
+a verified signup here. The dummy secret `1x0000000000000000000000000000000AA`
+answers `success: true` with the hostname `example.com` and no action, so the
+Worker refuses the token on the action check. That makes the dummy keys useful for
+the refusal paths only: put that secret in `.dev.vars` with `TURNSTILE = "on"` and
+`TURNSTILE_HOSTNAMES = "example.com"`, and expect 400 `challenge_failed`. Secret
+`2x0000000000000000000000000000000AA` always answers a failure.
+
+To see a signup pass locally, use a real widget whose hostnames include
+`localhost`, with its secret and `TURNSTILE_HOSTNAMES = "localhost"` in `.dev.vars`.
+Use a widget made for development, not the production one, and never add a local
+hostname to the production list.
 
 The unit tests stub siteverify through `fetch`. The workerd suite answers it from
 the provider stand-in in `test/subscription-invariants.test.mjs`, which accepts one
