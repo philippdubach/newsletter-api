@@ -57,7 +57,7 @@ A failed provider call retries by Durable Object alarm. There are eight attempts
 - A token passes on three checks of the siteverify answer: `success` is true, `action` is `signup`, and `hostname` is in `TURNSTILE_HOSTNAMES`. The last two refuse a token that was solved on another page.
 - With `TURNSTILE = "off"`, no request is refused. A token that arrives is still verified, and the record stores the result.
 - A signup that is not verified causes one email at most: the opt-in mail from Listmonk. It gets no 48-hour reminder, and a repeat of the request does not resend the link.
-- `BLOCKED_IPS` refuses listed clients at `/api/subscribe` and `/api/confirm`. It is in the Worker because zone WAF rules do not cover the `workers.dev` hostname. The check runs before the challenge. Keep the list until `TURNSTILE` is `on` in production: a listed address still posted on 2026-11-09. Remove it only after that.
+- `BLOCKED_IPS` refuses listed clients at `/api/subscribe` and `/api/confirm`. It is in the Worker because zone WAF rules do not cover the `workers.dev` hostname. The check runs before the challenge. The secret is optional and is not set in production: the list of six addresses was removed on 2026-11-09, after `TURNSTILE` went `on`. `docs/REFERENCE.md` records the addresses.
 - Both endpoints allow five requests a minute for each IP address. The limit fails open on KV errors and is not atomic.
 - `/api/confirm` accepts only a UUID. It reports a provider failure as a failure.
 - A plain fetch of the confirmation link confirms nothing, because the site must run JavaScript. A scanner that runs JavaScript can still confirm.

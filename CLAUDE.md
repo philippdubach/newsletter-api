@@ -42,7 +42,7 @@ npm run deploy:production   # Deploy to production — USE THIS
 
 **Confirm flow** (`handleConfirm`): the email links to `philippdubach.com/?confirm#<subscriber uuid>`. The site posts the id to `/api/confirm`, and the Worker posts to Listmonk's public `/subscription/optin/<uuid>`. Do not change the link format. The query avoids a stale cached homepage, and the fragment keeps the id out of logs. See `OPERATIONS.md` in the site repository.
 
-`BLOCKED_IPS` is an optional comma-separated secret. It lives in the Worker because zone WAF rules do not cover the `workers.dev` hostname.
+`BLOCKED_IPS` is an optional comma-separated secret. It lives in the Worker because zone WAF rules do not cover the `workers.dev` hostname. It is not set in production since 2026-11-09, because the challenge now refuses those callers.
 
 **Signup report** (`handleSignupStats`, `GET /api/signup-stats`, operator token): lists the subscriber keys in KV, reads the values 100 at a time, and counts the records of the last 24 hours and 7 days by IP, ASN and user agent. `alert.triggered` follows the thresholds in `README.md`. It must not return an email address, and a KV error must stay a 500.
 

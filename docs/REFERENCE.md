@@ -92,17 +92,29 @@ request. In the same hour an unrelated scraper used the same user-agent string,
 and about 20 real subscribers arrive through VPNs or relays. The unit tests pin
 this: a request with the bot's exact shape is accepted once its challenge passes.
 
-### The IP blocklist stays for now
+### The IP blocklist was removed
 
-`BLOCKED_IPS` and its check are unchanged in this branch. The owner's instruction
-on 2026-11-09 was: "Keep the IP list until Turnstile is live." At 12:25 UTC that
-day `95.182.114.251`, one of the six listed addresses, posted to `/api/subscribe`
-and got the 429. The blocklist runs before the challenge, so a listed address is
-refused without a siteverify call.
+`BLOCKED_IPS` is an optional secret, and the check for it stays in the code. It
+runs before the challenge, so a listed address is refused without a siteverify
+call. The secret is not set in production since 2026-11-09 15:22 UTC.
 
-Remove the list only after `TURNSTILE` is `on` in production and the signup
-report has stayed quiet. Until then it is the only control that stops those
-addresses.
+It listed the six addresses of the November bot. The owner's instruction that
+day was to keep the list until Turnstile was live. At 12:25 UTC one of the
+addresses still posted to `/api/subscribe` and got the 429. `TURNSTILE` went `on`
+at 15:20 UTC, and the owner then had the list removed. The bot posts without a
+token, so the challenge now refuses it with a 400, from any address.
+
+To restore the list, set the secret again with these addresses, separated by
+commas:
+
+```text
+31.57.107.185
+31.56.204.42
+95.182.114.251
+95.182.89.76
+31.56.196.42
+2a13:7c00:5:29:f816:3eff:fe9c:985d
+```
 
 ### Rollout
 
@@ -112,7 +124,8 @@ State on 2026-11-09: steps 1 to 5 are done, and `TURNSTILE` is `on` in
 production. The secret was stored after the deploy of step 3, not before it:
 `wrangler secret put` refuses while the newest uploaded version of the Worker is
 not the deployed one, and a leftover test version was the newest. A signup made
-through the live form was recorded with `"verified":true`. Steps 6 and 7 are open.
+through the live form was recorded with `"verified":true`. `BLOCKED_IPS` was
+removed the same day, which closes step 7. Step 6 is open.
 
 1. Create a Turnstile widget in the Cloudflare dashboard, in Managed mode. Allow
    the hostnames that serve the form. Done on 2026-11-09 for `philippdubach.com`.
@@ -150,10 +163,10 @@ through the live form was recorded with `"verified":true`. Steps 6 and 7 are ope
    deploy again. A request without a passing token now gets 400.
 6. Start the hourly poll of `/api/signup-stats`. See `README.md`.
 7. Leave `BLOCKED_IPS` set through all of the steps above. It may be removed only
-   after step 5 is live in production. See "The IP blocklist stays for now".
+   after step 5 is live in production. See "The IP blocklist was removed".
 
-To go back, set `TURNSTILE = "off"` and deploy. The secret can stay. Keep
-`BLOCKED_IPS` while the challenge is off.
+To go back, set `TURNSTILE = "off"` and deploy. The secret can stay. Set
+`BLOCKED_IPS` again while the challenge is off.
 
 ### The site form change
 
