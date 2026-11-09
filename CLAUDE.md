@@ -27,15 +27,20 @@ npm run deploy:production   # Deploy to production — USE THIS
 
 **Subscribe flow** (`handleSubscribe`):
 1. Refuse `BLOCKED_IPS`, apply the rate limit, and reject the honeypot field.
-2. Send the intent to `SubscriptionCoordinator`, one Durable Object for each address. It serializes signups and unsubscribes.
-3. The coordinator reads Listmonk, then creates the subscriber if the address is absent. It writes the KV shadow record. A transient failure retries by alarm, with eight attempts in total. A 4xx create and a subscriber with no list row are terminal. Exhausted work is stored under `exhausted` and shown by `/state`.
-4. With `DOUBLE_OPTIN = "on"` (production), the create uses `preconfirm_subscriptions: false`, and the Worker sends no welcome. Listmonk mails the opt-in link because list 3 is a double opt-in list. The response carries `status: "confirmation_required"`. Change the Worker var and the list's opt-in type together. If the address is already unconfirmed, the coordinator resends the opt-in at most once per 24 hours.
+2. Run `checkChallenge()`. With `TURNSTILE = "on"`, a missing or failed `cf-turnstile-response` token returns 400 and a missing `TURNSTILE_SECRET` or unreachable siteverify returns 503, all before `submitIntent`. With `TURNSTILE = "off"`, nothing is refused, but a token is still verified when the secret is set. The operator bearer token passes without a challenge. The result travels to the coordinator as `verified`.
+3. Send the intent to `SubscriptionCoordinator`, one Durable Object for each address. It serializes signups and unsubscribes.
+4. The coordinator reads Listmonk, then creates the subscriber if the address is absent. It writes the KV shadow record. A transient failure retries by alarm, with eight attempts in total. A 4xx create and a subscriber with no list row are terminal. Exhausted work is stored under `exhausted` and shown by `/state`.
+5. With `DOUBLE_OPTIN = "on"` (production), the create uses `preconfirm_subscriptions: false`, and the Worker sends no welcome. Listmonk mails the opt-in link because list 3 is a double opt-in list. The response carries `status: "confirmation_required"`. Change the Worker var and the list's opt-in type together. If the address is already unconfirmed and the intent is `verified`, the coordinator resends the opt-in at most once per 24 hours.
 
-**Reminder:** a first signup under double opt-in stores `optin-reminder-at`, 48 hours ahead. The reminder shares the coordinator's alarm with retries, so `endRetries()` must rearm it. At the due time, `sendDueReminder()` resends the opt-in once if Listmonk still reports the address as unconfirmed. The 24-hour resend window also applies.
+**One mail for an unverified signup:** anyone can submit any address. An intent without `verified` gets the opt-in mail from the Listmonk create and nothing else: no reminder and no resend. Keep this rule when you add a path that sends mail.
+
+**Reminder:** a first verified signup under double opt-in stores `optin-reminder-at`, 48 hours ahead. The reminder shares the coordinator's alarm with retries, so `endRetries()` must rearm it. At the due time, `sendDueReminder()` resends the opt-in once if Listmonk still reports the address as unconfirmed. The 24-hour resend window also applies.
 
 **Confirm flow** (`handleConfirm`): the email links to `philippdubach.com/?confirm#<subscriber uuid>`. The site posts the id to `/api/confirm`, and the Worker posts to Listmonk's public `/subscription/optin/<uuid>`. Do not change the link format. The query avoids a stale cached homepage, and the fragment keeps the id out of logs. See `OPERATIONS.md` in the site repository.
 
 `BLOCKED_IPS` is an optional comma-separated secret. It lives in the Worker because zone WAF rules do not cover the `workers.dev` hostname.
+
+**Signup report** (`handleSignupStats`, `GET /api/signup-stats`, operator token): lists the subscriber keys in KV, reads the values 100 at a time, and counts the records of the last 24 hours and 7 days by IP, ASN and user agent. `alert.triggered` follows the thresholds in `README.md`. It must not return an email address, and a KV error must stay a 500.
 
 The welcome and Plunk fallback paths run only when `DOUBLE_OPTIN` is off.
 
@@ -45,11 +50,11 @@ The welcome and Plunk fallback paths run only when `DOUBLE_OPTIN` is off.
 - `NEWSLETTER_SUBSCRIBERS` — KV namespace (subscriber shadow + rate limits + caches)
 - `R2_BUCKET` — R2 bucket `static-eu` (EU jurisdiction) for newsletter archive files
 - `SUBSCRIPTION_COORDINATOR` — Durable Object namespace, one object for each address
-- Vars: `ALLOWED_ORIGIN`, `ENVIRONMENT`, `COORDINATOR_MODE`, `DOUBLE_OPTIN`, `PROVIDER_BUDGET_MS`, `LINKEDIN_NEWSLETTER_URLS`, `LISTMONK_API_URL`, `LISTMONK_LIST_ID`, `LISTMONK_WELCOME_TEMPLATE_ID`
-- Secrets (set via `wrangler secret put ... --env production`): `LISTMONK_API_USER`, `LISTMONK_API_TOKEN`, `PLUNK_SECRET_KEY`, `ADMIN_TOKEN`, `UNSUBSCRIBE_HMAC_SECRET`, `BLOCKED_IPS`
+- Vars: `ALLOWED_ORIGIN`, `ENVIRONMENT`, `COORDINATOR_MODE`, `DOUBLE_OPTIN`, `TURNSTILE`, `PROVIDER_BUDGET_MS`, `LINKEDIN_NEWSLETTER_URLS`, `LISTMONK_API_URL`, `LISTMONK_LIST_ID`, `LISTMONK_WELCOME_TEMPLATE_ID`
+- Secrets (set via `wrangler secret put ... --env production`): `LISTMONK_API_USER`, `LISTMONK_API_TOKEN`, `PLUNK_SECRET_KEY`, `ADMIN_TOKEN`, `UNSUBSCRIBE_HMAC_SECRET`, `BLOCKED_IPS`, `TURNSTILE_SECRET`
 
 **KV key conventions:**
-- Subscriber emails stored directly as keys (lowercased) with subscription metadata as the value
+- Subscriber emails stored directly as keys (lowercased). The value is the signup evidence: `timestamp`, `ip`, `userAgent`, `asn`, `asOrganization`, `verified`, `seq`. The first record for an address wins
 - `rate_limit:{ip}` — short-TTL rate-limit counter
 - `cache:subscriber_count` — 10-min cached combined count payload
 - `cache:linkedin_last_known:{hash}` — last successful LinkedIn follower count per URL
@@ -83,7 +88,7 @@ No CI/CD — deployment is manual via Wrangler CLI.
 
 ## Listmonk templates
 
-`listmonk/static/` overlays the Listmonk templates at `/etc/listmonk/static` on `pd-prod`. See `listmonk/README.md`. Render a template offline before you install it. Do not send test signups without authorization.
+`listmonk/static/` overlays the Listmonk templates at `/etc/listmonk/static` on `pd-prod`. See `listmonk/README.md`. Render a template offline before you install it. Do not send test signups without authorization. This includes a request that you expect the challenge to refuse.
 
 ## Subscriber data
 

@@ -12,7 +12,7 @@ The website is in a separate repository. Its `OPERATIONS.md` describes the produ
 | `README.md` | What the system does and how to run it |
 | `CLAUDE.md` | Rules for coding agents |
 | `listmonk/README.md` | The Listmonk template overrides |
-| `docs/REFERENCE.md` | Coordinator rollback, test design and the subscriber inventory tool |
+| `docs/REFERENCE.md` | Signup challenge rollout, the site form change, coordinator rollback, test design and the subscriber inventory tool |
 
 ## How signup works
 
@@ -21,16 +21,16 @@ Site form -> POST /api/subscribe -> SubscriptionCoordinator -> Listmonk -> confi
 Email button -> philippdubach.com/?confirm#<id> -> POST /api/confirm -> Listmonk
 ```
 
-1. The form posts the address to `/api/subscribe`.
-2. The Worker checks the blocklist, the rate limit and the honeypot field.
+1. The form posts the address and a Turnstile token to `/api/subscribe`.
+2. The Worker checks the blocklist, the rate limit and the honeypot field. With `TURNSTILE = "on"`, it then verifies the token with Cloudflare and answers 400 if the token is missing or fails. Nothing is recorded and no mail is sent for a refused request.
 3. `SubscriptionCoordinator` is one Durable Object for each address. It records the intent, so a signup and an unsubscribe cannot overlap.
 4. The coordinator reads the current state from Listmonk. It creates the subscriber if the address is absent. It does not overwrite a blocklisted or unsubscribed address.
-5. Listmonk sends the confirmation email, because list 3 is a double opt-in list. If the link is unclicked after 48 hours, the coordinator asks Listmonk to send it once more.
+5. Listmonk sends the confirmation email, because list 3 is a double opt-in list. If the link is unclicked after 48 hours, the coordinator asks Listmonk to send it once more. This reminder is armed only for a verified signup: one that passed the challenge or carried the operator token.
 6. The email button opens the site. The site posts the subscriber id to `/api/confirm`, and the Worker confirms in Listmonk.
 
 The Worker sends no welcome email while `DOUBLE_OPTIN` is `on`.
 
-Listmonk is the source of truth. KV keeps a shadow record with the time, IP address and user agent of each signup. KV also holds the rate limit counters and caches. A KV record does not prove that an address is subscribed.
+Listmonk is the source of truth. KV keeps a shadow record of each signup: the time, IP address, user agent, ASN, ASN organization and whether the signup was verified. The first record for an address is kept. KV also holds the rate limit counters and caches. A KV record does not prove that an address is subscribed.
 
 A failed provider call retries by Durable Object alarm. There are eight attempts in total. After that, the coordinator stores an `exhausted` record, and an operator must investigate. The next accepted intent clears the record. A 4xx answer to a create, other than 409 and 429, is final and does not retry.
 
@@ -45,6 +45,7 @@ A failed provider call retries by Durable Object alarm. There are eight attempts
 | POST | `/api/unsubscribe/confirm` | Submit the signed form |
 | GET | `/api/newsletters` | List newsletter issues |
 | GET | `/api/subscriber-count` | Get the combined count, cached for 10 minutes |
+| GET | `/api/signup-stats` | Report recent signups. Operator authorization is required |
 | GET | `/api/health` | Health check |
 | POST | `/api/test-email` | Send a test email. Operator authorization is required |
 
@@ -52,6 +53,9 @@ A failed provider call retries by Durable Object alarm. There are eight attempts
 
 ## Security
 
+- With `TURNSTILE = "on"`, `/api/subscribe` requires a Turnstile token in the `cf-turnstile-response` field. A missing or rejected token gets 400. A missing secret or an unreachable siteverify gets 503, so the check never fails open. The operator bearer token passes without a challenge.
+- With `TURNSTILE = "off"`, no request is refused. A token that arrives is still verified, and the record stores the result.
+- A signup that is not verified causes one email at most: the opt-in mail from Listmonk. It gets no 48-hour reminder, and a repeat of the request does not resend the link.
 - `BLOCKED_IPS` refuses listed clients at `/api/subscribe` and `/api/confirm`. It is in the Worker because zone WAF rules do not cover the `workers.dev` hostname.
 - Both endpoints allow five requests a minute for each IP address. The limit fails open on KV errors and is not atomic.
 - `/api/confirm` accepts only a UUID. It reports a provider failure as a failure.
@@ -59,10 +63,62 @@ A failed provider call retries by Durable Object alarm. There are eight attempts
 - Unsubscribing requires a signed token or the operator bearer token. A signed GET link only shows a form.
 - An accepted unsubscribe is a durable tombstone. An anonymous signup cannot undo it.
 - Removal returns HTTP 202 with `status: "unverified"`, because a provider 2xx does not prove removal.
-- Request bodies are limited to 1 KB for signup and 2 KB for unsubscribe.
+- Request bodies are limited to 4 KB for signup, 2 KB for unsubscribe and 1 KB elsewhere. A Turnstile token is up to 2048 characters.
 - `/api/test-email` is refused when `ENVIRONMENT` is missing or unknown.
 
 Do not render provider values as HTML in a client. This code has no HTML sanitizer.
+
+## Watching for a signup spike
+
+`GET /api/signup-stats` reads the KV signup records and counts those of the last 24 hours and the last 7 days. It needs the operator bearer token. The 7-day numbers include the last 24 hours.
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" https://newsletter-api.philippd.workers.dev/api/signup-stats
+```
+
+```json
+{
+  "generatedAt": "2026-11-09T12:00:00.000Z",
+  "records": 148,
+  "undated": 0,
+  "windows": {
+    "24h": {
+      "signups": 4,
+      "unverified": 3,
+      "byIp": [{ "ip": "203.0.113.5", "count": 3 }, { "ip": "198.51.100.7", "count": 1 }],
+      "byAsn": [{ "asn": 64500, "asOrganization": "Example Hosting", "count": 3 }, { "asn": null, "asOrganization": null, "count": 1 }],
+      "byUserAgent": [{ "userAgent": "Mozilla/5.0 ... Chrome/124.0.0.0 Safari/537.36", "count": 3 }, { "userAgent": "...", "count": 1 }]
+    },
+    "7d": { "signups": 9, "unverified": 5, "byIp": [], "byAsn": [], "byUserAgent": [] }
+  },
+  "alert": {
+    "triggered": true,
+    "reasons": [
+      { "rule": "ip_24h", "ip": "203.0.113.5", "count": 3 },
+      { "rule": "user_agent_24h", "userAgent": "Mozilla/5.0 ... Chrome/124.0.0.0 Safari/537.36", "count": 3 }
+    ],
+    "thresholds": { "signups24h": 10, "repeat24h": 3 }
+  }
+}
+```
+
+Poll it every hour. `alert.triggered` is true when one of these holds for the last 24 hours:
+
+| Rule | Condition |
+|---|---|
+| `signups_24h` | More than 10 signups |
+| `ip_24h` | 3 or more signups from one IP address |
+| `user_agent_24h` | 3 or more signups with one identical user-agent string |
+
+Treat any answer other than HTTP 200 as a failed check, not as a quiet day. A KV error returns 500.
+
+Limits of the report:
+
+- It counts addresses, not requests. A record is the first signup of an address, and an unsubscribe deletes it.
+- A request that the challenge refuses leaves no record. Use `npx wrangler tail --env production` to see refused requests.
+- Records made before this endpoint existed have no ASN and count as unverified.
+- Each breakdown lists the 50 largest groups. The alert uses all groups.
+- The report contains IP addresses and no email address.
 
 ## Local development
 
@@ -112,6 +168,7 @@ Production variables are in `wrangler.toml`:
 | `ENVIRONMENT` | `development` or `production` |
 | `COORDINATOR_MODE` | `on`, or `legacy` to pause subscriber writes |
 | `DOUBLE_OPTIN` | `on` requires confirmation |
+| `TURNSTILE` | `on` refuses a signup without a passed Turnstile challenge. `off` verifies a token only if one arrives |
 | `PROVIDER_BUDGET_MS` | Time limit for one provider phase |
 | `LINKEDIN_NEWSLETTER_URLS` | LinkedIn pages for the follower count |
 | `LISTMONK_API_URL`, `LISTMONK_LIST_ID` | Listmonk location and list |
@@ -126,6 +183,7 @@ Production secrets are set with `npx wrangler secret put <NAME> --env production
 | `ADMIN_TOKEN` | Operator bearer token |
 | `UNSUBSCRIBE_HMAC_SECRET` | Signs unsubscribe tokens |
 | `BLOCKED_IPS` | Client IPs to refuse, separated by commas |
+| `TURNSTILE_SECRET` | Turnstile secret key for siteverify. Set it before `TURNSTILE` is `on` |
 | `UNSUBSCRIBE_BASE_URL` | Optional origin for unsubscribe links |
 
 ## Local-only files

@@ -2,6 +2,208 @@
 
 This file holds the detailed design notes and test records. `README.md` describes the system. Entries with a date were true on that date.
 
+## Signup challenge (Turnstile)
+
+Added on 2026-11-09 after a bot posted 124 signups straight to `/api/subscribe`
+on 3 to 7 November. It used six hosting-provider IP addresses, one user agent and
+about one request every 20 minutes. The honeypot, the per-IP rate limit and the
+exact-match `BLOCKED_IPS` list do not stop that pattern. Double opt-in kept the
+addresses off campaigns, but each request still mailed a stranger.
+
+### What the Worker does
+
+`checkChallenge()` runs in `handleSubscribe` after the blocklist, the rate limit,
+the honeypot and the address check, and before `submitIntent`. The token is the
+`cf-turnstile-response` field of the JSON or form body. The Worker posts it to
+`https://challenges.cloudflare.com/turnstile/v0/siteverify` with `TURNSTILE_SECRET`
+and the caller's IP address, with a 5-second limit.
+
+| Caller | `TURNSTILE = "on"` | `TURNSTILE = "off"` |
+|---|---|---|
+| Operator bearer token | Accepted, verified | Accepted, verified |
+| Token that passes | Accepted, verified | Accepted, verified (needs the secret) |
+| No token | 400 `challenge_required` | Accepted, unverified |
+| Token that siteverify rejects, or longer than 2048 characters | 400 `challenge_failed` | Accepted, unverified |
+| Siteverify unreachable, or it reports a bad secret or an internal error | 503 `challenge_unavailable` | Accepted, unverified |
+| `TURNSTILE_SECRET` not set | 503 `challenge_unavailable` | Accepted, unverified, no siteverify call |
+
+A refusal carries `success: false`, `status`, `error` and `message`, like the other
+signup answers, so the site form shows the text without a change. A refused request
+records no intent, writes no KV record and reaches Listmonk at no point.
+
+Only the exact value `on` enforces. `npm run check:config` rejects any value other
+than `on` or `off`, because a typo would leave the endpoint open.
+
+The Worker does not compare the `hostname` or `action` that siteverify returns.
+Restrict the widget to the site's hostnames in the Cloudflare dashboard instead.
+
+`verified` is true for a passed token or the operator token. It is stored on the
+coordinator intent and on the KV record. An intent that is not verified gets one
+mail at most:
+
+- The Listmonk create sends the opt-in mail. This is the one mail.
+- `optin-reminder-at` is not stored, so there is no 48-hour reminder. A reminder
+  that an earlier signup armed for the same address is deleted.
+- A repeat request for an unclicked address does not call `resendOptin`. The caller
+  still gets `confirmation_required`, so the answer tells an attacker nothing.
+
+A reminder that a verified signup armed still fires after a later unverified
+request for the same address.
+
+### Rollout
+
+Each step that changes production needs the owner's approval.
+
+1. Create a Turnstile widget in the Cloudflare dashboard, in Managed mode. Allow
+   the hostnames that serve the form: `philippdubach.com`, `www.philippdubach.com`
+   and any other origin in `ALLOWED_ORIGIN` that shows it. Note the sitekey, which
+   is public, and the secret key.
+2. Store the secret. Run this from `workers/newsletter-api/`:
+
+   ```bash
+   npx wrangler secret put TURNSTILE_SECRET --env production
+   ```
+
+3. Deploy this code with `TURNSTILE = "off"`, as committed:
+
+   ```bash
+   npm run deploy:production
+   ```
+
+   From this deploy on, the report endpoint works and new records carry the ASN.
+   Also from this deploy on, a signup without a token is unverified. Until the site
+   sends tokens, that is every signup, so no reader gets the 48-hour reminder or a
+   resend. Keep the time between this step and the next one short.
+4. Ship the site change below. Then sign up through the form with an address you
+   own that has no KV record yet, because the first record is kept. Its record
+   must show `"verified":true`:
+
+   ```bash
+   npx wrangler kv key get "<address>" --binding NEWSLETTER_SUBSCRIBERS --remote --env production
+   ```
+5. Set `TURNSTILE = "on"` in `[env.production.vars]` of `wrangler.toml` and deploy
+   again. A request without a token now gets 400.
+6. Start the hourly poll of `/api/signup-stats`. See `README.md`.
+
+To go back, set `TURNSTILE = "off"` and deploy. The secret can stay.
+
+### The site form change
+
+The form is in the site repository, `philippdubach.github.io`. It posts to
+`/api/subscribe` from `assets/js/site.js`. Four files change.
+
+1. `hugo.toml`, under `[params.newsletter]`: add the public sitekey.
+
+   ```toml
+   turnstile_sitekey = '<sitekey from the dashboard>'
+   ```
+
+2. `layouts/partials/newsletter-form.html`: give the production form the sitekey
+   and a container for the widget. Put the container before the message paragraph.
+
+   ```html
+   <form ... data-newsletter-endpoint="..." data-turnstile-sitekey="{{ site.Params.newsletter.turnstile_sitekey }}" ...>
+     ...
+     <div data-newsletter-challenge></div>
+     <p class="newsletter-preview__message" data-newsletter-message role="status" aria-live="polite"></p>
+   </form>
+   ```
+
+   The preview form stays inert and gets no widget.
+
+3. `assets/js/site.js`, in the `[data-newsletter-endpoint]` loop: load the Turnstile
+   script on the first focus of the email field, render one widget for each form,
+   and send its token with the address. The Worker's contract is only the field
+   name `cf-turnstile-response`; the code below is one way to meet it.
+
+   ```js
+   // One script load for the page. Cloudflare requires this exact URL: do not bundle or proxy it.
+   let turnstileScript;
+   const loadTurnstile = () => turnstileScript ??= new Promise((resolve, reject) => {
+     const script = document.createElement("script");
+     script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+     script.async = true;
+     script.onload = () => resolve(window.turnstile);
+     script.onerror = reject;
+     document.head.append(script);
+   });
+
+   // For each form:
+   const challenge = form.querySelector("[data-newsletter-challenge]");
+   let widgetId;
+   const showChallenge = () => loadTurnstile().then((turnstile) => {
+     widgetId ??= turnstile.render(challenge, {
+       sitekey: form.dataset.turnstileSitekey,
+       appearance: "interaction-only",
+       size: "flexible",
+     });
+   });
+   input.addEventListener("focus", () => showChallenge().catch(() => {}), { once: true });
+   ```
+
+   In the submit handler, after the address check and before the `fetch`:
+
+   ```js
+   const token = widgetId === undefined ? "" : window.turnstile.getResponse(widgetId);
+   if (!token) {
+     showChallenge().catch(() => {});
+     message.textContent = "Checking your browser. Please press Subscribe again in a moment.";
+     return;
+   }
+   ```
+
+   Change the request body:
+
+   ```js
+   body: JSON.stringify({ email: input.value.trim(), "cf-turnstile-response": token }),
+   ```
+
+   A token works once and for 300 seconds. So in the `else` branch and in `.catch`,
+   where the button is enabled again, ask for a new one:
+
+   ```js
+   if (widgetId !== undefined) window.turnstile.reset(widgetId);
+   ```
+
+   The Worker's answers need no other change. `challenge_required`,
+   `challenge_failed` and `challenge_unavailable` arrive with `status` and
+   `message`, which the handler already displays.
+
+4. The Content Security Policy, in both places that set it:
+   `layouts/partials/head.html` (the `<meta>` tag) and
+   `workers/security-headers/src/index.js`.
+
+   - Add `https://challenges.cloudflare.com` to `script-src`.
+   - Add the directive `frame-src https://challenges.cloudflare.com;`. The policy
+     has no `frame-src` now, so `default-src 'self'` blocks the widget's iframe.
+   - `connect-src` needs no change.
+
+   `workers/security-headers/test/csp.test.js` reads the policy, so run that
+   Worker's tests.
+
+Three consequences for the site owner to decide on:
+
+- The form keeps `method="post" action="..."` for readers without JavaScript.
+  Turnstile needs JavaScript, so with `TURNSTILE = "on"` that path gets a raw 400
+  answer. Remove the two attributes and add a `<noscript>` note, or accept it.
+- The form says "No tracking". The widget loads a script and an iframe from
+  `challenges.cloudflare.com`. Loading it on focus limits that to readers who start
+  a signup. Check the privacy notice.
+- `layouts/partials/structured-data.html` advertises the endpoint as a
+  `urlTemplate`. A client that follows it has no token.
+
+### Local testing
+
+Cloudflare publishes dummy keys that work on any hostname, listed at
+`developers.cloudflare.com/turnstile/troubleshooting/testing/`. Sitekey
+`1x00000000000000000000AA` with secret `1x0000000000000000000000000000000AA`
+always passes. Secret `2x0000000000000000000000000000000AA` always fails. Put the
+secret in `.dev.vars` with `TURNSTILE = "on"`. A real secret rejects a dummy token.
+
+The unit tests stub siteverify through `fetch`. The workerd suite answers it from
+the provider stand-in in `test/subscription-invariants.test.mjs`, which accepts one
+fixed token.
+
 ## Rolling this back
 
 Rolling back to a version that predates the Durable Object class is not supported
