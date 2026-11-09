@@ -1170,6 +1170,32 @@ describe('Newsletter API', () => {
       expect(alarm()).toBeNull();
     });
 
+    describe('for an address whose link is still unclicked', () => {
+      const pending = { id: 4242, email: EMAIL, status: 'enabled', lists: [{ id: 3, subscription_status: 'unconfirmed' }] };
+
+      it('resends the opt-in for a caller that passed the challenge', async () => {
+        const listmonk = stubListmonk(pending);
+
+        const result = await submit(new SubscriptionCoordinator(fakeState().state, mockEnv), true);
+
+        expect(result).toMatchObject({ outcome: 'completed', created: false, awaitingConfirmation: true });
+        expect(callsTo(listmonk, 'POST', /^\/api\/subscribers\/4242\/optin$/)).toBe(1);
+      });
+
+      it('gives an unverified caller the same answer and sends nothing', async () => {
+        const listmonk = stubListmonk(pending);
+        const { state, data } = fakeState();
+        // The resend window is open, so only the caller decides.
+        data.set('optin-resent-at', Date.now() - 25 * HOUR);
+
+        const result = await submit(new SubscriptionCoordinator(state, mockEnv), false);
+
+        expect(result).toMatchObject({ outcome: 'completed', created: false, awaitingConfirmation: true });
+        expect(callsTo(listmonk, 'POST', /optin$/)).toBe(0);
+        expect(callsTo(listmonk, 'POST', /^\/api\/subscribers$/)).toBe(0);
+      });
+    });
+
     it('drops a reminder an earlier signup armed when an unverified signup recreates the address', async () => {
       const { state, data, alarm } = fakeState();
       stubListmonk();

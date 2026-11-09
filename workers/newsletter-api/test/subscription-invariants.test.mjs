@@ -1390,11 +1390,11 @@ describe('double opt-in', () => {
       const email = 'invariant-resend@example.com';
       const store = createProviderStub();
       store.subscribers.set(email, unconfirmed(email));
-      const local = await startRuntime({ extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+      const local = await startRuntime({ extraBindings: VERIFYING_BINDINGS, outboundService: store.handler });
       try {
         const bodies = [];
         for (const ip of ['198.51.100.82', '198.51.100.83', '198.51.100.84']) {
-          bodies.push(await (await post(local, email, ip)).json());
+          bodies.push(await (await post(local, email, ip, PASSED)).json());
         }
         await local.drain();
 
@@ -1405,6 +1405,33 @@ describe('double opt-in', () => {
         await local.dispose();
       }
     });
+
+    for (const [name, fields] of [['no token', {}], ['a token that fails', { 'cf-turnstile-response': 'forged' }]]) {
+      it(`does not resend for a caller with ${name}, however old the last mail is`, async () => {
+        const email = `invariant-resend-unverified-${Object.keys(fields).length}@example.com`;
+        const store = createProviderStub();
+        store.subscribers.set(email, unconfirmed(email));
+        const local = await startRuntime({ scheduler: true, extraBindings: VERIFYING_BINDINGS, outboundService: store.handler });
+        try {
+          const stub = await local.coordinator(email);
+          await stub.fetch('https://coordinator/fixture', {
+            method: 'POST',
+            body: JSON.stringify({ seed: { 'optin-resent-at': Date.now() - 25 * HOUR } }),
+          });
+          for (const ip of ['198.51.100.94', '198.51.100.95']) {
+            const body = await (await post(local, email, ip, fields)).json();
+            // The answer is the same as for a reader, so it reveals nothing.
+            assert.equal(body.status, 'confirmation_required');
+          }
+          await local.drain();
+
+          assert.equal(resends(store).length, 0);
+          assert.equal(store.mutations().length, 0);
+        } finally {
+          await local.dispose();
+        }
+      });
+    }
 
     describe('the 48-hour reminder', () => {
       const intent = (email, desired = 'subscribed') => ({ email, desired, seq: 1, updatedAt: new Date().toISOString() });
@@ -1579,14 +1606,14 @@ describe('double opt-in', () => {
         const email = `invariant-resend-${age}h@example.com`;
         const store = createProviderStub();
         store.subscribers.set(email, unconfirmed(email));
-        const local = await startRuntime({ scheduler: true, extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+        const local = await startRuntime({ scheduler: true, extraBindings: VERIFYING_BINDINGS, outboundService: store.handler });
         try {
           const stub = await local.coordinator(email);
           await stub.fetch('https://coordinator/fixture', {
             method: 'POST',
             body: JSON.stringify({ seed: { 'optin-resent-at': Date.now() - age * HOUR } }),
           });
-          const body = await (await post(local, email, '198.51.100.85')).json();
+          const body = await (await post(local, email, '198.51.100.85', PASSED)).json();
           await local.drain();
 
           assert.equal(body.status, 'confirmation_required');
@@ -1607,14 +1634,14 @@ describe('double opt-in', () => {
         store.subscribers.set(email, unconfirmed(email));
         const base = store.handler;
         const local = await startRuntime({
-          extraBindings: OPTIN_BINDINGS,
+          extraBindings: VERIFYING_BINDINGS,
           outboundService: async (request) => {
             const response = await base(request);
             return new URL(request.url).pathname.endsWith('/optin') ? fail() : response;
           },
         });
         try {
-          const response = await post(local, email, '198.51.100.86');
+          const response = await post(local, email, '198.51.100.86', PASSED);
           const body = await response.json();
           await local.drain();
 
@@ -1635,9 +1662,9 @@ describe('double opt-in', () => {
       const email = 'invariant-resend-no-id@example.com';
       const store = createProviderStub();
       store.subscribers.set(email, unconfirmed(email, '../../admin'));
-      const local = await startRuntime({ extraBindings: OPTIN_BINDINGS, outboundService: store.handler });
+      const local = await startRuntime({ extraBindings: VERIFYING_BINDINGS, outboundService: store.handler });
       try {
-        const body = await (await post(local, email, '198.51.100.87')).json();
+        const body = await (await post(local, email, '198.51.100.87', PASSED)).json();
         await local.drain();
 
         assert.equal(body.status, 'confirmation_required');
@@ -1651,9 +1678,9 @@ describe('double opt-in', () => {
       const email = 'invariant-resend-single@example.com';
       const store = createProviderStub();
       store.subscribers.set(email, unconfirmed(email));
-      const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
+      const local = await startRuntime({ extraBindings: { ...PROVIDER_BINDINGS, ...CHALLENGE_BINDINGS }, outboundService: store.handler });
       try {
-        await (await post(local, email, '198.51.100.88')).json();
+        await (await post(local, email, '198.51.100.88', PASSED)).json();
         await local.drain();
         assert.equal(resends(store).length, 0);
       } finally {

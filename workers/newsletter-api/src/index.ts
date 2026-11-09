@@ -1793,7 +1793,9 @@ export class SubscriptionCoordinator {
       // The reader is told to check their inbox, so make that true: a create here
       // would be refused, and the original mail may be long gone.
       if (isDoubleOptIn(this.env)) {
-        await this.resendOptin(intent, id, deadline);
+        // Only for a verified caller: otherwise repeating the request would mail
+        // the address again every time the resend window reopens.
+        if (intent.verified === true) await this.resendOptin(intent, id, deadline);
         return { outcome: 'completed', created: false, awaitingConfirmation: true };
       }
       return { outcome: 'unverified', reason, retryable: false };
