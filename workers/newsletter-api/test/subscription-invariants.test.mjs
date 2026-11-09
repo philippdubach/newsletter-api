@@ -1852,10 +1852,10 @@ describe('the KV shadow record', () => {
     const email = 'invariant-first-record@example.com';
     const store = createProviderStub();
     const local = await startRuntime({ extraBindings: PROVIDER_BINDINGS, outboundService: store.handler });
-    const signup = async (ip, agent, cf) => {
+    const signup = async (ip, agent, cf, headers = {}) => {
       const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip, 'User-Agent': agent },
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip, 'User-Agent': agent, ...headers },
         body: JSON.stringify({ email }),
         cf,
       });
@@ -1863,16 +1863,18 @@ describe('the KV shadow record', () => {
       await local.drain();
     };
     try {
-      await signup('198.51.100.60', 'first-client', { asn: 64500, asOrganization: 'First Network' });
+      await signup('198.51.100.60', 'first-client', { asn: 64500, asOrganization: 'First Network', httpProtocol: 'HTTP/1.1' });
       const kv = await local.runtime.getKVNamespace('NEWSLETTER_SUBSCRIBERS');
       const first = await kv.get(email);
       const { timestamp, seq, ...evidence } = JSON.parse(first);
       assert.deepEqual(evidence, {
-        ip: '198.51.100.60', userAgent: 'first-client', asn: 64500, asOrganization: 'First Network', verified: false,
+        ip: '198.51.100.60', userAgent: 'first-client', asn: 64500, asOrganization: 'First Network',
+        secChUa: false, httpProtocol: 'HTTP/1.1', verified: false,
       });
       assert.ok(Math.abs(Date.parse(timestamp) - Date.now()) < 5000);
 
-      await signup('198.51.100.61', 'second-client', { asn: 64501, asOrganization: 'Second Network' });
+      await signup('198.51.100.61', 'second-client', { asn: 64501, asOrganization: 'Second Network', httpProtocol: 'HTTP/2' },
+        { 'Sec-CH-UA': '"Chromium";v="124"' });
       assert.equal(await kv.get(email), first, 'a repeat signup must not rewrite the consent record');
     } finally {
       await local.dispose();

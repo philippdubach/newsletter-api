@@ -1024,12 +1024,15 @@ describe('Newsletter API', () => {
     });
   });
 
-  describe('Network evidence on the signup record', () => {
+  describe('Request evidence on the signup record', () => {
     // Node's Request has no `cf`; the edge attaches it.
-    function signupFrom(cf: unknown): Request {
+    function signupFrom(cf: unknown, headers: Record<string, string> = {}): Request {
       const request = new Request('https://api.example.com/api/subscribe', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.8', 'User-Agent': 'evidence-agent' },
+        headers: {
+          'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.8', 'User-Agent': 'evidence-agent',
+          ...headers,
+        },
         body: JSON.stringify({ email: 'evidence@example.com' }),
       });
       if (cf !== undefined) Object.defineProperty(request, 'cf', { value: cf });
@@ -1054,6 +1057,23 @@ describe('Newsletter API', () => {
       });
     });
 
+    it('keeps refusing a listed IP before the challenge is consulted', async () => {
+      (mockEnv as Env).BLOCKED_IPS = '203.0.113.8, 203.0.113.99';
+      (mockEnv as Env).TURNSTILE = 'on';
+      (mockEnv as Env).TURNSTILE_SECRET = 'test-turnstile-secret';
+      const request = new Request('https://api.example.com/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.8' },
+        body: JSON.stringify({ email: 'evidence@example.com', 'cf-turnstile-response': 'good-token' }),
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+
+      // The afterEach hook fails the test if siteverify or any other host was called.
+      expect(response.status).toBe(429);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.put).not.toHaveBeenCalled();
+    });
+
     it('passes the same evidence to the coordinator', async () => {
       const intent = vi.fn(async (_url: string, _init: RequestInit) =>
         new Response(JSON.stringify({ outcome: 'completed', created: true }), { status: 200 }));
@@ -1062,10 +1082,11 @@ describe('Newsletter API', () => {
         get: () => ({ fetch: intent }),
       } as unknown as DurableObjectNamespace;
 
-      await worker.fetch(signupFrom({ asn: 19318, asOrganization: 'Example Transit' }), mockEnv, mockCtx);
+      await worker.fetch(signupFrom({ asn: 19318, asOrganization: 'Example Transit', httpProtocol: 'HTTP/3' }), mockEnv, mockCtx);
 
       expect(JSON.parse(String((intent.mock.calls[0][1] as RequestInit).body))).toMatchObject({
         ip: '203.0.113.8', userAgent: 'evidence-agent', asn: 19318, asOrganization: 'Example Transit',
+        secChUa: false, httpProtocol: 'HTTP/3',
       });
     });
 
@@ -1086,6 +1107,88 @@ describe('Newsletter API', () => {
       await worker.fetch(signupFrom({ asn: 64500, asOrganization: 'x'.repeat(500) }), mockEnv, mockCtx);
 
       expect((storedRecord().asOrganization as string).length).toBe(200);
+    });
+
+    it('stores that a client hint came with the request, and the protocol', async () => {
+      const chrome = { 'Sec-CH-UA': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"' };
+
+      await worker.fetch(signupFrom({ httpProtocol: 'HTTP/2' }, chrome), mockEnv, mockCtx);
+
+      // Presence only: the header's value adds nothing the user agent lacks.
+      expect(storedRecord()).toMatchObject({ secChUa: true, httpProtocol: 'HTTP/2' });
+      expect(JSON.stringify(storedRecord())).not.toContain('Chromium');
+    });
+
+    it('stores that no client hint came, and leaves out a protocol it was not given', async () => {
+      await worker.fetch(signupFrom(undefined), mockEnv, mockCtx);
+
+      const record = storedRecord();
+      expect(record.secChUa).toBe(false);
+      expect('httpProtocol' in record).toBe(false);
+    });
+
+    it.each([
+      ['a protocol of the wrong type', { httpProtocol: 2 }, undefined],
+      ['an overlong protocol', { httpProtocol: 'HTTP/'.padEnd(80, '9') }, 'HTTP/'.padEnd(20, '9')],
+    ])('handles %s', async (_name, cf, expected) => {
+      await worker.fetch(signupFrom(cf), mockEnv, mockCtx);
+
+      expect(storedRecord().httpProtocol).toBe(expected);
+    });
+
+    describe('for a request shaped like the November 2026 bot', () => {
+      // Seen in the production tail on 2026-11-09: a spoofed Origin and Referer, a
+      // form body, a Chrome 124 user agent without client hints, over HTTP/1.1.
+      const BOT_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+      function botRequest(fields = ''): Request {
+        const request = new Request('https://api.example.com/api/subscribe', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Origin: 'https://philippdubach.com',
+            Referer: 'https://philippdubach.com/subscribe/',
+            'Accept-Language': 'ru,en;q=0.8',
+            'User-Agent': BOT_AGENT,
+            'CF-Connecting-IP': '203.0.113.8',
+          },
+          body: `email=evidence%40example.com${fields}`,
+        });
+        Object.defineProperty(request, 'cf', { value: { asn: 56971, asOrganization: 'Example Hosting Ltd', httpProtocol: 'HTTP/1.1' } });
+        return request;
+      }
+
+      it('records the evidence while the challenge is off', async () => {
+        const response = await worker.fetch(botRequest(), mockEnv, mockCtx);
+
+        expect(response.status).toBe(200);
+        expect(storedRecord()).toMatchObject({
+          ip: '203.0.113.8', userAgent: BOT_AGENT, asn: 56971, asOrganization: 'Example Hosting Ltd',
+          secChUa: false, httpProtocol: 'HTTP/1.1', verified: false,
+        });
+      });
+
+      it('is refused by the challenge, whatever its Origin says', async () => {
+        (mockEnv as Env).ALLOWED_ORIGIN = 'https://philippdubach.com';
+        (mockEnv as Env).TURNSTILE = 'on';
+        (mockEnv as Env).TURNSTILE_SECRET = 'test-turnstile-secret';
+
+        const response = await worker.fetch(botRequest(), mockEnv, mockCtx);
+
+        expect(response.status).toBe(400);
+        expect((await response.json() as { status: string }).status).toBe('challenge_required');
+        expect(mockEnv.NEWSLETTER_SUBSCRIBERS.put).not.toHaveBeenCalledWith('evidence@example.com', expect.anything());
+      });
+
+      it('is accepted with a passed challenge: the evidence never refuses a request', async () => {
+        (mockEnv as Env).TURNSTILE = 'on';
+        (mockEnv as Env).TURNSTILE_SECRET = 'test-turnstile-secret';
+        global.fetch = vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 })) as unknown as typeof fetch;
+
+        const response = await worker.fetch(botRequest('&cf-turnstile-response=good-token'), mockEnv, mockCtx);
+
+        expect(response.status).toBe(200);
+        expect(storedRecord()).toMatchObject({ secChUa: false, httpProtocol: 'HTTP/1.1', verified: true });
+      });
     });
   });
 

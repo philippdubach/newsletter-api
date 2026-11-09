@@ -314,23 +314,37 @@ function getClientIP(request: Request): string {
   return 'unknown';
 }
 
-/** The network a request came from, as Cloudflare reports it. Absent off the edge. */
-interface NetworkEvidence {
+/**
+ * What a request shows about its client, beyond the IP and the user agent.
+ *
+ * This is evidence for the signup report and for cleanup. It must never decide
+ * whether a request is accepted: readers come through VPNs and relays, and a
+ * header or a protocol version proves nothing about one request.
+ */
+interface RequestEvidence {
+  /** The network, as Cloudflare reports it. Absent off the edge. */
   asn?: number;
   asOrganization?: string;
+  /** Whether a `Sec-CH-UA` header came with the request. Chromium browsers send one. */
+  secChUa?: boolean;
+  /** `request.cf.httpProtocol`, such as "HTTP/1.1" or "HTTP/2". */
+  httpProtocol?: string;
 }
 
-function networkEvidence(request: Request): NetworkEvidence {
+function requestEvidence(request: Request): RequestEvidence {
   const cf = (request as Request<unknown, IncomingRequestCfProperties>).cf;
-  const evidence: NetworkEvidence = {};
+  const evidence: RequestEvidence = { secChUa: request.headers.has('Sec-CH-UA') };
   if (typeof cf?.asn === 'number' && Number.isSafeInteger(cf.asn)) evidence.asn = cf.asn;
   if (typeof cf?.asOrganization === 'string' && cf.asOrganization) {
     evidence.asOrganization = cf.asOrganization.slice(0, 200);
   }
+  if (typeof cf?.httpProtocol === 'string' && cf.httpProtocol) {
+    evidence.httpProtocol = cf.httpProtocol.slice(0, 20);
+  }
   return evidence;
 }
 
-interface SubscriptionRecord extends NetworkEvidence {
+interface SubscriptionRecord extends RequestEvidence {
   timestamp: string;
   ip: string;
   userAgent: string;
@@ -352,6 +366,8 @@ function parseRecord(raw: string | null): SubscriptionRecord | null {
       userAgent: typeof parsed.userAgent === 'string' ? parsed.userAgent : 'unknown',
       ...(typeof parsed.asn === 'number' ? { asn: parsed.asn } : {}),
       ...(typeof parsed.asOrganization === 'string' ? { asOrganization: parsed.asOrganization } : {}),
+      ...(typeof parsed.secChUa === 'boolean' ? { secChUa: parsed.secChUa } : {}),
+      ...(typeof parsed.httpProtocol === 'string' ? { httpProtocol: parsed.httpProtocol } : {}),
       ...(typeof parsed.verified === 'boolean' ? { verified: parsed.verified } : {}),
       seq: typeof parsed.seq === 'number' ? parsed.seq : 0,
     };
@@ -993,7 +1009,7 @@ async function submitIntent(
         email,
         ip: clientIP,
         userAgent: request.headers.get('User-Agent') || 'unknown',
-        ...networkEvidence(request),
+        ...requestEvidence(request),
         authenticated,
         verified,
       }),
@@ -1136,7 +1152,7 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       timestamp: new Date().toISOString(),
       ip: clientIP,
       userAgent: request.headers.get('User-Agent') || 'unknown',
-      ...networkEvidence(request),
+      ...requestEvidence(request),
       verified: challenge.verified,
       seq: Date.now(),
     };
@@ -1607,7 +1623,7 @@ function retryDelayMs(attempts: number): number {
   return Math.min(60_000 * Math.pow(4, Math.max(0, attempts - 1)), 60 * 60_000);
 }
 
-interface CoordinatorIntent {
+interface CoordinatorIntent extends RequestEvidence {
   email: string;
   desired: 'subscribed' | 'unsubscribed';
   seq: number;
@@ -1615,8 +1631,6 @@ interface CoordinatorIntent {
   /** Caller metadata, kept here so a retry can repair the shadow correctly. */
   ip?: string;
   userAgent?: string;
-  asn?: number;
-  asOrganization?: string;
   /** Whether the caller proved control of the address. */
   authenticated?: boolean;
   /** Whether a signup passed the challenge or carried the operator token. */
@@ -1624,7 +1638,7 @@ interface CoordinatorIntent {
 }
 
 type IntentInput = Pick<CoordinatorIntent,
-  'desired' | 'email' | 'ip' | 'userAgent' | 'asn' | 'asOrganization' | 'authenticated' | 'verified'>;
+  'desired' | 'email' | 'ip' | 'userAgent' | keyof RequestEvidence | 'authenticated' | 'verified'>;
 
 interface CoordinatorPending {
   kind: 'create' | 'remove' | 'shadow';
@@ -1770,6 +1784,8 @@ export class SubscriptionCoordinator {
       userAgent: input.userAgent,
       asn: input.asn,
       asOrganization: input.asOrganization,
+      secChUa: input.secChUa,
+      httpProtocol: input.httpProtocol,
       authenticated: input.authenticated,
       verified: input.verified,
     };
@@ -1881,6 +1897,8 @@ export class SubscriptionCoordinator {
           userAgent: intent.userAgent ?? 'unknown',
           asn: intent.asn,
           asOrganization: intent.asOrganization,
+          secChUa: intent.secChUa,
+          httpProtocol: intent.httpProtocol,
           verified: intent.verified === true,
           seq: Date.now(),
         }));
