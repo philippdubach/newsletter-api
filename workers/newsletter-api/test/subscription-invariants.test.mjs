@@ -35,9 +35,19 @@ const PROVIDER_BINDINGS = {
   LISTMONK_WELCOME_TEMPLATE_ID: '5',
 };
 
-// The one token the siteverify stand-in accepts.
+// The one token the siteverify stand-in answers as issued by the site's widget.
 const PASSING_TOKEN = 'runtime-suite-passing-token';
-const CHALLENGE_BINDINGS = { TURNSTILE_SECRET: 'runtime-suite-turnstile-secret' };
+const CHALLENGE_HOSTNAME = 'site.runtime-suite.invalid';
+const CHALLENGE_BINDINGS = {
+  TURNSTILE_SECRET: 'runtime-suite-turnstile-secret',
+  TURNSTILE_HOSTNAMES: CHALLENGE_HOSTNAME,
+};
+// Tokens siteverify accepts, but that were not issued for this form.
+const FOREIGN_TOKENS = {
+  'runtime-suite-other-action': { action: 'login', hostname: CHALLENGE_HOSTNAME },
+  'runtime-suite-no-action': { hostname: CHALLENGE_HOSTNAME },
+  'runtime-suite-other-hostname': { action: 'signup', hostname: 'elsewhere.runtime-suite.invalid' },
+};
 
 /**
  * Minimal Listmonk stand-in. Subscriber state is a map the test controls, so a
@@ -80,8 +90,10 @@ function createProviderStub() {
 
     // Turnstile's siteverify shares the egress, so it is answered here too.
     if (url.hostname === 'challenges.cloudflare.com') {
-      const passed = JSON.parse(body ?? '{}').response === PASSING_TOKEN;
-      return json({ success: passed, 'error-codes': passed ? [] : ['invalid-input-response'] });
+      const token = JSON.parse(body ?? '{}').response;
+      if (token === PASSING_TOKEN) return json({ success: true, action: 'signup', hostname: CHALLENGE_HOSTNAME, 'error-codes': [] });
+      if (token in FOREIGN_TOKENS) return json({ success: true, ...FOREIGN_TOKENS[token], 'error-codes': [] });
+      return json({ success: false, 'error-codes': ['invalid-input-response'] });
     }
     if (url.pathname === '/api/subscribers' && method === 'GET') {
       if (rawLookup) return rawLookup(request);
@@ -1913,9 +1925,11 @@ describe('the signup challenge', () => {
   for (const [name, fields, status, calls] of [
     ['no token', {}, 'challenge_required', 0],
     ['a token siteverify rejects', { 'cf-turnstile-response': 'forged' }, 'challenge_failed', 1],
+    ...Object.keys(FOREIGN_TOKENS).map((token) =>
+      [`a valid token for ${token.replace('runtime-suite-', '').replace('-', ' ')}`, { 'cf-turnstile-response': token }, 'challenge_failed', 1]),
   ]) {
     it(`refuses ${name} and leaves no trace of the address`, async () => {
-      const email = `invariant-challenge-${calls}@example.com`;
+      const email = `invariant-challenge-${name.replace(/[^a-z]+/g, '-')}@example.com`;
       await withChallenge(async ({ store, local, post }) => {
         const answer = await post(email, fields);
 
@@ -1956,6 +1970,60 @@ describe('the signup challenge', () => {
       assert.equal(JSON.parse(await local.kv.get(email)).verified, true);
     });
   });
+
+  it('refuses every signup with a 503 when the hostname list is missing', async () => {
+    const email = 'invariant-challenge-no-hostnames@example.com';
+    const store = createProviderStub();
+    const { TURNSTILE_HOSTNAMES, ...withoutHostnames } = ENFORCED;
+    const local = await startRuntime({ extraBindings: withoutHostnames, outboundService: store.handler });
+    try {
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': nextIP() },
+        body: JSON.stringify({ email, 'cf-turnstile-response': PASSING_TOKEN }),
+      });
+      const body = await response.json();
+      await local.drain();
+
+      assert.equal(response.status, 503);
+      assert.equal(body.status, 'challenge_unavailable');
+      assert.equal(store.calls.length, 0, 'the token is not spent and the provider is not reached');
+      assert.equal(await local.kv.get(email), null);
+    } finally {
+      await local.dispose();
+    }
+  });
+
+  for (const token of Object.keys(FOREIGN_TOKENS)) {
+    it(`accepts ${token} as an unverified signup while enforcement is off`, async () => {
+      const email = `invariant-challenge-dark-${token}@example.com`;
+      const store = createProviderStub();
+      const local = await startRuntime({
+        scheduler: true,
+        extraBindings: { ...PROVIDER_BINDINGS, ...CHALLENGE_BINDINGS, DOUBLE_OPTIN: 'on', TURNSTILE: 'off' },
+        outboundService: store.handler,
+      });
+      try {
+        const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': nextIP() },
+          body: JSON.stringify({ email, 'cf-turnstile-response': token }),
+        });
+        const body = await response.json();
+        await local.drain();
+
+        assert.equal(response.status, 200);
+        assert.equal(body.status, 'confirmation_required');
+        assert.equal(siteverifies(store).length, 1);
+        assert.equal(JSON.parse(await local.kv.get(email)).verified, false);
+        // Unverified, so the one-mail rule applies: no reminder is armed.
+        const state = await (await (await local.coordinator(email)).fetch('https://coordinator/state')).json();
+        assert.equal(state.reminder, null);
+      } finally {
+        await local.dispose();
+      }
+    });
+  }
 
   it('records a signup as unverified while enforcement is off', async () => {
     const email = 'invariant-challenge-dark@example.com';

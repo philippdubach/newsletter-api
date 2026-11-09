@@ -779,6 +779,8 @@ describe('Newsletter API', () => {
 
   describe('Turnstile challenge on /api/subscribe', () => {
     const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+    // What siteverify says about a token the site's own widget issued.
+    const PASSED = { success: true, action: 'signup', hostname: 'philippdubach.com', 'error-codes': [] };
     type Answer = { success: boolean; status?: string; error?: string; message?: string };
 
     // Stands in for the Durable Object, so a test can see whether an intent was
@@ -814,6 +816,83 @@ describe('Newsletter API', () => {
     beforeEach(() => {
       (mockEnv as Env).TURNSTILE = 'on';
       (mockEnv as Env).TURNSTILE_SECRET = 'test-turnstile-secret';
+      (mockEnv as Env).TURNSTILE_HOSTNAMES = 'philippdubach.com';
+    });
+
+    describe('the action and hostname of a token siteverify accepts', () => {
+      const send = () => worker.fetch(signup({ 'cf-turnstile-response': 'token' }), mockEnv, mockCtx);
+
+      it.each([
+        ['another action', { ...PASSED, action: 'login' }],
+        ['no action, as a page cached before the release sends', { success: true, hostname: 'philippdubach.com' }],
+        ['an empty action', { ...PASSED, action: '' }],
+        ['an action that differs in case', { ...PASSED, action: 'Signup' }],
+        ['an action of the wrong type', { ...PASSED, action: ['signup'] }],
+        ['another hostname', { ...PASSED, hostname: 'evil.example' }],
+        ['a subdomain that is not listed', { ...PASSED, hostname: 'www.philippdubach.com' }],
+        ['a hostname that only ends like a listed one', { ...PASSED, hostname: 'notphilippdubach.com' }],
+        ['the dummy-key hostname', { success: true, hostname: 'example.com' }],
+        ['no hostname', { success: true, action: 'signup' }],
+        ['a hostname of the wrong type', { ...PASSED, hostname: 42 }],
+        ['a local hostname', { ...PASSED, hostname: 'localhost' }],
+      ])('refuses a token for %s', async (_name, answer) => {
+        const intent = bindCoordinator();
+        stubSiteverify(answer);
+        const logged = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const response = await send();
+
+        expect(response.status).toBe(400);
+        expect((await response.json() as Answer).status).toBe('challenge_failed');
+        expect(intent).not.toHaveBeenCalled();
+        expect(logged).toHaveBeenCalledTimes(1);
+        logged.mockRestore();
+      });
+
+      it.each([
+        ['one of several listed hostnames', 'philippdubach.com, www.philippdubach.com', 'www.philippdubach.com'],
+        ['a list with spaces, capitals and empty entries', ' ,PhilippDubach.com , ', 'philippdubach.com'],
+        ['a hostname reported in capitals', 'philippdubach.com', 'PHILIPPDUBACH.COM'],
+      ])('accepts a token for %s', async (_name, list, hostname) => {
+        const intent = bindCoordinator();
+        (mockEnv as Env).TURNSTILE_HOSTNAMES = list;
+        stubSiteverify({ ...PASSED, hostname });
+
+        const response = await send();
+
+        expect(response.status).toBe(200);
+        expect(intentBody(intent).verified).toBe(true);
+      });
+
+      it.each([
+        ['missing', undefined],
+        ['empty', ''],
+        ['only separators', ' , ,'],
+      ])('fails closed without calling siteverify when the hostname list is %s', async (_name, list) => {
+        const intent = bindCoordinator();
+        if (list === undefined) delete (mockEnv as Env).TURNSTILE_HOSTNAMES;
+        else (mockEnv as Env).TURNSTILE_HOSTNAMES = list;
+        const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        const response = await send();
+
+        // The afterEach hook fails the test if siteverify was called.
+        expect(response.status).toBe(503);
+        expect((await response.json() as Answer).status).toBe('challenge_unavailable');
+        expect(intent).not.toHaveBeenCalled();
+        expect(logged).toHaveBeenCalledWith('TURNSTILE is on but TURNSTILE_HOSTNAMES is empty');
+        logged.mockRestore();
+      });
+
+      it('still lets the operator token through without a hostname list', async () => {
+        const intent = bindCoordinator();
+        delete (mockEnv as Env).TURNSTILE_HOSTNAMES;
+
+        const response = await worker.fetch(signup({}, { Authorization: 'Bearer test_token' }), mockEnv, mockCtx);
+
+        expect(response.status).toBe(200);
+        expect(intentBody(intent)).toMatchObject({ authenticated: true, verified: true });
+      });
     });
 
     it('refuses a signup without a token before any intent or outbound call', async () => {
@@ -844,7 +923,7 @@ describe('Newsletter API', () => {
 
     it('sends the secret, the token and the caller address to siteverify, then submits a verified intent', async () => {
       const intent = bindCoordinator();
-      const siteverify = stubSiteverify({ success: true });
+      const siteverify = stubSiteverify(PASSED);
 
       const response = await worker.fetch(signup({ 'cf-turnstile-response': ' good-token ' }), mockEnv, mockCtx);
 
@@ -861,7 +940,7 @@ describe('Newsletter API', () => {
 
     it('accepts the widget field from a URL-encoded form', async () => {
       const intent = bindCoordinator();
-      const siteverify = stubSiteverify({ success: true });
+      const siteverify = stubSiteverify(PASSED);
       const request = new Request('https://api.example.com/api/subscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -877,7 +956,7 @@ describe('Newsletter API', () => {
 
     it('accepts a token of the maximum length and refuses a longer one unasked', async () => {
       const intent = bindCoordinator();
-      const siteverify = stubSiteverify({ success: true });
+      const siteverify = stubSiteverify(PASSED);
 
       const longest = await worker.fetch(signup({ 'cf-turnstile-response': 'x'.repeat(2048) }), mockEnv, mockCtx);
       expect(longest.status).toBe(200);
@@ -968,7 +1047,7 @@ describe('Newsletter API', () => {
 
       it('marks a signup verified when its token passes', async () => {
         const intent = bindCoordinator();
-        stubSiteverify({ success: true });
+        stubSiteverify(PASSED);
 
         await worker.fetch(signup({ 'cf-turnstile-response': 'good-token' }), mockEnv, mockCtx);
 
@@ -988,6 +1067,33 @@ describe('Newsletter API', () => {
         expect(response.status).toBe(200);
         expect(intentBody(intent).verified).toBe(false);
         logged.mockRestore();
+      });
+
+      it.each([
+        ['another action', { ...PASSED, action: 'login' }],
+        ['no action', { success: true, hostname: 'philippdubach.com' }],
+        ['another hostname', { ...PASSED, hostname: 'evil.example' }],
+      ])('accepts a signup whose token is for %s, as unverified', async (_name, answer) => {
+        const intent = bindCoordinator();
+        stubSiteverify(answer);
+        const logged = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const response = await worker.fetch(signup({ 'cf-turnstile-response': 'token' }), mockEnv, mockCtx);
+
+        expect(response.status).toBe(200);
+        expect(intentBody(intent).verified).toBe(false);
+        logged.mockRestore();
+      });
+
+      it('does not call siteverify without a hostname list', async () => {
+        const intent = bindCoordinator();
+        delete (mockEnv as Env).TURNSTILE_HOSTNAMES;
+
+        const response = await worker.fetch(signup({ 'cf-turnstile-response': 'token' }), mockEnv, mockCtx);
+
+        // The afterEach hook fails the test if siteverify was called.
+        expect(response.status).toBe(200);
+        expect(intentBody(intent).verified).toBe(false);
       });
 
       it('does not call siteverify without a secret', async () => {
@@ -1014,7 +1120,7 @@ describe('Newsletter API', () => {
     it('stores the verdict on the record of a signup without a coordinator', async () => {
       mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(null);
       mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
-      stubSiteverify({ success: true });
+      stubSiteverify(PASSED);
 
       const response = await worker.fetch(signup({ 'cf-turnstile-response': 'good-token' }), mockEnv, mockCtx);
 
@@ -1171,6 +1277,7 @@ describe('Newsletter API', () => {
         (mockEnv as Env).ALLOWED_ORIGIN = 'https://philippdubach.com';
         (mockEnv as Env).TURNSTILE = 'on';
         (mockEnv as Env).TURNSTILE_SECRET = 'test-turnstile-secret';
+        (mockEnv as Env).TURNSTILE_HOSTNAMES = 'philippdubach.com';
 
         const response = await worker.fetch(botRequest(), mockEnv, mockCtx);
 
@@ -1182,7 +1289,10 @@ describe('Newsletter API', () => {
       it('is accepted with a passed challenge: the evidence never refuses a request', async () => {
         (mockEnv as Env).TURNSTILE = 'on';
         (mockEnv as Env).TURNSTILE_SECRET = 'test-turnstile-secret';
-        global.fetch = vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 })) as unknown as typeof fetch;
+        (mockEnv as Env).TURNSTILE_HOSTNAMES = 'philippdubach.com';
+        global.fetch = vi.fn(async () => new Response(
+          JSON.stringify({ success: true, action: 'signup', hostname: 'philippdubach.com' }), { status: 200 },
+        )) as unknown as typeof fetch;
 
         const response = await worker.fetch(botRequest('&cf-turnstile-response=good-token'), mockEnv, mockCtx);
 

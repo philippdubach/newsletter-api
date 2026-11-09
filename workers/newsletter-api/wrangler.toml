@@ -72,6 +72,10 @@ DOUBLE_OPTIN = "on"
 # TURNSTILE_SECRET secret and ship the site's widget before turning it on.
 # While "off", a token the form sends is still verified and recorded.
 TURNSTILE = "off"
+# Hostnames whose widget may issue a signup token, separated by commas. The
+# Worker compares them with the hostname siteverify reports. Never add localhost
+# or 127.0.0.1 here. Empty with TURNSTILE = "on" refuses every signup.
+TURNSTILE_HOSTNAMES = "philippdubach.com"
 # Overall budget for one provider phase, well under the 30-second Durable Object
 # reset threshold that applies while blockConcurrencyWhile is held.
 PROVIDER_BUDGET_MS = "20000"

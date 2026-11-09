@@ -257,8 +257,40 @@ test('a misspelt signup challenge switch is rejected', () => {
 
 test('the signup challenge switch accepts on and off', () => {
   for (const value of ['on', 'off']) {
-    assert.deepEqual(check(SAFE.replace(/COORDINATOR_MODE = "on"/g, `COORDINATOR_MODE = "on"\nTURNSTILE = "${value}"`)), []);
+    assert.deepEqual(check(SAFE.replace(/COORDINATOR_MODE = "on"/g,
+      `COORDINATOR_MODE = "on"\nTURNSTILE = "${value}"\nTURNSTILE_HOSTNAMES = "example.com"`)), []);
   }
+});
+
+const withProdVars = (lines) => SAFE.replace(/(ENVIRONMENT = "production"\n)/, `$1${lines}\n`);
+
+test('the fixture edit for production vars lands in production only', () => {
+  const edited = withProdVars('TURNSTILE = "on"');
+  assert.equal(edited.match(/TURNSTILE = "on"/g).length, 1);
+  assert.ok(edited.indexOf('TURNSTILE = "on"') > edited.indexOf('[env.production.vars]'));
+});
+
+test('the signup challenge cannot be on without a hostname list', () => {
+  has(check(withProdVars('TURNSTILE = "on"')), /production sets TURNSTILE = "on" without TURNSTILE_HOSTNAMES/);
+  has(check(withProdVars('TURNSTILE = "on"\nTURNSTILE_HOSTNAMES = " , "')), /without TURNSTILE_HOSTNAMES/);
+});
+
+test('the signup challenge is accepted with a hostname list, on or off', () => {
+  for (const value of ['on', 'off']) {
+    assert.deepEqual(check(withProdVars(`TURNSTILE = "${value}"\nTURNSTILE_HOSTNAMES = "philippdubach.com, www.philippdubach.com"`)), []);
+  }
+  assert.deepEqual(check(withProdVars('TURNSTILE = "off"')), [], 'a dark deploy needs no list');
+});
+
+for (const name of ['localhost', 'LOCALHOST', 'localhost:8787', 'app.localhost', '127.0.0.1', '127.0.0.1:1313', '::1', '[::1]:8787']) {
+  test(`a production hostname list with ${name} is rejected`, () => {
+    const errors = check(withProdVars(`TURNSTILE = "off"\nTURNSTILE_HOSTNAMES = "philippdubach.com, ${name}"`));
+    has(errors, /production TURNSTILE_HOSTNAMES lists the local hostname/);
+  });
+}
+
+test('a hostname that only resembles a local one is accepted', () => {
+  assert.deepEqual(check(withProdVars('TURNSTILE = "on"\nTURNSTILE_HOSTNAMES = "localhost.example.com, philippdubach.com"')), []);
 });
 
 test('an out-of-range provider budget is rejected', () => {

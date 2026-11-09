@@ -66,6 +66,9 @@ function findRemote(node, path, found) {
   }
 }
 
+// Loopback names and addresses, with or without a port.
+const LOCAL_HOSTNAME = /^(localhost|.*\.localhost|127(\.\d{1,3}){3}|\[?::1\]?|0\.0\.0\.0)(:\d+)?$/;
+
 export function checkConfig(config) {
   const errors = [];
   if (!isObject(config)) return ['the configuration is not a TOML table'];
@@ -160,6 +163,23 @@ export function checkConfig(config) {
     const challenge = vars.TURNSTILE;
     if (challenge !== undefined && challenge !== 'on' && challenge !== 'off') {
       errors.push(`${label} TURNSTILE must be "on" or "off", found ${JSON.stringify(challenge)}`);
+    }
+    // The Worker accepts a token only from a listed hostname. With the challenge
+    // on and no list, it refuses every signup with a 503.
+    const hostnames = typeof vars.TURNSTILE_HOSTNAMES === 'string'
+      ? vars.TURNSTILE_HOSTNAMES.split(',').map((name) => name.trim().toLowerCase()).filter(Boolean)
+      : [];
+    if (vars.TURNSTILE_HOSTNAMES !== undefined && typeof vars.TURNSTILE_HOSTNAMES !== 'string') {
+      errors.push(`${label} TURNSTILE_HOSTNAMES must be a comma-separated string`);
+    }
+    if (challenge === 'on' && hostnames.length === 0) {
+      errors.push(`${label} sets TURNSTILE = "on" without TURNSTILE_HOSTNAMES`);
+    }
+    // A token solved on a developer's machine must not count in production.
+    if (label === 'production') {
+      for (const name of hostnames) {
+        if (LOCAL_HOSTNAME.test(name)) errors.push(`production TURNSTILE_HOSTNAMES lists the local hostname ${JSON.stringify(name)}`);
+      }
     }
   }
 

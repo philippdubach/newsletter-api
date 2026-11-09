@@ -32,6 +32,9 @@ export interface Env {
   TURNSTILE?: string;
   // Turnstile secret key for the siteverify call.
   TURNSTILE_SECRET?: string;
+  // Comma-separated hostnames whose widget may issue a token. A token solved on
+  // any other page is refused. Never list a local hostname in production.
+  TURNSTILE_HOSTNAMES?: string;
 
   // Rollback path: direct Plunk API call (kept as automatic fallback).
   // To force-rollback: remove LISTMONK_* secrets and Worker uses these instead.
@@ -55,6 +58,9 @@ const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/sit
 // The name the Turnstile widget gives its hidden form input.
 const TURNSTILE_FIELD = 'cf-turnstile-response';
 const MAX_TURNSTILE_TOKEN_LENGTH = 2048;
+// The action the site's widget is rendered with. A token for another action, or
+// for none, was not issued for this form.
+const TURNSTILE_ACTION = 'signup';
 // URL-encoding a 320-character address plus its signed token can exceed 1 KB.
 const MAX_UNSUBSCRIBE_REQUEST_SIZE = 2048;
 const UNSUBSCRIBE_TOKEN_VERSION = 'v1';
@@ -481,14 +487,29 @@ function isChallengeEnforced(env: Env): boolean {
   return env.TURNSTILE === 'on';
 }
 
+function challengeHostnames(env: Env): string[] {
+  return (env.TURNSTILE_HOSTNAMES ?? '').split(',').map((name) => name.trim().toLowerCase()).filter(Boolean);
+}
+
 // 'unavailable' is the Worker's or Cloudflare's fault, never the caller's.
 type ChallengeVerdict = 'passed' | 'failed' | 'unavailable';
 
 // Error codes that say the secret or the service is broken, not the token.
 const TURNSTILE_SERVICE_ERRORS = ['missing-input-secret', 'invalid-input-secret', 'internal-error'];
 
-/** Asks siteverify about one token. A token is single-use. Never throws. */
-async function verifyTurnstileToken(token: string, clientIP: string, env: Env): Promise<ChallengeVerdict> {
+/**
+ * Asks siteverify about one token. A token is single-use. Never throws.
+ *
+ * A token passes on three checks, not one: siteverify accepts it, it was issued
+ * for this form's action, and it was solved on a hostname in `hostnames`. The
+ * last two stop a token that is valid for the sitekey but came from elsewhere.
+ */
+async function verifyTurnstileToken(
+  token: string,
+  clientIP: string,
+  hostnames: string[],
+  env: Env,
+): Promise<ChallengeVerdict> {
   if (token.length > MAX_TURNSTILE_TOKEN_LENGTH) return 'failed';
   try {
     const resp = await fetch(TURNSTILE_VERIFY_URL, {
@@ -501,8 +522,15 @@ async function verifyTurnstileToken(token: string, clientIP: string, env: Env): 
       }),
       signal: AbortSignal.timeout(5000),
     });
-    const body = await resp.json() as { success?: unknown; 'error-codes'?: unknown } | null;
-    if (body?.success === true) return 'passed';
+    const body = await resp.json() as
+      { success?: unknown; 'error-codes'?: unknown; action?: unknown; hostname?: unknown } | null;
+    if (body?.success === true) {
+      const hostname = typeof body.hostname === 'string' ? body.hostname.toLowerCase() : '';
+      if (body.action === TURNSTILE_ACTION && hostnames.includes(hostname)) return 'passed';
+      // Visible in tail: a page cached before the widget had an action looks like this.
+      console.warn(`Turnstile token refused: action ${JSON.stringify(String(body.action).slice(0, 40))}, hostname ${JSON.stringify(hostname.slice(0, 80))}`);
+      return 'failed';
+    }
     const codes = Array.isArray(body?.['error-codes']) ? body['error-codes'].map(String) : [];
     if (body?.success !== false || codes.some((code) => TURNSTILE_SERVICE_ERRORS.includes(code))) {
       console.error(`Turnstile siteverify unusable: HTTP ${resp.status} ${codes.join(',')}`);
@@ -525,8 +553,8 @@ const TEXT_CHALLENGE_UNAVAILABLE = 'Verification is temporarily unavailable. Ple
  * The operator token stands in for the challenge. With enforcement off nothing
  * is refused, but a token that verifies still marks the signup, so the form can
  * ship and be observed before the gate closes. With enforcement on, every
- * failure is a refusal, including a missing secret: failing open would reopen
- * the endpoint without anyone noticing.
+ * failure is a refusal, including a missing secret or hostname list: failing
+ * open would reopen the endpoint without anyone noticing.
  */
 async function checkChallenge(
   token: string | undefined,
@@ -537,10 +565,12 @@ async function checkChallenge(
 ): Promise<{ verified: boolean } | Response> {
   if (authenticated) return { verified: true };
   const candidate = (token ?? '').trim();
+  const hostnames = challengeHostnames(env);
 
   if (!isChallengeEnforced(env)) {
-    if (!candidate || !env.TURNSTILE_SECRET) return { verified: false };
-    return { verified: await verifyTurnstileToken(candidate, clientIP, env) === 'passed' };
+    // Without both settings no token can pass, so none is spent on the question.
+    if (!candidate || !env.TURNSTILE_SECRET || hostnames.length === 0) return { verified: false };
+    return { verified: await verifyTurnstileToken(candidate, clientIP, hostnames, env) === 'passed' };
   }
 
   const refuse = (status: number, code: string, text: string) =>
@@ -549,8 +579,12 @@ async function checkChallenge(
     console.error('TURNSTILE is on but TURNSTILE_SECRET is not set');
     return refuse(503, 'challenge_unavailable', TEXT_CHALLENGE_UNAVAILABLE);
   }
+  if (hostnames.length === 0) {
+    console.error('TURNSTILE is on but TURNSTILE_HOSTNAMES is empty');
+    return refuse(503, 'challenge_unavailable', TEXT_CHALLENGE_UNAVAILABLE);
+  }
   if (!candidate) return refuse(400, 'challenge_required', TEXT_CHALLENGE_REQUIRED);
-  const verdict = await verifyTurnstileToken(candidate, clientIP, env);
+  const verdict = await verifyTurnstileToken(candidate, clientIP, hostnames, env);
   if (verdict === 'unavailable') return refuse(503, 'challenge_unavailable', TEXT_CHALLENGE_UNAVAILABLE);
   if (verdict === 'failed') return refuse(400, 'challenge_failed', TEXT_CHALLENGE_FAILED);
   return { verified: true };
