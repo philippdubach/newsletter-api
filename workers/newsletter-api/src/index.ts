@@ -1421,6 +1421,18 @@ function parseNewsletterDirectory(html: string): NewsletterItem[] {
 const COMBINED_COUNT_CACHE_KEY = 'cache:subscriber_count';
 const LINKEDIN_LAST_KNOWN_PREFIX = 'cache:linkedin_last_known:';
 const COMBINED_COUNT_CACHE_TTL = 600;
+const COUNT_BROWSER_CACHE = 'public, max-age=300';
+
+/**
+ * The count changes slowly, so a browser may reuse it between pages. The CORS
+ * header echoes the caller's origin, so a stored copy belongs to that origin.
+ */
+function countResponse(payload: unknown, cacheControl: string, request: Request, env: Env): Response {
+  const response = jsonResponse(payload, 200, request, env);
+  response.headers.set('Cache-Control', cacheControl);
+  response.headers.set('Vary', 'Origin');
+  return response;
+}
 
 /** A KV failure must not hide a healthy Listmonk answer, so a miss is the worst case. */
 async function readCountCache(key: string, env: Env): Promise<string | null> {
@@ -2219,7 +2231,7 @@ export default {
       try {
         const cached = await readCountCache(COMBINED_COUNT_CACHE_KEY, env);
         if (cached) {
-          return jsonResponse(JSON.parse(cached), 200, request, env);
+          return countResponse(JSON.parse(cached), COUNT_BROWSER_CACHE, request, env);
         }
 
         // Listmonk is the source of truth; KV count is the dual-write fallback
@@ -2256,9 +2268,10 @@ export default {
           )
         );
 
-        return jsonResponse(payload, 200, request, env);
+        return countResponse(payload, COUNT_BROWSER_CACHE, request, env);
       } catch {
-        return jsonResponse({ count: 0, display: '0+' }, 200, request, env);
+        // The placeholder must not outlive the outage in a browser.
+        return countResponse({ count: 0, display: '0+' }, 'no-store', request, env);
       }
     }
 

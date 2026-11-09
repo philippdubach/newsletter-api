@@ -44,7 +44,7 @@ A failed provider call retries by Durable Object alarm. There are eight attempts
 | POST | `/api/unsubscribe` | Request removal, with a signed token or operator authorization |
 | POST | `/api/unsubscribe/confirm` | Submit the signed form |
 | GET | `/api/newsletters` | List newsletter issues |
-| GET | `/api/subscriber-count` | Get the combined count, cached for 10 minutes |
+| GET | `/api/subscriber-count` | Get the combined count, cached for 10 minutes. Browsers may reuse it for 5 minutes |
 | GET | `/api/signup-stats` | Report recent signups. Operator authorization is required |
 | GET | `/api/health` | Health check |
 | POST | `/api/test-email` | Send a test email. Operator authorization is required |

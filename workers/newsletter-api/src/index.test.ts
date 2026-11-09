@@ -665,6 +665,38 @@ describe('Newsletter API', () => {
       expect(await count()).toEqual({ count: 0, display: '0+' });
       expect(mockEnv.NEWSLETTER_SUBSCRIBERS.put).not.toHaveBeenCalled();
     });
+
+    function countRequest(): Promise<Response> {
+      return worker.fetch(new Request('https://api.example.com/api/subscriber-count', {
+        headers: { Origin: 'https://example.com' },
+      }), mockEnv, mockCtx);
+    }
+
+    it('lets a browser reuse a fresh count and a stored count for five minutes', async () => {
+      global.fetch = vi.fn().mockResolvedValue(listmonkCount(123));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.list.mockResolvedValue({ keys: [], list_complete: true });
+      const fresh = await countRequest();
+
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue('{"count":130,"display":"130+"}');
+      const stored = await countRequest();
+
+      for (const response of [fresh, stored]) {
+        expect(await response.json()).toEqual({ count: 130, display: '130+' });
+        expect(response.headers.get('Cache-Control')).toBe('public, max-age=300');
+        // The allowed origin is echoed, so a stored copy must not serve another origin.
+        expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://example.com');
+        expect(response.headers.get('Vary')).toBe('Origin');
+      }
+    });
+
+    it('keeps the 0+ placeholder out of browser caches', async () => {
+      global.fetch = vi.fn().mockRejectedValue(new Error('provider unreachable'));
+      mockEnv.NEWSLETTER_SUBSCRIBERS.list.mockRejectedValue(new Error('kv unavailable'));
+
+      const response = await countRequest();
+      expect(await response.json()).toEqual({ count: 0, display: '0+' });
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+    });
   });
 
   describe('GET /api/health', () => {

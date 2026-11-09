@@ -48,7 +48,7 @@ npm run deploy:production   # Deploy to production — USE THIS
 
 The welcome and Plunk fallback paths run only when `DOUBLE_OPTIN` is off.
 
-**Subscriber-count** (`/api/subscriber-count`): Listmonk is the source of truth. Calls `GET /api/subscribers?list_id={LISTMONK_LIST_ID}&subscription_status=confirmed&per_page=1` and reads `data.total`. The status filter excludes blocklisted, unsubscribed and unconfirmed rows. This avoids the JOIN double-count bug in `/api/lists/{id}.subscriber_count`. Falls back to counting KV keys (excluding `rate_limit:*` and `cache:*`) if Listmonk is unreachable. Adds LinkedIn follower counts (cached, scraped from `LINKEDIN_NEWSLETTER_URLS`) and rounds the total up to the nearest 10. The combined response is cached in KV under `cache:subscriber_count` for 10 minutes.
+**Subscriber-count** (`/api/subscriber-count`): Listmonk is the source of truth. Calls `GET /api/subscribers?list_id={LISTMONK_LIST_ID}&subscription_status=confirmed&per_page=1` and reads `data.total`. The status filter excludes blocklisted, unsubscribed and unconfirmed rows. This avoids the JOIN double-count bug in `/api/lists/{id}.subscriber_count`. Falls back to counting KV keys (excluding `rate_limit:*` and `cache:*`) if Listmonk is unreachable. Adds LinkedIn follower counts (cached, scraped from `LINKEDIN_NEWSLETTER_URLS`) and rounds the total up to the nearest 10. The combined response is cached in KV under `cache:subscriber_count` for 10 minutes. It is sent with `Cache-Control: public, max-age=300` and `Vary: Origin`, so a browser reuses it between pages. The `0+` placeholder for a failed count is sent with `no-store`.
 
 **Bindings (defined in `wrangler.toml`):**
 - `NEWSLETTER_SUBSCRIBERS` — KV namespace (subscriber shadow + rate limits + caches)
