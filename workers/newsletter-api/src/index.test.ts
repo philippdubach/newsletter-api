@@ -1024,6 +1024,71 @@ describe('Newsletter API', () => {
     });
   });
 
+  describe('Network evidence on the signup record', () => {
+    // Node's Request has no `cf`; the edge attaches it.
+    function signupFrom(cf: unknown): Request {
+      const request = new Request('https://api.example.com/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.8', 'User-Agent': 'evidence-agent' },
+        body: JSON.stringify({ email: 'evidence@example.com' }),
+      });
+      if (cf !== undefined) Object.defineProperty(request, 'cf', { value: cf });
+      return request;
+    }
+
+    function storedRecord(): Record<string, unknown> {
+      const stored = mockEnv.NEWSLETTER_SUBSCRIBERS.put.mock.calls.find(call => call[0] === 'evidence@example.com');
+      return JSON.parse(stored![1] as string);
+    }
+
+    beforeEach(() => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(null);
+      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
+    });
+
+    it('stores the ASN and its organization next to the IP and user agent', async () => {
+      await worker.fetch(signupFrom({ asn: 56971, asOrganization: 'Example Hosting Ltd' }), mockEnv, mockCtx);
+
+      expect(storedRecord()).toMatchObject({
+        ip: '203.0.113.8', userAgent: 'evidence-agent', asn: 56971, asOrganization: 'Example Hosting Ltd',
+      });
+    });
+
+    it('passes the same evidence to the coordinator', async () => {
+      const intent = vi.fn(async (_url: string, _init: RequestInit) =>
+        new Response(JSON.stringify({ outcome: 'completed', created: true }), { status: 200 }));
+      (mockEnv as Env).SUBSCRIPTION_COORDINATOR = {
+        idFromName: (name: string) => name,
+        get: () => ({ fetch: intent }),
+      } as unknown as DurableObjectNamespace;
+
+      await worker.fetch(signupFrom({ asn: 19318, asOrganization: 'Example Transit' }), mockEnv, mockCtx);
+
+      expect(JSON.parse(String((intent.mock.calls[0][1] as RequestInit).body))).toMatchObject({
+        ip: '203.0.113.8', userAgent: 'evidence-agent', asn: 19318, asOrganization: 'Example Transit',
+      });
+    });
+
+    it.each([
+      ['no cf object', undefined],
+      ['an empty cf object', {}],
+      ['values of the wrong type', { asn: 'AS56971', asOrganization: 42 }],
+    ])('stores no network fields for %s', async (_name, cf) => {
+      await worker.fetch(signupFrom(cf), mockEnv, mockCtx);
+
+      const record = storedRecord();
+      expect(record.ip).toBe('203.0.113.8');
+      expect('asn' in record).toBe(false);
+      expect('asOrganization' in record).toBe(false);
+    });
+
+    it('bounds the length of the organization name', async () => {
+      await worker.fetch(signupFrom({ asn: 64500, asOrganization: 'x'.repeat(500) }), mockEnv, mockCtx);
+
+      expect((storedRecord().asOrganization as string).length).toBe(200);
+    });
+  });
+
   describe('Listmonk reconciliation (audit item 35)', () => {
     const recordJson = (seq: number): string =>
       JSON.stringify({ timestamp: '2026-01-01T00:00:00Z', ip: '1.2.3.4', userAgent: 'test', seq });

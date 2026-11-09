@@ -314,7 +314,23 @@ function getClientIP(request: Request): string {
   return 'unknown';
 }
 
-interface SubscriptionRecord {
+/** The network a request came from, as Cloudflare reports it. Absent off the edge. */
+interface NetworkEvidence {
+  asn?: number;
+  asOrganization?: string;
+}
+
+function networkEvidence(request: Request): NetworkEvidence {
+  const cf = (request as Request<unknown, IncomingRequestCfProperties>).cf;
+  const evidence: NetworkEvidence = {};
+  if (typeof cf?.asn === 'number' && Number.isSafeInteger(cf.asn)) evidence.asn = cf.asn;
+  if (typeof cf?.asOrganization === 'string' && cf.asOrganization) {
+    evidence.asOrganization = cf.asOrganization.slice(0, 200);
+  }
+  return evidence;
+}
+
+interface SubscriptionRecord extends NetworkEvidence {
   timestamp: string;
   ip: string;
   userAgent: string;
@@ -334,6 +350,8 @@ function parseRecord(raw: string | null): SubscriptionRecord | null {
       timestamp: typeof parsed.timestamp === 'string' ? parsed.timestamp : '',
       ip: typeof parsed.ip === 'string' ? parsed.ip : 'unknown',
       userAgent: typeof parsed.userAgent === 'string' ? parsed.userAgent : 'unknown',
+      ...(typeof parsed.asn === 'number' ? { asn: parsed.asn } : {}),
+      ...(typeof parsed.asOrganization === 'string' ? { asOrganization: parsed.asOrganization } : {}),
       ...(typeof parsed.verified === 'boolean' ? { verified: parsed.verified } : {}),
       seq: typeof parsed.seq === 'number' ? parsed.seq : 0,
     };
@@ -975,6 +993,7 @@ async function submitIntent(
         email,
         ip: clientIP,
         userAgent: request.headers.get('User-Agent') || 'unknown',
+        ...networkEvidence(request),
         authenticated,
         verified,
       }),
@@ -1117,6 +1136,7 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       timestamp: new Date().toISOString(),
       ip: clientIP,
       userAgent: request.headers.get('User-Agent') || 'unknown',
+      ...networkEvidence(request),
       verified: challenge.verified,
       seq: Date.now(),
     };
@@ -1483,6 +1503,8 @@ interface CoordinatorIntent {
   /** Caller metadata, kept here so a retry can repair the shadow correctly. */
   ip?: string;
   userAgent?: string;
+  asn?: number;
+  asOrganization?: string;
   /** Whether the caller proved control of the address. */
   authenticated?: boolean;
   /** Whether a signup passed the challenge or carried the operator token. */
@@ -1490,7 +1512,7 @@ interface CoordinatorIntent {
 }
 
 type IntentInput = Pick<CoordinatorIntent,
-  'desired' | 'email' | 'ip' | 'userAgent' | 'authenticated' | 'verified'>;
+  'desired' | 'email' | 'ip' | 'userAgent' | 'asn' | 'asOrganization' | 'authenticated' | 'verified'>;
 
 interface CoordinatorPending {
   kind: 'create' | 'remove' | 'shadow';
@@ -1634,6 +1656,8 @@ export class SubscriptionCoordinator {
       updatedAt: new Date(recordedAtMs).toISOString(),
       ip: input.ip,
       userAgent: input.userAgent,
+      asn: input.asn,
+      asOrganization: input.asOrganization,
       authenticated: input.authenticated,
       verified: input.verified,
     };
@@ -1743,6 +1767,8 @@ export class SubscriptionCoordinator {
           timestamp: intent.updatedAt,
           ip: intent.ip ?? 'unknown',
           userAgent: intent.userAgent ?? 'unknown',
+          asn: intent.asn,
+          asOrganization: intent.asOrganization,
           verified: intent.verified === true,
           seq: Date.now(),
         }));
