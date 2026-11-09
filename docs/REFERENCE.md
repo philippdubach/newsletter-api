@@ -50,6 +50,40 @@ mail at most:
 A reminder that a verified signup armed still fires after a later unverified
 request for the same address.
 
+### Evidence, not a filter
+
+A one-hour tail of production on 2026-11-09 (11:34 to 12:34 UTC) showed the bot's
+request: `Origin: https://philippdubach.com` and
+`Referer: https://philippdubach.com/subscribe/`, both spoofed; a URL-encoded form
+body; `Accept-Language: ru,en;q=0.8`; a Chrome 124 on Windows user agent; no
+`Sec-CH-UA` header; HTTP/1.1. A real Chrome sends `Sec-CH-UA` and uses HTTP/2 or
+HTTP/3.
+
+Two things follow:
+
+- Enforcing the `Origin` header would not stop this client, so the branch does
+  not add that check. The challenge is the control.
+- The KV record keeps `asn`, `asOrganization`, `secChUa` (whether the header was
+  present) and `httpProtocol` (`request.cf.httpProtocol`). `/api/signup-stats`
+  shows them for each recent signup.
+
+These fields are for alerting and cleanup only. Do not use them to refuse a
+request. In the same hour an unrelated scraper used the same user-agent string,
+and about 20 real subscribers arrive through VPNs or relays. The unit tests pin
+this: a request with the bot's exact shape is accepted once its challenge passes.
+
+### The IP blocklist stays for now
+
+`BLOCKED_IPS` and its check are unchanged in this branch. The owner's instruction
+on 2026-11-09 was: "Keep the IP list until Turnstile is live." At 12:25 UTC that
+day `95.182.114.251`, one of the six listed addresses, posted to `/api/subscribe`
+and got the 429. The blocklist runs before the challenge, so a listed address is
+refused without a siteverify call.
+
+Remove the list only after `TURNSTILE` is `on` in production and the signup
+report has stayed quiet. Until then it is the only control that stops those
+addresses.
+
 ### Rollout
 
 Each step that changes production needs the owner's approval.
@@ -84,8 +118,11 @@ Each step that changes production needs the owner's approval.
 5. Set `TURNSTILE = "on"` in `[env.production.vars]` of `wrangler.toml` and deploy
    again. A request without a token now gets 400.
 6. Start the hourly poll of `/api/signup-stats`. See `README.md`.
+7. Leave `BLOCKED_IPS` set through all of the steps above. It may be removed only
+   after step 5 is live in production. See "The IP blocklist stays for now".
 
-To go back, set `TURNSTILE = "off"` and deploy. The secret can stay.
+To go back, set `TURNSTILE = "off"` and deploy. The secret can stay. Keep
+`BLOCKED_IPS` while the challenge is off.
 
 ### The site form change
 

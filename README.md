@@ -30,7 +30,7 @@ Email button -> philippdubach.com/?confirm#<id> -> POST /api/confirm -> Listmonk
 
 The Worker sends no welcome email while `DOUBLE_OPTIN` is `on`.
 
-Listmonk is the source of truth. KV keeps a shadow record of each signup: the time, IP address, user agent, ASN, ASN organization and whether the signup was verified. The first record for an address is kept. KV also holds the rate limit counters and caches. A KV record does not prove that an address is subscribed.
+Listmonk is the source of truth. KV keeps a shadow record of each signup: the time, IP address, user agent, ASN, ASN organization, whether a `Sec-CH-UA` header was present, the HTTP protocol and whether the signup was verified. The first record for an address is kept. The ASN, the header and the protocol are evidence for the report and for cleanup. The Worker never refuses a request because of them. KV also holds the rate limit counters and caches. A KV record does not prove that an address is subscribed.
 
 A failed provider call retries by Durable Object alarm. There are eight attempts in total. After that, the coordinator stores an `exhausted` record, and an operator must investigate. The next accepted intent clears the record. A 4xx answer to a create, other than 409 and 429, is final and does not retry.
 
@@ -56,7 +56,7 @@ A failed provider call retries by Durable Object alarm. There are eight attempts
 - With `TURNSTILE = "on"`, `/api/subscribe` requires a Turnstile token in the `cf-turnstile-response` field. A missing or rejected token gets 400. A missing secret or an unreachable siteverify gets 503, so the check never fails open. The operator bearer token passes without a challenge.
 - With `TURNSTILE = "off"`, no request is refused. A token that arrives is still verified, and the record stores the result.
 - A signup that is not verified causes one email at most: the opt-in mail from Listmonk. It gets no 48-hour reminder, and a repeat of the request does not resend the link.
-- `BLOCKED_IPS` refuses listed clients at `/api/subscribe` and `/api/confirm`. It is in the Worker because zone WAF rules do not cover the `workers.dev` hostname.
+- `BLOCKED_IPS` refuses listed clients at `/api/subscribe` and `/api/confirm`. It is in the Worker because zone WAF rules do not cover the `workers.dev` hostname. The check runs before the challenge. Keep the list until `TURNSTILE` is `on` in production: a listed address still posted on 2026-11-09. Remove it only after that.
 - Both endpoints allow five requests a minute for each IP address. The limit fails open on KV errors and is not atomic.
 - `/api/confirm` accepts only a UUID. It reports a provider failure as a failure.
 - A plain fetch of the confirmation link confirms nothing, because the site must run JavaScript. A scanner that runs JavaScript can still confirm.
@@ -85,12 +85,27 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" https://newsletter-api.philippd.
     "24h": {
       "signups": 4,
       "unverified": 3,
+      "withoutSecChUa": 3,
       "byIp": [{ "ip": "203.0.113.5", "count": 3 }, { "ip": "198.51.100.7", "count": 1 }],
       "byAsn": [{ "asn": 64500, "asOrganization": "Example Hosting", "count": 3 }, { "asn": null, "asOrganization": null, "count": 1 }],
-      "byUserAgent": [{ "userAgent": "Mozilla/5.0 ... Chrome/124.0.0.0 Safari/537.36", "count": 3 }, { "userAgent": "...", "count": 1 }]
+      "byUserAgent": [{ "userAgent": "Mozilla/5.0 ... Chrome/124.0.0.0 Safari/537.36", "count": 3 }, { "userAgent": "...", "count": 1 }],
+      "byHttpProtocol": [{ "httpProtocol": "HTTP/1.1", "count": 3 }, { "httpProtocol": "HTTP/2", "count": 1 }]
     },
-    "7d": { "signups": 9, "unverified": 5, "byIp": [], "byAsn": [], "byUserAgent": [] }
+    "7d": { "signups": 9, "unverified": 5, "withoutSecChUa": 4, "byIp": [], "byAsn": [], "byUserAgent": [], "byHttpProtocol": [] }
   },
+  "recent": [
+    {
+      "timestamp": "2026-11-09T11:40:00.000Z",
+      "ip": "203.0.113.5",
+      "asn": 64500,
+      "asOrganization": "Example Hosting",
+      "userAgent": "Mozilla/5.0 ... Chrome/124.0.0.0 Safari/537.36",
+      "secChUa": false,
+      "httpProtocol": "HTTP/1.1",
+      "verified": false
+    }
+  ],
+  "recentTruncated": false,
   "alert": {
     "triggered": true,
     "reasons": [
@@ -112,11 +127,15 @@ Poll it every hour. `alert.triggered` is true when one of these holds for the la
 
 Treat any answer other than HTTP 200 as a failed check, not as a quiet day. A KV error returns 500.
 
+`recent` lists each signup of the last 7 days, newest first, 200 at most. `recentTruncated` is true when there were more. Use it to read a cluster across fields. The bot of November 2026 claimed Chrome 124 on Windows, sent no `Sec-CH-UA` header and used HTTP/1.1. A real Chrome sends the header and uses HTTP/2 or HTTP/3. Firefox and Safari send no such header, so `secChUa: false` means something only next to a Chrome user agent.
+
+No alert rule reads `secChUa` or `httpProtocol`, and the Worker never refuses a request because of them. Another scraper used the same user-agent string in the same hour, and about 20 real subscribers arrive through VPNs or relays. Decide on a cluster, not on one row.
+
 Limits of the report:
 
 - It counts addresses, not requests. A record is the first signup of an address, and an unsubscribe deletes it.
 - A request that the challenge refuses leaves no record. Use `npx wrangler tail --env production` to see refused requests.
-- Records made before this endpoint existed have no ASN and count as unverified.
+- Records made before this endpoint existed have no ASN and count as unverified. Their `secChUa` and `httpProtocol` are `null`, and `withoutSecChUa` does not count them.
 - Each breakdown lists the 50 largest groups. The alert uses all groups.
 - The report contains IP addresses and no email address.
 
