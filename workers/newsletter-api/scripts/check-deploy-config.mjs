@@ -154,6 +154,15 @@ export function checkConfig(config) {
     }
   }
 
+  // The Worker enforces the signup challenge only for the exact value "on", so
+  // a typo would leave the endpoint open without any error.
+  for (const [label, vars] of [['development', devVars], ['production', prodVars]]) {
+    const challenge = vars.TURNSTILE;
+    if (challenge !== undefined && challenge !== 'on' && challenge !== 'off') {
+      errors.push(`${label} TURNSTILE must be "on" or "off", found ${JSON.stringify(challenge)}`);
+    }
+  }
+
   const migrations = Array.isArray(dev.migrations) ? dev.migrations.filter(isObject) : [];
   const declaresClass = migrations.some((migration) => {
     for (const key of ['new_classes', 'new_sqlite_classes']) {

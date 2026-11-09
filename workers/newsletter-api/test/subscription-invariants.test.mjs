@@ -35,6 +35,10 @@ const PROVIDER_BINDINGS = {
   LISTMONK_WELCOME_TEMPLATE_ID: '5',
 };
 
+// The one token the siteverify stand-in accepts.
+const PASSING_TOKEN = 'runtime-suite-passing-token';
+const CHALLENGE_BINDINGS = { TURNSTILE_SECRET: 'runtime-suite-turnstile-secret' };
+
 /**
  * Minimal Listmonk stand-in. Subscriber state is a map the test controls, so a
  * case can put the provider in any status without touching a real account.
@@ -74,6 +78,11 @@ function createProviderStub() {
     }
     calls.push({ method, path: url.pathname, search: url.search, body });
 
+    // Turnstile's siteverify shares the egress, so it is answered here too.
+    if (url.hostname === 'challenges.cloudflare.com') {
+      const passed = JSON.parse(body ?? '{}').response === PASSING_TOKEN;
+      return json({ success: passed, 'error-codes': passed ? [] : ['invalid-input-response'] });
+    }
     if (url.pathname === '/api/subscribers' && method === 'GET') {
       if (rawLookup) return rawLookup(request);
       const query = url.searchParams.get('query') ?? '';
@@ -1790,6 +1799,106 @@ describe('the KV shadow record', () => {
 
       await signup('198.51.100.61', 'second-client');
       assert.equal(await kv.get(email), first, 'a repeat signup must not rewrite the consent record');
+    } finally {
+      await local.dispose();
+    }
+  });
+});
+
+describe('the signup challenge', () => {
+  const ENFORCED = {
+    ...PROVIDER_BINDINGS, ...CHALLENGE_BINDINGS, DOUBLE_OPTIN: 'on', TURNSTILE: 'on',
+    ADMIN_TOKEN: 'runtime-suite-admin-token',
+  };
+  const siteverifies = (store) => store.calls.filter((call) => call.path === '/turnstile/v0/siteverify');
+  const listmonk = (store) => store.calls.filter((call) => call.path !== '/turnstile/v0/siteverify');
+
+  async function withChallenge(check) {
+    const store = createProviderStub();
+    const local = await startRuntime({ extraBindings: ENFORCED, outboundService: store.handler });
+    const post = async (email, fields = {}, headers = {}) => {
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': nextIP(), ...headers },
+        body: JSON.stringify({ email, ...fields }),
+      });
+      const body = await response.json();
+      await local.drain();
+      return { status: response.status, body };
+    };
+    try {
+      await check({ store, local, post });
+    } finally {
+      await local.dispose();
+    }
+  }
+
+  for (const [name, fields, status, calls] of [
+    ['no token', {}, 'challenge_required', 0],
+    ['a token siteverify rejects', { 'cf-turnstile-response': 'forged' }, 'challenge_failed', 1],
+  ]) {
+    it(`refuses ${name} and leaves no trace of the address`, async () => {
+      const email = `invariant-challenge-${calls}@example.com`;
+      await withChallenge(async ({ store, local, post }) => {
+        const answer = await post(email, fields);
+
+        assert.equal(answer.status, 400);
+        assert.equal(answer.body.success, false);
+        assert.equal(answer.body.status, status);
+        assert.equal(siteverifies(store).length, calls);
+        assert.equal(listmonk(store).length, 0, 'no lookup, no create, so no mail');
+        const state = await (await (await local.coordinator(email)).fetch('https://coordinator/state')).json();
+        assert.equal(state.intent, null, 'a refused caller records no intent');
+        assert.equal(state.alarm, null);
+        assert.equal(await local.kv.get(email), null);
+      });
+    });
+  }
+
+  it('creates the subscriber once the token passes, and records the verdict', async () => {
+    const email = 'invariant-challenge-passed@example.com';
+    await withChallenge(async ({ store, local, post }) => {
+      const answer = await post(email, { 'cf-turnstile-response': PASSING_TOKEN });
+
+      assert.equal(answer.status, 200);
+      assert.equal(answer.body.status, 'confirmation_required');
+      assert.equal(siteverifies(store).length, 1);
+      assert.equal(store.mutations().length, 1);
+      assert.equal(JSON.parse(await local.kv.get(email)).verified, true);
+    });
+  });
+
+  it('accepts the operator token without a challenge', async () => {
+    const email = 'invariant-challenge-operator@example.com';
+    await withChallenge(async ({ store, local, post }) => {
+      const answer = await post(email, {}, { Authorization: `Bearer ${ENFORCED.ADMIN_TOKEN}` });
+
+      assert.equal(answer.status, 200);
+      assert.equal(siteverifies(store).length, 0);
+      assert.equal(store.mutations().length, 1);
+      assert.equal(JSON.parse(await local.kv.get(email)).verified, true);
+    });
+  });
+
+  it('records a signup as unverified while enforcement is off', async () => {
+    const email = 'invariant-challenge-dark@example.com';
+    const store = createProviderStub();
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, ...CHALLENGE_BINDINGS, TURNSTILE: 'off' },
+      outboundService: store.handler,
+    });
+    try {
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': nextIP() },
+        body: JSON.stringify({ email }),
+      });
+      await response.json();
+      await local.drain();
+
+      assert.equal(response.status, 200);
+      assert.equal(siteverifies(store).length, 0);
+      assert.equal(JSON.parse(await local.kv.get(email)).verified, false);
     } finally {
       await local.dispose();
     }

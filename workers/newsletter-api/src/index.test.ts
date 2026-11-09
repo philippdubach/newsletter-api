@@ -777,6 +777,253 @@ describe('Newsletter API', () => {
     });
   });
 
+  describe('Turnstile challenge on /api/subscribe', () => {
+    const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+    type Answer = { success: boolean; status?: string; error?: string; message?: string };
+
+    // Stands in for the Durable Object, so a test can see whether an intent was
+    // submitted and what it carried.
+    function bindCoordinator(): ReturnType<typeof vi.fn> {
+      const intent = vi.fn(async (_url: string, _init: RequestInit) =>
+        new Response(JSON.stringify({ outcome: 'completed', created: true }), { status: 200 }));
+      (mockEnv as Env).SUBSCRIPTION_COORDINATOR = {
+        idFromName: (name: string) => name,
+        get: () => ({ fetch: intent }),
+      } as unknown as DurableObjectNamespace;
+      return intent;
+    }
+
+    const intentBody = (intent: ReturnType<typeof vi.fn>): Record<string, unknown> =>
+      JSON.parse(String((intent.mock.calls[0][1] as RequestInit).body));
+
+    function stubSiteverify(answer: unknown, status = 200): ReturnType<typeof vi.fn> {
+      const f = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(typeof answer === 'string' ? answer : JSON.stringify(answer), { status }));
+      global.fetch = f as unknown as typeof fetch;
+      return f;
+    }
+
+    function signup(fields: Record<string, unknown>, headers: Record<string, string> = {}): Request {
+      return new Request('https://api.example.com/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.7', ...headers },
+        body: JSON.stringify({ email: 'reader@example.com', ...fields }),
+      });
+    }
+
+    beforeEach(() => {
+      (mockEnv as Env).TURNSTILE = 'on';
+      (mockEnv as Env).TURNSTILE_SECRET = 'test-turnstile-secret';
+    });
+
+    it('refuses a signup without a token before any intent or outbound call', async () => {
+      const intent = bindCoordinator();
+
+      const response = await worker.fetch(signup({}), mockEnv, mockCtx);
+      const body = await response.json() as Answer;
+
+      expect(response.status).toBe(400);
+      expect(body).toMatchObject({ success: false, status: 'challenge_required' });
+      expect(body.error).toBe(body.message);
+      expect(intent).not.toHaveBeenCalled();
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.put).not.toHaveBeenCalledWith('reader@example.com', expect.anything());
+    });
+
+    it('refuses a token that siteverify rejects', async () => {
+      const intent = bindCoordinator();
+      const siteverify = stubSiteverify({ success: false, 'error-codes': ['invalid-input-response'] });
+
+      const response = await worker.fetch(signup({ 'cf-turnstile-response': 'forged' }), mockEnv, mockCtx);
+      const body = await response.json() as Answer;
+
+      expect(response.status).toBe(400);
+      expect(body).toMatchObject({ success: false, status: 'challenge_failed' });
+      expect(siteverify).toHaveBeenCalledTimes(1);
+      expect(intent).not.toHaveBeenCalled();
+    });
+
+    it('sends the secret, the token and the caller address to siteverify, then submits a verified intent', async () => {
+      const intent = bindCoordinator();
+      const siteverify = stubSiteverify({ success: true });
+
+      const response = await worker.fetch(signup({ 'cf-turnstile-response': ' good-token ' }), mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      const [url, init] = siteverify.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe(SITEVERIFY);
+      expect(init.method).toBe('POST');
+      expect(JSON.parse(String(init.body))).toEqual({
+        secret: 'test-turnstile-secret', response: 'good-token', remoteip: '203.0.113.7',
+      });
+      expect(intent).toHaveBeenCalledTimes(1);
+      expect(intentBody(intent)).toMatchObject({ desired: 'subscribed', authenticated: false, verified: true });
+    });
+
+    it('accepts the widget field from a URL-encoded form', async () => {
+      const intent = bindCoordinator();
+      const siteverify = stubSiteverify({ success: true });
+      const request = new Request('https://api.example.com/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'email=reader%40example.com&cf-turnstile-response=form-token',
+      });
+
+      const response = await worker.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      expect(JSON.parse(String((siteverify.mock.calls[0][1] as RequestInit).body)).response).toBe('form-token');
+      expect(intentBody(intent).verified).toBe(true);
+    });
+
+    it('accepts a token of the maximum length and refuses a longer one unasked', async () => {
+      const intent = bindCoordinator();
+      const siteverify = stubSiteverify({ success: true });
+
+      const longest = await worker.fetch(signup({ 'cf-turnstile-response': 'x'.repeat(2048) }), mockEnv, mockCtx);
+      expect(longest.status).toBe(200);
+      expect(siteverify).toHaveBeenCalledTimes(1);
+
+      const tooLong = await worker.fetch(signup({ 'cf-turnstile-response': 'x'.repeat(2049) }), mockEnv, mockCtx);
+      expect(tooLong.status).toBe(400);
+      expect((await tooLong.json() as Answer).status).toBe('challenge_failed');
+      expect(siteverify).toHaveBeenCalledTimes(1);
+      expect(intent).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a token that is not a string as a malformed body', async () => {
+      const intent = bindCoordinator();
+
+      const response = await worker.fetch(signup({ 'cf-turnstile-response': { nested: true } }), mockEnv, mockCtx);
+
+      expect(response.status).toBe(400);
+      expect((await response.json() as Answer).error).toBe('Invalid request body');
+      expect(intent).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a siteverify outage', () => stubSiteverify('upstream down', 502)],
+      ['a siteverify answer without a verdict', () => stubSiteverify({})],
+      ['a rejected secret', () => stubSiteverify({ success: false, 'error-codes': ['invalid-input-secret'] })],
+      ['a siteverify internal error', () => stubSiteverify({ success: false, 'error-codes': ['internal-error'] })],
+      ['a network failure', () => {
+        global.fetch = vi.fn().mockRejectedValue(new Error('connection reset')) as unknown as typeof fetch;
+      }],
+    ])('answers 503 and submits nothing after %s', async (_name, arrange) => {
+      const intent = bindCoordinator();
+      arrange();
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const response = await worker.fetch(signup({ 'cf-turnstile-response': 'token' }), mockEnv, mockCtx);
+
+      expect(response.status).toBe(503);
+      expect((await response.json() as Answer).status).toBe('challenge_unavailable');
+      expect(intent).not.toHaveBeenCalled();
+      expect(logged).toHaveBeenCalled();
+      logged.mockRestore();
+    });
+
+    it('fails closed when enforcement is on and the secret is missing', async () => {
+      const intent = bindCoordinator();
+      delete (mockEnv as Env).TURNSTILE_SECRET;
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const response = await worker.fetch(signup({ 'cf-turnstile-response': 'token' }), mockEnv, mockCtx);
+
+      expect(response.status).toBe(503);
+      expect(intent).not.toHaveBeenCalled();
+      logged.mockRestore();
+    });
+
+    it('lets the operator token stand in for the challenge', async () => {
+      const intent = bindCoordinator();
+
+      const response = await worker.fetch(signup({}, { Authorization: 'Bearer test_token' }), mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      expect(intentBody(intent)).toMatchObject({ authenticated: true, verified: true });
+    });
+
+    it('does not accept a wrong operator token in place of the challenge', async () => {
+      const intent = bindCoordinator();
+
+      const response = await worker.fetch(signup({}, { Authorization: 'Bearer wrong' }), mockEnv, mockCtx);
+
+      expect(response.status).toBe(400);
+      expect(intent).not.toHaveBeenCalled();
+    });
+
+    describe('with enforcement off', () => {
+      beforeEach(() => {
+        (mockEnv as Env).TURNSTILE = 'off';
+      });
+
+      it('accepts a signup without a token and marks it unverified', async () => {
+        const intent = bindCoordinator();
+
+        const response = await worker.fetch(signup({}), mockEnv, mockCtx);
+
+        expect(response.status).toBe(200);
+        expect(intentBody(intent)).toMatchObject({ authenticated: false, verified: false });
+      });
+
+      it('marks a signup verified when its token passes', async () => {
+        const intent = bindCoordinator();
+        stubSiteverify({ success: true });
+
+        await worker.fetch(signup({ 'cf-turnstile-response': 'good-token' }), mockEnv, mockCtx);
+
+        expect(intentBody(intent).verified).toBe(true);
+      });
+
+      it.each([
+        ['fails', () => stubSiteverify({ success: false, 'error-codes': ['timeout-or-duplicate'] })],
+        ['cannot be checked', () => stubSiteverify('upstream down', 502)],
+      ])('still accepts a signup whose token %s, as unverified', async (_name, arrange) => {
+        const intent = bindCoordinator();
+        arrange();
+        const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        const response = await worker.fetch(signup({ 'cf-turnstile-response': 'token' }), mockEnv, mockCtx);
+
+        expect(response.status).toBe(200);
+        expect(intentBody(intent).verified).toBe(false);
+        logged.mockRestore();
+      });
+
+      it('does not call siteverify without a secret', async () => {
+        const intent = bindCoordinator();
+        delete (mockEnv as Env).TURNSTILE_SECRET;
+
+        const response = await worker.fetch(signup({ 'cf-turnstile-response': 'token' }), mockEnv, mockCtx);
+
+        expect(response.status).toBe(200);
+        expect(intentBody(intent).verified).toBe(false);
+      });
+
+      it('treats any value other than "on" as off', async () => {
+        const intent = bindCoordinator();
+        (mockEnv as Env).TURNSTILE = 'On';
+
+        const response = await worker.fetch(signup({}), mockEnv, mockCtx);
+
+        expect(response.status).toBe(200);
+        expect(intent).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it('stores the verdict on the record of a signup without a coordinator', async () => {
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockResolvedValue(null);
+      mockEnv.NEWSLETTER_SUBSCRIBERS.put.mockResolvedValue(undefined);
+      stubSiteverify({ success: true });
+
+      const response = await worker.fetch(signup({ 'cf-turnstile-response': 'good-token' }), mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      const stored = mockEnv.NEWSLETTER_SUBSCRIBERS.put.mock.calls.find(call => call[0] === 'reader@example.com');
+      expect(JSON.parse(stored![1] as string).verified).toBe(true);
+    });
+  });
+
   describe('Listmonk reconciliation (audit item 35)', () => {
     const recordJson = (seq: number): string =>
       JSON.stringify({ timestamp: '2026-01-01T00:00:00Z', ip: '1.2.3.4', userAgent: 'test', seq });

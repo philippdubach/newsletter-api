@@ -250,6 +250,17 @@ test('legacy mode is accepted', () => {
   assert.deepEqual(check(SAFE.replace(/COORDINATOR_MODE = "on"/g, 'COORDINATOR_MODE = "legacy"')), []);
 });
 
+test('a misspelt signup challenge switch is rejected', () => {
+  const errors = check(SAFE.replace('COORDINATOR_MODE = "on"', 'COORDINATOR_MODE = "on"\nTURNSTILE = "On"'));
+  has(errors, /TURNSTILE must be "on" or "off", found "On"/);
+});
+
+test('the signup challenge switch accepts on and off', () => {
+  for (const value of ['on', 'off']) {
+    assert.deepEqual(check(SAFE.replace(/COORDINATOR_MODE = "on"/g, `COORDINATOR_MODE = "on"\nTURNSTILE = "${value}"`)), []);
+  }
+});
+
 test('an out-of-range provider budget is rejected', () => {
   const errors = check(SAFE.replace('COORDINATOR_MODE = "on"', 'COORDINATOR_MODE = "on"\nPROVIDER_BUDGET_MS = "45000"'));
   has(errors, /PROVIDER_BUDGET_MS must be an integer between 1000 and 25000/);

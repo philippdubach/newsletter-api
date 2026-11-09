@@ -26,6 +26,12 @@ export interface Env {
   // Comma-separated client IPs refused at /api/subscribe. A secret, because
   // workers.dev traffic does not pass through any zone's WAF rules.
   BLOCKED_IPS?: string;
+  // "on": /api/subscribe refuses a caller without a passed Turnstile challenge.
+  // Any other value leaves the challenge unenforced, so the Worker can ship
+  // before the form does. A token that arrives is still verified.
+  TURNSTILE?: string;
+  // Turnstile secret key for the siteverify call.
+  TURNSTILE_SECRET?: string;
 
   // Rollback path: direct Plunk API call (kept as automatic fallback).
   // To force-rollback: remove LISTMONK_* secrets and Worker uses these instead.
@@ -43,6 +49,12 @@ interface NewsletterItem {
 }
 
 const MAX_REQUEST_SIZE = 1024;
+// A Turnstile token is up to 2048 characters, on top of a 320-character address.
+const MAX_SUBSCRIBE_REQUEST_SIZE = 4096;
+const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+// The name the Turnstile widget gives its hidden form input.
+const TURNSTILE_FIELD = 'cf-turnstile-response';
+const MAX_TURNSTILE_TOKEN_LENGTH = 2048;
 // URL-encoding a 320-character address plus its signed token can exceed 1 KB.
 const MAX_UNSUBSCRIBE_REQUEST_SIZE = 2048;
 const UNSUBSCRIBE_TOKEN_VERSION = 'v1';
@@ -124,6 +136,7 @@ interface ParsedBody {
   email?: string;
   token?: string;
   honeypot?: string;
+  turnstileToken?: string;
 }
 
 type BodyResult =
@@ -215,12 +228,12 @@ export async function readBody(request: Request, maxBytes = MAX_REQUEST_SIZE): P
       // Reject non-string email/token/honeypot fields instead of letting them
       // propagate and potentially cause a 500 downstream.
       const body = parsed as Record<string, unknown>;
-      for (const key of ['email', 'token', 'honeypot']) {
+      for (const key of ['email', 'token', 'honeypot', TURNSTILE_FIELD]) {
         if (key in body && body[key] !== undefined && typeof body[key] !== 'string') {
           return { ok: false, status: 400, error: 'Invalid request body' };
         }
       }
-      return { ok: true, body: parsed as ParsedBody };
+      return { ok: true, body: { ...(parsed as ParsedBody), turnstileToken: body[TURNSTILE_FIELD] as string | undefined } };
     } catch {
       // Explicit JSON must never be reinterpreted as a form. Preserve the
       // existing text/plain/no-type compatibility for older clients.
@@ -240,6 +253,7 @@ export async function readBody(request: Request, maxBytes = MAX_REQUEST_SIZE): P
         email: params.get('email') ?? undefined,
         token: params.get('token') ?? undefined,
         honeypot: params.get('honeypot') ?? undefined,
+        turnstileToken: params.get(TURNSTILE_FIELD) ?? undefined,
       },
     };
   } catch {
@@ -304,22 +318,33 @@ interface SubscriptionRecord {
   timestamp: string;
   ip: string;
   userAgent: string;
+  /** True when the signup passed the challenge or carried the operator token. */
+  verified?: boolean;
   // Best-effort intent marker. KV is eventually consistent and this value
   // cannot serialize in-flight Listmonk writes with unsubscribe requests.
   seq: number;
 }
 
-async function readRecord(email: string, env: Env): Promise<SubscriptionRecord | null> {
+function parseRecord(raw: string | null): SubscriptionRecord | null {
+  if (!raw) return null;
   try {
-    const raw = await env.NEWSLETTER_SUBSCRIBERS.get(email);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<SubscriptionRecord>;
+    const parsed = JSON.parse(raw) as Partial<SubscriptionRecord> | null;
+    if (typeof parsed !== 'object' || parsed === null) return null;
     return {
       timestamp: typeof parsed.timestamp === 'string' ? parsed.timestamp : '',
       ip: typeof parsed.ip === 'string' ? parsed.ip : 'unknown',
       userAgent: typeof parsed.userAgent === 'string' ? parsed.userAgent : 'unknown',
+      ...(typeof parsed.verified === 'boolean' ? { verified: parsed.verified } : {}),
       seq: typeof parsed.seq === 'number' ? parsed.seq : 0,
     };
+  } catch {
+    return null;
+  }
+}
+
+async function readRecord(email: string, env: Env): Promise<SubscriptionRecord | null> {
+  try {
+    return parseRecord(await env.NEWSLETTER_SUBSCRIBERS.get(email));
   } catch {
     return null;
   }
@@ -410,6 +435,91 @@ async function checkRateLimit(ip: string, env: Env): Promise<boolean> {
   } catch {
     return true;
   }
+}
+
+/* =============================================================================
+ * Turnstile challenge
+ * The form attaches a token; siteverify says whether a browser earned it. A
+ * client that posts JSON straight to the endpoint has none.
+ * ========================================================================== */
+
+function isChallengeEnforced(env: Env): boolean {
+  return env.TURNSTILE === 'on';
+}
+
+// 'unavailable' is the Worker's or Cloudflare's fault, never the caller's.
+type ChallengeVerdict = 'passed' | 'failed' | 'unavailable';
+
+// Error codes that say the secret or the service is broken, not the token.
+const TURNSTILE_SERVICE_ERRORS = ['missing-input-secret', 'invalid-input-secret', 'internal-error'];
+
+/** Asks siteverify about one token. A token is single-use. Never throws. */
+async function verifyTurnstileToken(token: string, clientIP: string, env: Env): Promise<ChallengeVerdict> {
+  if (token.length > MAX_TURNSTILE_TOKEN_LENGTH) return 'failed';
+  try {
+    const resp = await fetch(TURNSTILE_VERIFY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        secret: env.TURNSTILE_SECRET,
+        response: token,
+        ...(clientIP !== 'unknown' ? { remoteip: clientIP } : {}),
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const body = await resp.json() as { success?: unknown; 'error-codes'?: unknown } | null;
+    if (body?.success === true) return 'passed';
+    const codes = Array.isArray(body?.['error-codes']) ? body['error-codes'].map(String) : [];
+    if (body?.success !== false || codes.some((code) => TURNSTILE_SERVICE_ERRORS.includes(code))) {
+      console.error(`Turnstile siteverify unusable: HTTP ${resp.status} ${codes.join(',')}`);
+      return 'unavailable';
+    }
+    return 'failed';
+  } catch (error) {
+    console.error(`Turnstile siteverify exception: ${error instanceof Error ? error.message : String(error)}`);
+    return 'unavailable';
+  }
+}
+
+const TEXT_CHALLENGE_REQUIRED = 'Please complete the verification and try again.';
+const TEXT_CHALLENGE_FAILED = 'Verification failed. Please reload the page and try again.';
+const TEXT_CHALLENGE_UNAVAILABLE = 'Verification is temporarily unavailable. Please try again later.';
+
+/**
+ * Decides whether a signup may proceed, and whether it counts as verified.
+ *
+ * The operator token stands in for the challenge. With enforcement off nothing
+ * is refused, but a token that verifies still marks the signup, so the form can
+ * ship and be observed before the gate closes. With enforcement on, every
+ * failure is a refusal, including a missing secret: failing open would reopen
+ * the endpoint without anyone noticing.
+ */
+async function checkChallenge(
+  token: string | undefined,
+  clientIP: string,
+  authenticated: boolean,
+  request: Request,
+  env: Env,
+): Promise<{ verified: boolean } | Response> {
+  if (authenticated) return { verified: true };
+  const candidate = (token ?? '').trim();
+
+  if (!isChallengeEnforced(env)) {
+    if (!candidate || !env.TURNSTILE_SECRET) return { verified: false };
+    return { verified: await verifyTurnstileToken(candidate, clientIP, env) === 'passed' };
+  }
+
+  const refuse = (status: number, code: string, text: string) =>
+    jsonResponse({ success: false, status: code, error: text, message: text }, status, request, env);
+  if (!env.TURNSTILE_SECRET) {
+    console.error('TURNSTILE is on but TURNSTILE_SECRET is not set');
+    return refuse(503, 'challenge_unavailable', TEXT_CHALLENGE_UNAVAILABLE);
+  }
+  if (!candidate) return refuse(400, 'challenge_required', TEXT_CHALLENGE_REQUIRED);
+  const verdict = await verifyTurnstileToken(candidate, clientIP, env);
+  if (verdict === 'unavailable') return refuse(503, 'challenge_unavailable', TEXT_CHALLENGE_UNAVAILABLE);
+  if (verdict === 'failed') return refuse(400, 'challenge_failed', TEXT_CHALLENGE_FAILED);
+  return { verified: true };
 }
 
 /* =============================================================================
@@ -854,6 +964,7 @@ async function submitIntent(
   clientIP: string,
   request: Request,
   authenticated = false,
+  verified = false,
 ): Promise<IntentResult> {
   try {
     const response = await coordinator.fetch('https://coordinator/intent', {
@@ -865,6 +976,7 @@ async function submitIntent(
         ip: clientIP,
         userAgent: request.headers.get('User-Agent') || 'unknown',
         authenticated,
+        verified,
       }),
     });
     if (!response.ok) return { outcome: 'failed', error: `coordinator HTTP ${response.status}` };
@@ -935,7 +1047,7 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
     // Cheap declared-length rejection before spending rate-limit budget; the
     // streamed body itself is bounded later in readBody.
     const declaredLength = request.headers.get('Content-Length');
-    if (declaredLength && parseInt(declaredLength, 10) > MAX_REQUEST_SIZE) {
+    if (declaredLength && parseInt(declaredLength, 10) > MAX_SUBSCRIBE_REQUEST_SIZE) {
       return jsonResponse({ success: false, error: 'Request too large' }, 413, request, env);
     }
     const clientIP = getClientIP(request);
@@ -943,7 +1055,7 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       return jsonResponse({ success: false, error: 'Too many requests. Please try again later.' }, 429, request, env);
     }
 
-    const parsed = await readBody(request);
+    const parsed = await readBody(request, MAX_SUBSCRIBE_REQUEST_SIZE);
     if (!parsed.ok) {
       return jsonResponse({ success: false, error: parsed.error }, parsed.status, request, env);
     }
@@ -959,12 +1071,18 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       return jsonResponse({ success: false, error: 'Invalid email address' }, 400, request, env);
     }
 
+    // Nothing below this line runs for a refused caller, so no intent is
+    // recorded and no mail is sent.
+    const authenticated = requireAuth(request, env);
+    const challenge = await checkChallenge(body.turnstileToken, clientIP, authenticated, request, env);
+    if (challenge instanceof Response) return challenge;
+
     // The coordinator is the production path: one serialized object per address,
     // so this request cannot interleave with a concurrent unsubscribe.
     const coordinator = coordinatorFor(env, email);
     if (!coordinator && env.ENVIRONMENT === 'production') return maintenanceResponse(request, env);
     if (coordinator) {
-      const result = await submitIntent(coordinator, 'subscribed', email, clientIP, request, requireAuth(request, env));
+      const result = await submitIntent(coordinator, 'subscribed', email, clientIP, request, authenticated, challenge.verified);
       return subscribeResponse(result, request, env);
     }
 
@@ -999,6 +1117,7 @@ async function handleSubscribe(request: Request, env: Env, ctx: ExecutionContext
       timestamp: new Date().toISOString(),
       ip: clientIP,
       userAgent: request.headers.get('User-Agent') || 'unknown',
+      verified: challenge.verified,
       seq: Date.now(),
     };
     await env.NEWSLETTER_SUBSCRIBERS.put(email, JSON.stringify(record));
@@ -1366,7 +1485,12 @@ interface CoordinatorIntent {
   userAgent?: string;
   /** Whether the caller proved control of the address. */
   authenticated?: boolean;
+  /** Whether a signup passed the challenge or carried the operator token. */
+  verified?: boolean;
 }
+
+type IntentInput = Pick<CoordinatorIntent,
+  'desired' | 'email' | 'ip' | 'userAgent' | 'authenticated' | 'verified'>;
 
 interface CoordinatorPending {
   kind: 'create' | 'remove' | 'shadow';
@@ -1428,10 +1552,7 @@ export class SubscriptionCoordinator {
     try {
       if (url.pathname === '/intent' && request.method === 'POST') {
         if (isLegacyMode(this.env)) return new Response('maintenance', { status: 503 });
-        const body = await request.json() as {
-          desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
-          authenticated?: boolean;
-        };
+        const body = await request.json() as IntentInput;
         return Response.json(await this.runExclusive(() => this.setIntent(body)));
       }
       if (url.pathname === '/sync' && request.method === 'POST') {
@@ -1501,10 +1622,7 @@ export class SubscriptionCoordinator {
    * KV write recoverable: there is never a moment where durable state says one
    * thing and nothing is scheduled to act on it.
    */
-  private async setIntent(input: {
-    desired: 'subscribed' | 'unsubscribed'; email: string; ip?: string; userAgent?: string;
-    authenticated?: boolean;
-  }): Promise<SyncResult & { seq: number; desired: string }> {
+  private async setIntent(input: IntentInput): Promise<SyncResult & { seq: number; desired: string }> {
     const email = input.email.trim().toLowerCase();
     const previous = await this.state.storage.get<CoordinatorIntent>(INTENT_KEY);
     const seq = (previous?.seq ?? 0) + 1;
@@ -1517,6 +1635,7 @@ export class SubscriptionCoordinator {
       ip: input.ip,
       userAgent: input.userAgent,
       authenticated: input.authenticated,
+      verified: input.verified,
     };
 
     // The unsubscribe intent is a durable recipient tombstone, independent of
@@ -1624,6 +1743,7 @@ export class SubscriptionCoordinator {
           timestamp: intent.updatedAt,
           ip: intent.ip ?? 'unknown',
           userAgent: intent.userAgent ?? 'unknown',
+          verified: intent.verified === true,
           seq: Date.now(),
         }));
       } else {

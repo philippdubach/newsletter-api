@@ -68,6 +68,10 @@ COORDINATOR_MODE = "on"
 # New signups stay unconfirmed until the Listmonk opt-in link is clicked. Set to
 # "off" together with the list's opt-in type to return to single opt-in.
 DOUBLE_OPTIN = "on"
+# "on" refuses a signup without a passed Turnstile challenge. Set the
+# TURNSTILE_SECRET secret and ship the site's widget before turning it on.
+# While "off", a token the form sends is still verified and recorded.
+TURNSTILE = "off"
 # Overall budget for one provider phase, well under the 30-second Durable Object
 # reset threshold that applies while blockConcurrencyWhile is held.
 PROVIDER_BUDGET_MS = "20000"
