@@ -108,6 +108,12 @@ addresses.
 
 Each step that changes production needs the owner's approval.
 
+State on 2026-11-09: steps 1 to 5 are done, and `TURNSTILE` is `on` in
+production. The secret was stored after the deploy of step 3, not before it:
+`wrangler secret put` refuses while the newest uploaded version of the Worker is
+not the deployed one, and a leftover test version was the newest. A signup made
+through the live form was recorded with `"verified":true`. Steps 6 and 7 are open.
+
 1. Create a Turnstile widget in the Cloudflare dashboard, in Managed mode. Allow
    the hostnames that serve the form. Done on 2026-11-09 for `philippdubach.com`.
    Keep `TURNSTILE_HOSTNAMES` in `wrangler.toml` equal to the hostnames of the
