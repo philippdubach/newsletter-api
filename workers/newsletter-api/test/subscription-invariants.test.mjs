@@ -1996,7 +1996,7 @@ describe('the signup report', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip, 'User-Agent': agent },
         body: JSON.stringify({ email }),
-        cf: { asn: 64500, asOrganization: 'Runtime Suite Hosting' },
+        cf: { asn: 64500, asOrganization: 'Runtime Suite Hosting', httpProtocol: 'HTTP/1.1' },
       });
       await response.json();
       await local.drain();
@@ -2023,7 +2023,17 @@ describe('the signup report', () => {
         assert.deepEqual(body.windows[window].byIp, [{ ip: '198.51.100.70', count: 3 }]);
         assert.deepEqual(body.windows[window].byAsn, [{ asn: 64500, asOrganization: 'Runtime Suite Hosting', count: 3 }]);
         assert.equal(body.windows[window].byUserAgent.length, 3);
+        assert.equal(body.windows[window].withoutSecChUa, 3);
+        assert.deepEqual(body.windows[window].byHttpProtocol, [{ httpProtocol: 'HTTP/1.1', count: 3 }]);
       }
+      assert.equal(body.recent.length, 3);
+      const { timestamp, userAgent, ...row } = body.recent[0];
+      assert.deepEqual(row, {
+        ip: '198.51.100.70', asn: 64500, asOrganization: 'Runtime Suite Hosting',
+        secChUa: false, httpProtocol: 'HTTP/1.1', verified: false,
+      });
+      assert.match(userAgent, /^report-agent-[123]$/);
+      assert.equal(body.recentTruncated, false);
       assert.deepEqual(body.alert.reasons, [{ rule: 'ip_24h', ip: '198.51.100.70', count: 3 }]);
       assert.equal(body.alert.triggered, true);
       assert.ok(!text.includes('@example.com'), 'the report carries no address');

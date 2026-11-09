@@ -1468,6 +1468,8 @@ const SIGNUP_ALERT_TOTAL = 10; // more than this many signups
 const SIGNUP_ALERT_REPEAT = 3; // this many or more from one IP or one user agent
 // Longest breakdown returned per window. The alert is computed before the cut.
 const SIGNUP_REPORT_ROWS = 50;
+// Most signups listed one by one, newest first.
+const SIGNUP_REPORT_RECENT = 200;
 // KV reads up to 100 keys in one operation.
 const KV_BULK_READ_SIZE = 100;
 
@@ -1491,10 +1493,13 @@ function tally<T>(rows: T[], keyOf: (row: T) => string): Array<{ key: string; co
 /**
  * Reports recent signups from the KV records, for an operator to poll.
  *
- * It returns counts and network evidence, never an address. A record is the
+ * It returns counts and request evidence, never an address. A record is the
  * first signup of an address that has not unsubscribed since, so the numbers
  * are distinct addresses. A request refused by the challenge leaves no record.
  * A KV failure is an error, because an empty report would read as "no spike".
+ *
+ * The client hint and the protocol are listed, not judged: no alert rule reads
+ * them, because a single request without the hint or over HTTP/1.1 is ordinary.
  */
 async function handleSignupStats(request: Request, env: Env): Promise<Response> {
   if (!requireAuth(request, env)) {
@@ -1530,9 +1535,12 @@ async function handleSignupStats(request: Request, env: Env): Promise<Response> 
       const byIp = tally(records, (record) => record.ip);
       const byAsn = tally(records, (record) => record.asn === undefined ? 'unknown' : String(record.asn));
       const byUserAgent = tally(records, (record) => record.userAgent);
+      const byHttpProtocol = tally(records, (record) => record.httpProtocol ?? 'unknown');
       windows[label] = {
         signups: records.length,
         unverified: records.filter((record) => record.verified !== true).length,
+        // Known to be absent. A record older than this field is not counted.
+        withoutSecChUa: records.filter((record) => record.secChUa === false).length,
         byIp: byIp.slice(0, SIGNUP_REPORT_ROWS).map(({ key, count }) => ({ ip: key, count })),
         byAsn: byAsn.slice(0, SIGNUP_REPORT_ROWS).map(({ count, first }) => ({
           asn: first.asn ?? null,
@@ -1540,6 +1548,7 @@ async function handleSignupStats(request: Request, env: Env): Promise<Response> 
           count,
         })),
         byUserAgent: byUserAgent.slice(0, SIGNUP_REPORT_ROWS).map(({ key, count }) => ({ userAgent: key, count })),
+        byHttpProtocol: byHttpProtocol.map(({ count, first }) => ({ httpProtocol: first.httpProtocol ?? null, count })),
       };
       if (label !== '24h') continue;
       if (records.length > SIGNUP_ALERT_TOTAL) reasons.push({ rule: 'signups_24h', count: records.length });
@@ -1551,11 +1560,28 @@ async function handleSignupStats(request: Request, env: Env): Promise<Response> 
       }
     }
 
+    // Each signup of the longest window on its own, so a cluster can be read
+    // across fields. Still no address.
+    const longest = Math.max(...SIGNUP_WINDOWS.map(([, span]) => span));
+    const inWindow = dated.filter((entry) => entry.age < longest).sort((a, b) => a.age - b.age);
+    const recent = inWindow.slice(0, SIGNUP_REPORT_RECENT).map(({ record }) => ({
+      timestamp: record.timestamp,
+      ip: record.ip,
+      asn: record.asn ?? null,
+      asOrganization: record.asOrganization ?? null,
+      userAgent: record.userAgent,
+      secChUa: record.secChUa ?? null,
+      httpProtocol: record.httpProtocol ?? null,
+      verified: record.verified === true,
+    }));
+
     const response = jsonResponse({
       generatedAt: new Date(now).toISOString(),
       records: names.length,
       undated,
       windows,
+      recent,
+      recentTruncated: inWindow.length > recent.length,
       alert: {
         triggered: reasons.length > 0,
         reasons,

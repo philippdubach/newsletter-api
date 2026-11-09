@@ -1313,17 +1313,24 @@ describe('Newsletter API', () => {
 
   describe('GET /api/signup-stats', () => {
     const HOUR = 3_600_000;
-    type Signup = { hoursAgo: number; ip?: string; userAgent?: string; asn?: number; asOrganization?: string; verified?: boolean };
+    type Signup = {
+      hoursAgo: number; ip?: string; userAgent?: string; asn?: number; asOrganization?: string; verified?: boolean;
+      secChUa?: boolean; httpProtocol?: string;
+    };
     type Report = {
       records: number;
       undated: number;
       windows: Record<'24h' | '7d', {
         signups: number;
         unverified: number;
+        withoutSecChUa: number;
         byIp: Array<{ ip: string; count: number }>;
         byAsn: Array<{ asn: number | null; asOrganization: string | null; count: number }>;
         byUserAgent: Array<{ userAgent: string; count: number }>;
+        byHttpProtocol: Array<{ httpProtocol: string | null; count: number }>;
       }>;
+      recent: Array<Record<string, unknown>>;
+      recentTruncated: boolean;
       alert: { triggered: boolean; reasons: Array<Record<string, unknown>>; thresholds: Record<string, number> };
     };
 
@@ -1375,11 +1382,12 @@ describe('Newsletter API', () => {
 
     it('counts signups per window, IP, ASN and user agent', async () => {
       const hosting = { asn: 56971, asOrganization: 'Example Hosting Ltd' };
+      const scripted = { secChUa: false, httpProtocol: 'HTTP/1.1' };
       serveKv({
         ...records([
-          { hoursAgo: 1, ip: '203.0.113.5', userAgent: 'Chrome/124', ...hosting, verified: false },
-          { hoursAgo: 2, ip: '203.0.113.5', userAgent: 'Chrome/124', ...hosting, verified: false },
-          { hoursAgo: 23, ip: '203.0.113.6', userAgent: 'Firefox/130', asn: 3303, asOrganization: 'Example Access', verified: true },
+          { hoursAgo: 1, ip: '203.0.113.5', userAgent: 'Chrome/124', ...hosting, ...scripted, verified: false },
+          { hoursAgo: 2, ip: '203.0.113.5', userAgent: 'Chrome/124', ...hosting, ...scripted, verified: false },
+          { hoursAgo: 23, ip: '203.0.113.6', userAgent: 'Firefox/130', asn: 3303, asOrganization: 'Example Access', secChUa: true, httpProtocol: 'HTTP/2', verified: true },
           { hoursAgo: 25, ip: '203.0.113.5', userAgent: 'Chrome/124', ...hosting },
           { hoursAgo: 6 * 24, ip: '203.0.113.7', userAgent: 'Safari/18' },
           { hoursAgo: 8 * 24, ip: '203.0.113.8', userAgent: 'old' },
@@ -1400,12 +1408,19 @@ describe('Newsletter API', () => {
       expect(body.windows['24h']).toEqual({
         signups: 3,
         unverified: 2,
+        withoutSecChUa: 2,
         byIp: [{ ip: '203.0.113.5', count: 2 }, { ip: '203.0.113.6', count: 1 }],
         byAsn: [{ ...hosting, count: 2 }, { asn: 3303, asOrganization: 'Example Access', count: 1 }],
         byUserAgent: [{ userAgent: 'Chrome/124', count: 2 }, { userAgent: 'Firefox/130', count: 1 }],
+        byHttpProtocol: [{ httpProtocol: 'HTTP/1.1', count: 2 }, { httpProtocol: 'HTTP/2', count: 1 }],
       });
       expect(body.windows['7d'].signups).toBe(5);
       expect(body.windows['7d'].unverified).toBe(4);
+      // Records from before the field existed are unknown, not "without".
+      expect(body.windows['7d'].withoutSecChUa).toBe(2);
+      expect(body.windows['7d'].byHttpProtocol).toEqual([
+        { httpProtocol: 'HTTP/1.1', count: 2 }, { httpProtocol: null, count: 2 }, { httpProtocol: 'HTTP/2', count: 1 },
+      ]);
       expect(body.windows['7d'].byIp[0]).toEqual({ ip: '203.0.113.5', count: 3 });
       expect(body.windows['7d'].byAsn).toEqual([
         { ...hosting, count: 3 },
@@ -1437,6 +1452,49 @@ describe('Newsletter API', () => {
 
       expect(body.alert.reasons).toEqual(reasons);
       expect(body.alert.triggered).toBe(reasons.length > 0);
+    });
+
+    it('lists each signup of the last 7 days with its evidence, newest first', async () => {
+      serveKv(records([
+        { hoursAgo: 30, ip: '203.0.113.6', userAgent: 'Firefox/130', secChUa: false, httpProtocol: 'HTTP/3', verified: true },
+        { hoursAgo: 1, ip: '203.0.113.5', userAgent: 'Chrome/124', asn: 56971, asOrganization: 'Example Hosting Ltd', secChUa: false, httpProtocol: 'HTTP/1.1' },
+        { hoursAgo: 8 * 24, ip: '203.0.113.7' },
+        { hoursAgo: 50, ip: '203.0.113.8', userAgent: 'legacy' },
+      ]));
+
+      const response = await report();
+      const text = await response.text();
+      const body = JSON.parse(text) as Report;
+
+      expect(body.recent.map(({ timestamp, ...row }) => row)).toEqual([
+        { ip: '203.0.113.5', asn: 56971, asOrganization: 'Example Hosting Ltd', userAgent: 'Chrome/124', secChUa: false, httpProtocol: 'HTTP/1.1', verified: false },
+        { ip: '203.0.113.6', asn: null, asOrganization: null, userAgent: 'Firefox/130', secChUa: false, httpProtocol: 'HTTP/3', verified: true },
+        { ip: '203.0.113.8', asn: null, asOrganization: null, userAgent: 'legacy', secChUa: null, httpProtocol: null, verified: false },
+      ]);
+      expect(Math.abs(Date.parse(body.recent[0].timestamp as string) - (Date.now() - HOUR))).toBeLessThan(5000);
+      expect(body.recentTruncated).toBe(false);
+      expect(text).not.toContain('@example.com');
+    });
+
+    it('lists at most 200 signups and says when it left some out', async () => {
+      serveKv(records(Array.from({ length: 230 }, (_, i) => ({ hoursAgo: 25 + i / 10 }))));
+
+      const body = await (await report()).json() as Report;
+
+      expect(body.windows['7d'].signups).toBe(230);
+      expect(body.recent).toHaveLength(200);
+      expect(body.recentTruncated).toBe(true);
+      expect(body.recent[0].ip).toBe('198.51.100.0');
+    });
+
+    it('raises no alert from a missing client hint or an old protocol', async () => {
+      // Two signups that look scripted, from two sources: below every threshold.
+      serveKv(records([1, 2].map(hoursAgo => ({ hoursAgo, secChUa: false, httpProtocol: 'HTTP/1.1' }))));
+
+      const body = await (await report()).json() as Report;
+
+      expect(body.windows['24h'].withoutSecChUa).toBe(2);
+      expect(body.alert).toMatchObject({ triggered: false, reasons: [] });
     });
 
     it('names every rule that fired', async () => {
