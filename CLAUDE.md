@@ -54,7 +54,7 @@ The welcome and Plunk fallback paths run only when `DOUBLE_OPTIN` is off.
 - Secrets (set via `wrangler secret put ... --env production`): `LISTMONK_API_USER`, `LISTMONK_API_TOKEN`, `PLUNK_SECRET_KEY`, `ADMIN_TOKEN`, `UNSUBSCRIBE_HMAC_SECRET`, `BLOCKED_IPS`, `TURNSTILE_SECRET`
 
 **KV key conventions:**
-- Subscriber emails stored directly as keys (lowercased). The value is the signup evidence: `timestamp`, `ip`, `userAgent`, `asn`, `asOrganization`, `verified`, `seq`. The first record for an address wins
+- Subscriber emails stored directly as keys (lowercased). The value is the signup evidence: `timestamp`, `ip`, `userAgent`, `asn`, `asOrganization`, `secChUa`, `httpProtocol`, `verified`, `seq`. The first record for an address wins. `asn`, `asOrganization`, `secChUa` (was a `Sec-CH-UA` header present) and `httpProtocol` (`request.cf.httpProtocol`) are evidence for the signup report and for cleanup. Never refuse a request because of them
 - `rate_limit:{ip}` — short-TTL rate-limit counter
 - `cache:subscriber_count` — 10-min cached combined count payload
 - `cache:linkedin_last_known:{hash}` — last successful LinkedIn follower count per URL
