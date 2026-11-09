@@ -1208,6 +1208,202 @@ describe('Newsletter API', () => {
     });
   });
 
+  describe('GET /api/signup-stats', () => {
+    const HOUR = 3_600_000;
+    type Signup = { hoursAgo: number; ip?: string; userAgent?: string; asn?: number; asOrganization?: string; verified?: boolean };
+    type Report = {
+      records: number;
+      undated: number;
+      windows: Record<'24h' | '7d', {
+        signups: number;
+        unverified: number;
+        byIp: Array<{ ip: string; count: number }>;
+        byAsn: Array<{ asn: number | null; asOrganization: string | null; count: number }>;
+        byUserAgent: Array<{ userAgent: string; count: number }>;
+      }>;
+      alert: { triggered: boolean; reasons: Array<Record<string, unknown>>; thresholds: Record<string, number> };
+    };
+
+    // One record per address, each from its own IP and user agent unless told otherwise.
+    function records(signups: Signup[]): Record<string, string> {
+      return Object.fromEntries(signups.map(({ hoursAgo, ...rest }, i) => [
+        `reader${i}@example.com`,
+        JSON.stringify({
+          timestamp: new Date(Date.now() - hoursAgo * HOUR).toISOString(),
+          ip: `198.51.100.${i}`,
+          userAgent: `agent-${i}`,
+          seq: i,
+          ...rest,
+        }),
+      ]));
+    }
+
+    function serveKv(store: Record<string, string | null>, pageSize = 1000): void {
+      const names = Object.keys(store);
+      mockEnv.NEWSLETTER_SUBSCRIBERS.list.mockImplementation(async ({ cursor }: { cursor?: string } = {}) => {
+        const start = cursor ? Number(cursor) : 0;
+        const end = start + pageSize;
+        return {
+          keys: names.slice(start, end).map(name => ({ name })),
+          list_complete: end >= names.length,
+          cursor: end >= names.length ? undefined : String(end),
+        };
+      });
+      mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockImplementation(async (keys: string[]) =>
+        new Map(keys.map(key => [key, store[key] ?? null])));
+    }
+
+    async function report(headers: Record<string, string> = { Authorization: 'Bearer test_token' }): Promise<Response> {
+      return worker.fetch(new Request('https://api.example.com/api/signup-stats', { headers }), mockEnv, mockCtx);
+    }
+
+    const distinct = (count: number, hoursAgo = 1): Signup[] => Array.from({ length: count }, () => ({ hoursAgo }));
+
+    it.each([
+      ['no token', {}],
+      ['a wrong token', { Authorization: 'Bearer wrong' }],
+    ])('refuses %s without reading KV', async (_name, headers) => {
+      const response = await report(headers as Record<string, string>);
+
+      expect(response.status).toBe(401);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.list).not.toHaveBeenCalled();
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.get).not.toHaveBeenCalled();
+    });
+
+    it('counts signups per window, IP, ASN and user agent', async () => {
+      const hosting = { asn: 56971, asOrganization: 'Example Hosting Ltd' };
+      serveKv({
+        ...records([
+          { hoursAgo: 1, ip: '203.0.113.5', userAgent: 'Chrome/124', ...hosting, verified: false },
+          { hoursAgo: 2, ip: '203.0.113.5', userAgent: 'Chrome/124', ...hosting, verified: false },
+          { hoursAgo: 23, ip: '203.0.113.6', userAgent: 'Firefox/130', asn: 3303, asOrganization: 'Example Access', verified: true },
+          { hoursAgo: 25, ip: '203.0.113.5', userAgent: 'Chrome/124', ...hosting },
+          { hoursAgo: 6 * 24, ip: '203.0.113.7', userAgent: 'Safari/18' },
+          { hoursAgo: 8 * 24, ip: '203.0.113.8', userAgent: 'old' },
+        ]),
+        'rate_limit:203.0.113.5': '{"count":1,"resetAt":0}',
+        'cache:subscriber_count': '{"count":10,"display":"10+"}',
+        'intent:fence:reader@example.com': '{"desired":"unsubscribed"}',
+      });
+
+      const response = await report();
+      const text = await response.text();
+      const body = JSON.parse(text) as Report;
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      expect(body.records).toBe(6);
+      expect(body.undated).toBe(0);
+      expect(body.windows['24h']).toEqual({
+        signups: 3,
+        unverified: 2,
+        byIp: [{ ip: '203.0.113.5', count: 2 }, { ip: '203.0.113.6', count: 1 }],
+        byAsn: [{ ...hosting, count: 2 }, { asn: 3303, asOrganization: 'Example Access', count: 1 }],
+        byUserAgent: [{ userAgent: 'Chrome/124', count: 2 }, { userAgent: 'Firefox/130', count: 1 }],
+      });
+      expect(body.windows['7d'].signups).toBe(5);
+      expect(body.windows['7d'].unverified).toBe(4);
+      expect(body.windows['7d'].byIp[0]).toEqual({ ip: '203.0.113.5', count: 3 });
+      expect(body.windows['7d'].byAsn).toEqual([
+        { ...hosting, count: 3 },
+        { asn: 3303, asOrganization: 'Example Access', count: 1 },
+        { asn: null, asOrganization: null, count: 1 },
+      ]);
+      expect(body.alert.thresholds).toEqual({ signups24h: 10, repeat24h: 3 });
+      // The report is evidence about traffic, not a subscriber export.
+      expect(text).not.toContain('@example.com');
+    });
+
+    it.each([
+      ['ten signups from ten sources', distinct(10), []],
+      ['eleven signups from eleven sources', distinct(11), [{ rule: 'signups_24h', count: 11 }]],
+      ['two signups from one IP', [{ hoursAgo: 1, ip: '203.0.113.5' }, { hoursAgo: 2, ip: '203.0.113.5' }], []],
+      ['three signups from one IP',
+        [1, 2, 3].map(hoursAgo => ({ hoursAgo, ip: '203.0.113.5' })),
+        [{ rule: 'ip_24h', ip: '203.0.113.5', count: 3 }]],
+      ['three signups with one user agent from three IPs',
+        [1, 2, 3].map(hoursAgo => ({ hoursAgo, userAgent: 'Chrome/124.0.0.0' })),
+        [{ rule: 'user_agent_24h', userAgent: 'Chrome/124.0.0.0', count: 3 }]],
+      ['three signups from one IP, one of them older than a day',
+        [1, 2, 25].map(hoursAgo => ({ hoursAgo, ip: '203.0.113.5' })), []],
+      ['a spike that ended more than a day ago', distinct(20, 30), []],
+    ] as Array<[string, Signup[], Array<Record<string, unknown>>]>)('alert for %s', async (_name, signups, reasons) => {
+      serveKv(records(signups));
+
+      const body = await (await report()).json() as Report;
+
+      expect(body.alert.reasons).toEqual(reasons);
+      expect(body.alert.triggered).toBe(reasons.length > 0);
+    });
+
+    it('names every rule that fired', async () => {
+      serveKv(records(Array.from({ length: 12 }, (_, i) => ({ hoursAgo: 1, ip: i < 4 ? '203.0.113.5' : `198.51.100.${i}`, userAgent: 'Chrome/124' }))));
+
+      const body = await (await report()).json() as Report;
+
+      expect(body.alert.triggered).toBe(true);
+      expect(body.alert.reasons).toEqual([
+        { rule: 'signups_24h', count: 12 },
+        { rule: 'ip_24h', ip: '203.0.113.5', count: 4 },
+        { rule: 'user_agent_24h', userAgent: 'Chrome/124', count: 12 },
+      ]);
+    });
+
+    it('follows the listing cursor and reads values 100 at a time', async () => {
+      serveKv(records(distinct(250, 48)), 120);
+
+      const body = await (await report()).json() as Report;
+
+      expect(body.records).toBe(250);
+      expect(body.windows['7d'].signups).toBe(250);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.list).toHaveBeenCalledTimes(3);
+      expect(mockEnv.NEWSLETTER_SUBSCRIBERS.get.mock.calls.map(call => (call[0] as string[]).length)).toEqual([100, 100, 50]);
+    });
+
+    it('bounds each breakdown but raises the alert from all rows', async () => {
+      const busy = [1, 2, 3].map(hoursAgo => ({ hoursAgo, ip: '203.0.113.5', userAgent: `busy-${hoursAgo}` }));
+      serveKv(records([...distinct(60), ...busy]));
+
+      const body = await (await report()).json() as Report;
+
+      expect(body.windows['24h'].signups).toBe(63);
+      expect(body.windows['24h'].byIp).toHaveLength(50);
+      expect(body.windows['24h'].byIp[0]).toEqual({ ip: '203.0.113.5', count: 3 });
+      expect(body.windows['24h'].byUserAgent).toHaveLength(50);
+      expect(body.alert.reasons).toContainEqual({ rule: 'ip_24h', ip: '203.0.113.5', count: 3 });
+    });
+
+    it('counts a record it cannot date instead of dropping or dating it', async () => {
+      serveKv({
+        ...records(distinct(2)),
+        'broken@example.com': '{not json',
+        'legacy@example.com': JSON.stringify({ ip: '203.0.113.9', userAgent: 'legacy' }),
+        'vanished@example.com': null,
+      });
+
+      const body = await (await report()).json() as Report;
+
+      expect(body.records).toBe(5);
+      expect(body.undated).toBe(2);
+      expect(body.windows['7d'].signups).toBe(2);
+    });
+
+    it.each([
+      ['the listing', () => mockEnv.NEWSLETTER_SUBSCRIBERS.list.mockRejectedValue(new Error('kv down'))],
+      ['a value read', () => mockEnv.NEWSLETTER_SUBSCRIBERS.get.mockRejectedValue(new Error('kv down'))],
+    ])('answers 500 rather than an empty report when %s fails', async (_name, breakKv) => {
+      serveKv(records(distinct(3)));
+      breakKv();
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const response = await report();
+
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({ error: 'Signup report unavailable' });
+      logged.mockRestore();
+    });
+  });
+
   describe('Listmonk reconciliation (audit item 35)', () => {
     const recordJson = (seq: number): string =>
       JSON.stringify({ timestamp: '2026-01-01T00:00:00Z', ip: '1.2.3.4', userAgent: 'test', seq });

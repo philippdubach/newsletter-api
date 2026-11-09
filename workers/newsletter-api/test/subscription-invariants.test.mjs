@@ -1979,3 +1979,54 @@ describe('the signup challenge', () => {
     }
   });
 });
+
+describe('the signup report', () => {
+  const ADMIN_TOKEN = 'runtime-suite-admin-token';
+
+  it('reads the records workerd stored and flags a repeated source', async () => {
+    const store = createProviderStub();
+    const local = await startRuntime({
+      extraBindings: { ...PROVIDER_BINDINGS, ADMIN_TOKEN },
+      outboundService: store.handler,
+    });
+    const signup = async (email, ip, agent) => {
+      const response = await local.runtime.dispatchFetch('http://localhost/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip, 'User-Agent': agent },
+        body: JSON.stringify({ email }),
+        cf: { asn: 64500, asOrganization: 'Runtime Suite Hosting' },
+      });
+      await response.json();
+      await local.drain();
+    };
+    const report = (headers = {}) => local.runtime.dispatchFetch('http://localhost/api/signup-stats', { headers });
+    try {
+      for (const n of [1, 2, 3]) await signup(`invariant-report-${n}@example.com`, '198.51.100.70', `report-agent-${n}`);
+      // Worker bookkeeping in the same namespace is not a signup.
+      await local.kv.put('cache:subscriber_count', { count: 10, display: '10+' });
+
+      const refused = await report();
+      assert.equal(refused.status, 401);
+      await refused.json();
+
+      const response = await report({ Authorization: `Bearer ${ADMIN_TOKEN}` });
+      const text = await response.text();
+      const body = JSON.parse(text);
+
+      assert.equal(response.status, 200);
+      assert.equal(body.records, 3);
+      for (const window of ['24h', '7d']) {
+        assert.equal(body.windows[window].signups, 3);
+        assert.equal(body.windows[window].unverified, 3);
+        assert.deepEqual(body.windows[window].byIp, [{ ip: '198.51.100.70', count: 3 }]);
+        assert.deepEqual(body.windows[window].byAsn, [{ asn: 64500, asOrganization: 'Runtime Suite Hosting', count: 3 }]);
+        assert.equal(body.windows[window].byUserAgent.length, 3);
+      }
+      assert.deepEqual(body.alert.reasons, [{ rule: 'ip_24h', ip: '198.51.100.70', count: 3 }]);
+      assert.equal(body.alert.triggered, true);
+      assert.ok(!text.includes('@example.com'), 'the report carries no address');
+    } finally {
+      await local.dispose();
+    }
+  });
+});

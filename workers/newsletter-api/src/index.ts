@@ -1442,6 +1442,118 @@ async function fetchLinkedInFollowers(env: Env, ctx: ExecutionContext): Promise<
   return counts.reduce((sum, n) => sum + n, 0);
 }
 
+/* Signup report ------------------------------------------------------------- */
+
+const HOUR_MS = 60 * 60_000;
+const SIGNUP_WINDOWS = [['24h', 24 * HOUR_MS], ['7d', 7 * 24 * HOUR_MS]] as const;
+// Alert rules for the 24-hour window. The list normally gains a few readers a
+// day, and the bot runs seen so far reused one IP or one user-agent string.
+const SIGNUP_ALERT_TOTAL = 10; // more than this many signups
+const SIGNUP_ALERT_REPEAT = 3; // this many or more from one IP or one user agent
+// Longest breakdown returned per window. The alert is computed before the cut.
+const SIGNUP_REPORT_ROWS = 50;
+// KV reads up to 100 keys in one operation.
+const KV_BULK_READ_SIZE = 100;
+
+/** KV also holds rate limits, caches and historical intent fences. */
+function isSubscriberKey(name: string): boolean {
+  return !name.startsWith('rate_limit:') && !name.startsWith('cache:') && !name.startsWith('intent:');
+}
+
+/** Counts rows by key, most frequent first, ties in key order. */
+function tally<T>(rows: T[], keyOf: (row: T) => string): Array<{ key: string; count: number; first: T }> {
+  const groups = new Map<string, { key: string; count: number; first: T }>();
+  for (const row of rows) {
+    const key = keyOf(row);
+    const group = groups.get(key);
+    if (group) group.count++;
+    else groups.set(key, { key, count: 1, first: row });
+  }
+  return [...groups.values()].sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+}
+
+/**
+ * Reports recent signups from the KV records, for an operator to poll.
+ *
+ * It returns counts and network evidence, never an address. A record is the
+ * first signup of an address that has not unsubscribed since, so the numbers
+ * are distinct addresses. A request refused by the challenge leaves no record.
+ * A KV failure is an error, because an empty report would read as "no spike".
+ */
+async function handleSignupStats(request: Request, env: Env): Promise<Response> {
+  if (!requireAuth(request, env)) {
+    return jsonResponse({ error: 'Unauthorized' }, 401, request, env);
+  }
+  try {
+    const names: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await env.NEWSLETTER_SUBSCRIBERS.list({ cursor, limit: 1000 });
+      for (const key of page.keys) if (isSubscriberKey(key.name)) names.push(key.name);
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+
+    const now = Date.now();
+    const dated: Array<{ record: SubscriptionRecord; age: number }> = [];
+    let undated = 0;
+    for (let i = 0; i < names.length; i += KV_BULK_READ_SIZE) {
+      const values = await env.NEWSLETTER_SUBSCRIBERS.get(names.slice(i, i + KV_BULK_READ_SIZE));
+      for (const raw of values.values()) {
+        if (raw === null) continue; // removed since the listing
+        const record = parseRecord(raw);
+        const at = record ? Date.parse(record.timestamp) : NaN;
+        if (record && Number.isFinite(at)) dated.push({ record, age: now - at });
+        else undated++;
+      }
+    }
+
+    const windows: Record<string, unknown> = {};
+    const reasons: Array<Record<string, unknown>> = [];
+    for (const [label, span] of SIGNUP_WINDOWS) {
+      const records = dated.filter((entry) => entry.age < span).map((entry) => entry.record);
+      const byIp = tally(records, (record) => record.ip);
+      const byAsn = tally(records, (record) => record.asn === undefined ? 'unknown' : String(record.asn));
+      const byUserAgent = tally(records, (record) => record.userAgent);
+      windows[label] = {
+        signups: records.length,
+        unverified: records.filter((record) => record.verified !== true).length,
+        byIp: byIp.slice(0, SIGNUP_REPORT_ROWS).map(({ key, count }) => ({ ip: key, count })),
+        byAsn: byAsn.slice(0, SIGNUP_REPORT_ROWS).map(({ count, first }) => ({
+          asn: first.asn ?? null,
+          asOrganization: first.asOrganization ?? null,
+          count,
+        })),
+        byUserAgent: byUserAgent.slice(0, SIGNUP_REPORT_ROWS).map(({ key, count }) => ({ userAgent: key, count })),
+      };
+      if (label !== '24h') continue;
+      if (records.length > SIGNUP_ALERT_TOTAL) reasons.push({ rule: 'signups_24h', count: records.length });
+      for (const { key, count } of byIp) {
+        if (count >= SIGNUP_ALERT_REPEAT) reasons.push({ rule: 'ip_24h', ip: key, count });
+      }
+      for (const { key, count } of byUserAgent) {
+        if (count >= SIGNUP_ALERT_REPEAT) reasons.push({ rule: 'user_agent_24h', userAgent: key, count });
+      }
+    }
+
+    const response = jsonResponse({
+      generatedAt: new Date(now).toISOString(),
+      records: names.length,
+      undated,
+      windows,
+      alert: {
+        triggered: reasons.length > 0,
+        reasons,
+        thresholds: { signups24h: SIGNUP_ALERT_TOTAL, repeat24h: SIGNUP_ALERT_REPEAT },
+      },
+    }, 200, request, env);
+    response.headers.set('Cache-Control', 'no-store');
+    return response;
+  } catch (error) {
+    console.error(`signup report failed: ${error instanceof Error ? error.message : String(error)}`);
+    return jsonResponse({ error: 'Signup report unavailable' }, 500, request, env);
+  }
+}
+
 /* ========================================================================== */
 // Durable subscription coordinator
 //
@@ -2040,10 +2152,7 @@ export default {
           let cursor: string | undefined;
           do {
             const result = await env.NEWSLETTER_SUBSCRIBERS.list({ cursor, limit: 1000 });
-            count += result.keys.filter(key =>
-              !key.name.startsWith('rate_limit:') && !key.name.startsWith('cache:')
-              && !key.name.startsWith('intent:')
-            ).length;
+            count += result.keys.filter(key => isSubscriberKey(key.name)).length;
             cursor = result.list_complete ? undefined : result.cursor;
           } while (cursor);
           return count;
@@ -2073,6 +2182,10 @@ export default {
       } catch {
         return jsonResponse({ count: 0, display: '0+' }, 200, request, env);
       }
+    }
+
+    if (path === '/api/signup-stats' && request.method === 'GET') {
+      return handleSignupStats(request, env);
     }
 
     if (path === '/api/health' && request.method === 'GET') {
