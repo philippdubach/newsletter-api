@@ -27,7 +27,11 @@ npm run deploy:production   # Deploy to production — USE THIS
 
 **Subscribe flow** (`handleSubscribe`):
 1. Refuse `BLOCKED_IPS`, apply the rate limit, and reject the honeypot field.
-2. Run `checkChallenge()`. With `TURNSTILE = "on"`, a missing or failed `cf-turnstile-response` token returns 400 and a missing `TURNSTILE_SECRET` or unreachable siteverify returns 503, all before `submitIntent`. With `TURNSTILE = "off"`, nothing is refused, but a token is still verified when the secret is set. The operator bearer token passes without a challenge. The result travels to the coordinator as `verified`.
+2. Run `checkChallenge()`. With `TURNSTILE = "on"`, a missing or failed `cf-turnstile-response` token returns 400. A missing `TURNSTILE_SECRET`, an empty `TURNSTILE_HOSTNAMES` or an unreachable siteverify returns 503. All of this happens before `submitIntent`. With `TURNSTILE = "off"`, nothing is refused, but a token is still verified when the secret and the hostname list are set. The operator bearer token passes without a challenge. The result travels to the coordinator as `verified`.
+
+   `verifyTurnstileToken()` passes a token only on three checks of the siteverify answer: `success` is `true`, `action` is exactly `signup` (`TURNSTILE_ACTION`, the action the site's widget is rendered with), and `hostname` is in `TURNSTILE_HOSTNAMES` (exact match, case ignored). Keep all three, and keep the fail-closed 503s. Never add `localhost` or `127.0.0.1` to the production `TURNSTILE_HOSTNAMES`; `npm run check:config` rejects it.
+
+   Rollout: a page cached before the site release renders the widget without an action, or has no widget, so its token fails. Wait for caches to expire before you set `TURNSTILE = "on"`. See `docs/REFERENCE.md`.
 3. Send the intent to `SubscriptionCoordinator`, one Durable Object for each address. It serializes signups and unsubscribes.
 4. The coordinator reads Listmonk, then creates the subscriber if the address is absent. It writes the KV shadow record. A transient failure retries by alarm, with eight attempts in total. A 4xx create and a subscriber with no list row are terminal. Exhausted work is stored under `exhausted` and shown by `/state`.
 5. With `DOUBLE_OPTIN = "on"` (production), the create uses `preconfirm_subscriptions: false`, and the Worker sends no welcome. Listmonk mails the opt-in link because list 3 is a double opt-in list. The response carries `status: "confirmation_required"`. Change the Worker var and the list's opt-in type together. If the address is already unconfirmed and the intent is `verified`, the coordinator resends the opt-in at most once per 24 hours.
@@ -50,7 +54,7 @@ The welcome and Plunk fallback paths run only when `DOUBLE_OPTIN` is off.
 - `NEWSLETTER_SUBSCRIBERS` — KV namespace (subscriber shadow + rate limits + caches)
 - `R2_BUCKET` — R2 bucket `static-eu` (EU jurisdiction) for newsletter archive files
 - `SUBSCRIPTION_COORDINATOR` — Durable Object namespace, one object for each address
-- Vars: `ALLOWED_ORIGIN`, `ENVIRONMENT`, `COORDINATOR_MODE`, `DOUBLE_OPTIN`, `TURNSTILE`, `PROVIDER_BUDGET_MS`, `LINKEDIN_NEWSLETTER_URLS`, `LISTMONK_API_URL`, `LISTMONK_LIST_ID`, `LISTMONK_WELCOME_TEMPLATE_ID`
+- Vars: `ALLOWED_ORIGIN`, `ENVIRONMENT`, `COORDINATOR_MODE`, `DOUBLE_OPTIN`, `TURNSTILE`, `TURNSTILE_HOSTNAMES`, `PROVIDER_BUDGET_MS`, `LINKEDIN_NEWSLETTER_URLS`, `LISTMONK_API_URL`, `LISTMONK_LIST_ID`, `LISTMONK_WELCOME_TEMPLATE_ID`
 - Secrets (set via `wrangler secret put ... --env production`): `LISTMONK_API_USER`, `LISTMONK_API_TOKEN`, `PLUNK_SECRET_KEY`, `ADMIN_TOKEN`, `UNSUBSCRIBE_HMAC_SECRET`, `BLOCKED_IPS`, `TURNSTILE_SECRET`
 
 **KV key conventions:**
